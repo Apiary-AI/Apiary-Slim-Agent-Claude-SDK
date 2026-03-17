@@ -1,0 +1,4 @@
+claude-code-sdk>=0.0.25
+python-telegram-bot>=21.0
+httpx>=0.27.0
+pyyaml>=6.0

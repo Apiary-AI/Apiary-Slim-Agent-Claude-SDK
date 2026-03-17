@@ -1,0 +1,6 @@
+description: "GitHub PR workflow — clone repos, create branches, push changes, and open pull requests"
+env:
+  - GITHUB_TOKEN
+deps:
+  python: []
+  system: []
