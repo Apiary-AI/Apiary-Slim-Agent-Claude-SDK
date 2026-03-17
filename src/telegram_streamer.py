@@ -127,6 +127,9 @@ class TelegramStreamer:
         self._current_msg_id: int | None = None
         self._status_msg_id: int | None = None
         self._tool_count: int = 0
+        self._status_description: str = ""
+        self._status_started: float = 0.0
+        self._status_ticker: asyncio.Task | None = None
 
     async def start(self) -> None:
         await self._bot.send_chat_action(chat_id=self._chat_id, action=ChatAction.TYPING)
@@ -181,8 +184,36 @@ class TelegramStreamer:
     async def send_tool_notification(self, tool_name: str, tool_input: Any) -> None:
         """Update a separate status message with current tool activity."""
         self._tool_count += 1
-        description = _humanize_tool(tool_name, tool_input)
-        status_text = f"⏳ {description}"
+        self._status_description = _humanize_tool(tool_name, tool_input)
+        self._status_started = time.monotonic()
+
+        # Cancel previous ticker if running
+        if self._status_ticker and not self._status_ticker.done():
+            self._status_ticker.cancel()
+
+        await self._update_status_text()
+
+        # Start ticker to update elapsed time every 10s
+        self._status_ticker = asyncio.create_task(self._run_status_ticker())
+
+    async def _run_status_ticker(self) -> None:
+        """Periodically update the status message with elapsed time."""
+        try:
+            while True:
+                await asyncio.sleep(10)
+                await self._update_status_text()
+        except asyncio.CancelledError:
+            pass
+
+    def _format_elapsed(self) -> str:
+        elapsed = int(time.monotonic() - self._status_started)
+        if elapsed < 60:
+            return f"{elapsed}s"
+        return f"{elapsed // 60}m {elapsed % 60:02d}s"
+
+    async def _update_status_text(self) -> None:
+        elapsed = self._format_elapsed()
+        status_text = f"⏳ {self._status_description} ({elapsed})"
         try:
             if self._status_msg_id is None:
                 msg = await self._bot.send_message(
@@ -220,7 +251,10 @@ class TelegramStreamer:
             )
 
     async def _delete_status(self) -> None:
-        """Delete the ephemeral status message if one exists."""
+        """Cancel the ticker and delete the ephemeral status message."""
+        if self._status_ticker and not self._status_ticker.done():
+            self._status_ticker.cancel()
+            self._status_ticker = None
         if self._status_msg_id is not None:
             try:
                 await self._bot.delete_message(
