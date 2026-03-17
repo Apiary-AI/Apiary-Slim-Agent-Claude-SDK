@@ -51,6 +51,12 @@ async def run_telegram_bot(
             f"📊 Queue depth: {executor.pending}"
         )
 
+    async def cmd_new(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_user or not is_allowed(update.effective_user.id):
+            return
+        executor.clear_session(update.effective_chat.id)
+        await update.message.reply_text("🔄 Session cleared. Next message starts a fresh conversation.")
+
     async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not is_allowed(update.effective_user.id):
             log.warning(
@@ -74,6 +80,7 @@ async def run_telegram_bot(
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Non-blocking start: initialize + start + begin polling

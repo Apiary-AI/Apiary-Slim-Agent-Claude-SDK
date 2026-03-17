@@ -32,6 +32,7 @@ from telegram import Bot
 from .apiary_client import ApiaryClient
 from .config import Config
 from .module_loader import collect_mcp_servers, discover_modules
+from .session_store import SessionStore
 from .telegram_streamer import TelegramStreamer
 
 log = logging.getLogger(__name__)
@@ -59,11 +60,16 @@ class ClaudeExecutor:
         self._config = config
         self._apiary = apiary
         self._bot = bot
+        self._sessions = SessionStore()
         self.queue: asyncio.Queue[ExecutionRequest] = asyncio.Queue()
 
     @property
     def pending(self) -> int:
         return self.queue.qsize()
+
+    def clear_session(self, chat_id: int | str) -> None:
+        """Clear the stored session for a chat, starting fresh next message."""
+        self._sessions.clear(chat_id)
 
     async def run(self) -> None:
         """Infinite loop: pull requests from queue, execute one at a time."""
@@ -111,24 +117,43 @@ class ClaudeExecutor:
                 except asyncio.CancelledError:
                     pass
 
+    def _build_options(self, resume_session: str | None = None) -> ClaudeCodeOptions:
+        """Build ClaudeCodeOptions, optionally resuming a session."""
+        opts: dict = {
+            "model": self._config.claude_model,
+            "max_turns": self._config.claude_max_turns,
+            "permission_mode": "bypassPermissions",
+            "cwd": self._config.claude_working_dir,
+        }
+        if _mcp:
+            opts["mcp_servers"] = _mcp
+        if resume_session:
+            opts["resume"] = resume_session
+        return ClaudeCodeOptions(**opts)
+
     async def _execute_inner(
         self, req: ExecutionRequest, streamer: TelegramStreamer, retries: int,
     ) -> None:
         full_text = ""
 
+        # Telegram messages resume the chat session; Apiary tasks run fresh
+        resume_id = None
+        if req.source == "telegram":
+            resume_id = self._sessions.get(req.chat_id)
+
         for attempt in range(1, retries + 1):
             try:
-                options = ClaudeCodeOptions(
-                    model=self._config.claude_model,
-                    max_turns=self._config.claude_max_turns,
-                    permission_mode="bypassPermissions",
-                    cwd=self._config.claude_working_dir,
-                    **({"mcp_servers": _mcp} if _mcp else {}),
-                )
+                options = self._build_options(resume_session=resume_id)
                 async for message in query(
                     prompt=req.prompt,
                     options=options,
                 ):
+                    # Capture session_id from result
+                    if isinstance(message, ResultMessage) and hasattr(message, "session_id"):
+                        sid = message.session_id
+                        if sid and req.source == "telegram":
+                            self._sessions.set(req.chat_id, sid)
+
                     text = self._extract_text(message)
                     if text:
                         full_text += text
@@ -161,6 +186,13 @@ class ClaudeExecutor:
                     log.warning("Rate limited (attempt %d/%d), retrying in %ds", attempt, retries, wait)
                     await streamer.append(f"\n⏳ Rate limited, retrying in {wait}s...\n")
                     await asyncio.sleep(wait)
+                    continue
+
+                # If resume failed (stale session), retry without resume
+                if resume_id and attempt < retries:
+                    log.warning("Session resume failed, retrying with fresh session")
+                    self._sessions.clear(req.chat_id)
+                    resume_id = None
                     continue
 
                 if isinstance(e, ClaudeSDKError):
