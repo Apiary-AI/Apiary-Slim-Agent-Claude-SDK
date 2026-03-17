@@ -143,43 +143,49 @@ class TelegramStreamer:
             return
         self._buffer += text
 
-        # Send first message once we have content
-        if self._current_msg_id is None:
-            msg = await self._send_formatted(self._buffer[:4096])
-            self._current_msg_id = msg.message_id
-            self._messages.append(msg.message_id)
-            self._last_edit = time.monotonic()
-            return
+        try:
+            # Send first message once we have content
+            if self._current_msg_id is None:
+                msg = await self._send_formatted(self._buffer[:4096])
+                self._current_msg_id = msg.message_id
+                self._messages.append(msg.message_id)
+                self._last_edit = time.monotonic()
+                return
 
-        # If buffer exceeds limit, finalize current message and start a new one
-        if len(self._buffer) > MAX_MSG_LEN:
-            await self._finalize_current()
-            return
+            # If buffer exceeds limit, finalize current message and start a new one
+            if len(self._buffer) > MAX_MSG_LEN:
+                await self._finalize_current()
+                return
 
-        # Rate-limit edits
-        now = time.monotonic()
-        if now - self._last_edit >= MIN_EDIT_INTERVAL:
-            await self._edit_current()
+            # Rate-limit edits
+            now = time.monotonic()
+            if now - self._last_edit >= MIN_EDIT_INTERVAL:
+                await self._edit_current()
+        except Exception:
+            log.warning("Telegram network error in append (text buffered)", exc_info=True)
 
     async def finish(self) -> None:
         """Finalize the stream: flush remaining buffer and clean up status."""
-        await self._delete_status()
+        try:
+            await self._delete_status()
 
-        if not self._buffer:
-            return
+            if not self._buffer:
+                return
 
-        # If no message sent yet, send one now
-        if self._current_msg_id is None:
-            msg = await self._send_formatted(self._buffer[:4096])
-            self._current_msg_id = msg.message_id
-            self._messages.append(msg.message_id)
-            return
+            # If no message sent yet, send one now
+            if self._current_msg_id is None:
+                msg = await self._send_formatted(self._buffer[:4096])
+                self._current_msg_id = msg.message_id
+                self._messages.append(msg.message_id)
+                return
 
-        # Handle overflow on final flush
-        if len(self._buffer) > MAX_MSG_LEN:
-            await self._finalize_current()
+            # Handle overflow on final flush
+            if len(self._buffer) > MAX_MSG_LEN:
+                await self._finalize_current()
 
-        await self._edit_current()
+            await self._edit_current()
+        except Exception:
+            log.warning("Telegram network error in finish", exc_info=True)
 
     async def send_tool_notification(self, tool_name: str, tool_input: Any) -> None:
         """Update a separate status message with current tool activity."""
@@ -230,10 +236,13 @@ class TelegramStreamer:
             pass  # Non-critical — skip if update fails
 
     async def error(self, error_text: str) -> None:
-        """Send an error message."""
-        await self._bot.send_message(
-            chat_id=self._chat_id, text=f"❌ {error_text}"
-        )
+        """Send an error message (fire-and-forget — must never crash)."""
+        try:
+            await self._bot.send_message(
+                chat_id=self._chat_id, text=f"❌ {error_text}"
+            )
+        except Exception:
+            log.warning("Failed to send error message to Telegram", exc_info=True)
 
     # ── Internal ──────────────────────────────────────────────────────
 

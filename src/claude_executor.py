@@ -78,6 +78,13 @@ class ClaudeExecutor:
             req = await self.queue.get()
             try:
                 await self._execute(req)
+            except asyncio.CancelledError:
+                # Probe whether this is a real shutdown or spurious SDK cancellation
+                try:
+                    await asyncio.sleep(0)
+                except asyncio.CancelledError:
+                    raise  # Real shutdown — propagate
+                log.warning("Spurious CancelledError during execution (suppressed)")
             except Exception:
                 log.exception("Execution failed for request: %s", req)
             finally:
@@ -199,7 +206,12 @@ class ClaudeExecutor:
                     log.error("Claude SDK error: %s", e)
                 else:
                     log.exception("Unexpected error during execution")
-                await streamer.error(f"Error: {e}")
+                try:
+                    await streamer.error(f"Error: {e}")
+                except asyncio.CancelledError:
+                    log.warning("CancelledError while sending error to Telegram (suppressed)")
+                except Exception:
+                    log.warning("Failed to send error notification", exc_info=True)
                 if req.source == "apiary" and req.apiary_task_id and self._apiary:
                     try:
                         await self._apiary.fail_task(req.apiary_task_id, err_str)
