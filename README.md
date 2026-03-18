@@ -69,6 +69,28 @@ If you prefer API key auth, skip step 3, set `ANTHROPIC_API_KEY` in `.env`, and 
 docker run --env-file .env slim-apiary-agent
 ```
 
+## Testing
+
+Tests cover the concurrency-critical paths: task dedup, claim-expiry abort, and poller enqueue logic.
+
+### Run tests
+
+```bash
+docker build -f Dockerfile.test -t slim-agent-test .
+docker run --rm slim-agent-test
+```
+
+No credentials or environment variables needed — everything is mocked.
+
+### Test layout
+
+```
+tests/
+  conftest.py          # shared fixtures (executor, mock_apiary, mock_config)
+  test_executor.py     # dedup methods, _report_progress 409/500, claim-expiry cleanup
+  test_poller.py       # skip in-flight tasks, claim+enqueue new tasks, skip malformed tasks
+```
+
 ## Usage
 
 - Send any text message to your Telegram bot — Claude processes it and streams the response back
