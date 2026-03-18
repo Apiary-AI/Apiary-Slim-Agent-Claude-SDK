@@ -74,11 +74,17 @@ async def run_apiary_poller(
                         log.warning("Skipping task with missing id/prompt: %s", task)
                         continue
 
+                    if executor.has_apiary_task(task_id):
+                        log.debug("Skipping already in-flight task %s", task_id)
+                        continue
+
                     try:
                         await apiary.claim_task(task_id)
                     except Exception:
                         log.warning("Failed to claim task %s (maybe already claimed)", task_id)
                         continue
+
+                    executor.add_apiary_task(task_id)
 
                     chat_id = config.telegram_chat_id
                     if not chat_id:

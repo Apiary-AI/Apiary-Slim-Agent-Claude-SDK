@@ -7,6 +7,8 @@ import logging
 import time
 from dataclasses import dataclass
 
+import httpx
+
 from claude_code_sdk import ClaudeCodeOptions, ClaudeSDKError, Message, query
 from claude_code_sdk._internal import client as _sdk_client
 from claude_code_sdk._internal import message_parser
@@ -62,10 +64,20 @@ class ClaudeExecutor:
         self._bot = bot
         self._sessions = SessionStore()
         self.queue: asyncio.Queue[ExecutionRequest] = asyncio.Queue()
+        self._in_flight_apiary_tasks: set[str] = set()
 
     @property
     def pending(self) -> int:
         return self.queue.qsize()
+
+    def add_apiary_task(self, task_id: str) -> None:
+        self._in_flight_apiary_tasks.add(task_id)
+
+    def remove_apiary_task(self, task_id: str) -> None:
+        self._in_flight_apiary_tasks.discard(task_id)
+
+    def has_apiary_task(self, task_id: str) -> bool:
+        return task_id in self._in_flight_apiary_tasks
 
     def clear_session(self, chat_id: int | str) -> None:
         """Clear the stored session for a chat, starting fresh next message."""
@@ -90,7 +102,9 @@ class ClaudeExecutor:
             finally:
                 self.queue.task_done()
 
-    async def _report_progress(self, task_id: str, interval: int = 30) -> None:
+    async def _report_progress(
+        self, task_id: str, claim_expired: asyncio.Event, interval: int = 30
+    ) -> None:
         """Send periodic progress updates to keep the Apiary task alive."""
         progress = 5
         while True:
@@ -98,6 +112,12 @@ class ClaudeExecutor:
             progress = min(progress + 5, 95)
             try:
                 await self._apiary.update_progress(task_id, progress)
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 409:
+                    log.warning("Claim expired for task %s (409); aborting execution", task_id)
+                    claim_expired.set()
+                    return
+                log.debug("Progress update failed for task %s", task_id)
             except Exception:
                 log.debug("Progress update failed for task %s", task_id)
 
@@ -107,22 +127,52 @@ class ClaudeExecutor:
         t0 = time.monotonic()
         full_text = ""
 
+        claim_expired = asyncio.Event()
+
         # Start background progress reporter for Apiary tasks
         progress_task: asyncio.Task | None = None
         if req.source == "apiary" and req.apiary_task_id and self._apiary:
             progress_task = asyncio.create_task(
-                self._report_progress(req.apiary_task_id)
+                self._report_progress(req.apiary_task_id, claim_expired)
             )
 
+        inner_task: asyncio.Task | None = None
+        watcher_task: asyncio.Task | None = None
+
+        async def _watch_claim_expiry() -> None:
+            await claim_expired.wait()
+            if inner_task is not None:
+                inner_task.cancel()
+
         try:
-            await self._execute_inner(req, streamer, retries)
+            inner_task = asyncio.create_task(self._execute_inner(req, streamer, retries))
+            if req.source == "apiary" and req.apiary_task_id:
+                watcher_task = asyncio.create_task(_watch_claim_expiry())
+            try:
+                await inner_task
+            except asyncio.CancelledError:
+                if claim_expired.is_set():
+                    log.warning(
+                        "Execution aborted: claim expired for apiary task %s",
+                        req.apiary_task_id,
+                    )
+                else:
+                    raise
         finally:
+            if watcher_task:
+                watcher_task.cancel()
+                try:
+                    await watcher_task
+                except asyncio.CancelledError:
+                    pass
             if progress_task:
                 progress_task.cancel()
                 try:
                     await progress_task
                 except asyncio.CancelledError:
                     pass
+            if req.apiary_task_id:
+                self.remove_apiary_task(req.apiary_task_id)
 
     def _build_options(self, resume_session: str | None = None) -> ClaudeCodeOptions:
         """Build ClaudeCodeOptions, optionally resuming a session."""
