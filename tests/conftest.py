@@ -36,3 +36,8 @@ def mock_bot():
 @pytest.fixture
 def executor(mock_config, mock_apiary, mock_bot):
     return ClaudeExecutor(mock_config, mock_apiary, mock_bot)
+
+
+@pytest.fixture
+def executor_with_persona(mock_config, mock_apiary, mock_bot):
+    return ClaudeExecutor(mock_config, mock_apiary, mock_bot, persona="You are a helpful assistant.")

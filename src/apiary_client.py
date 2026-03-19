@@ -197,6 +197,50 @@ class ApiaryClient:
     async def heartbeat(self) -> None:
         await self._request("POST", "/api/v1/agents/heartbeat")
 
+    async def update_status(self, status: str) -> None:
+        """Update agent status (online/busy/idle/offline/error)."""
+        await self._request("PATCH", "/api/v1/agents/status", json={"status": status})
+
+    # ── Persona ───────────────────────────────────────────────────────
+
+    async def get_persona_assembled(self) -> str | None:
+        """Fetch the pre-assembled persona system prompt. Returns None if unavailable."""
+        try:
+            resp = await self._request("GET", "/api/v1/persona/assembled")
+            data = resp.json()
+            persona_data = data.get("data", data) if isinstance(data, dict) else {}
+            return persona_data.get("prompt") or None
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                log.debug("Persona endpoint not available (404); proceeding without it")
+            else:
+                log.warning("Failed to fetch persona; proceeding without it", exc_info=True)
+            return None
+        except Exception:
+            log.warning("Failed to fetch persona; proceeding without it", exc_info=True)
+            return None
+
+    async def update_persona_memory(
+        self,
+        content: str,
+        message: str | None = None,
+        mode: str = "append",
+    ) -> dict[str, Any]:
+        """Update the MEMORY document in the active persona.
+
+        Args:
+            content: The text to write.
+            message: Optional changelog message.
+            mode: 'append' (default), 'prepend', or 'replace'.
+        """
+        body: dict[str, Any] = {"content": content}
+        if message:
+            body["message"] = message
+        if mode != "replace":
+            body["mode"] = mode
+        resp = await self._request("PATCH", "/api/v1/persona/documents/MEMORY", json=body)
+        return resp.json()
+
     # ── Lifecycle ─────────────────────────────────────────────────────
 
     async def close(self) -> None:

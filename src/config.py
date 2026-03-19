@@ -28,11 +28,21 @@ class Config:
     claude_max_budget_usd: float = 5.0
     claude_max_turns: int = 30
     claude_working_dir: str = "/workspace"
+    claude_worktree_isolation: bool = False
 
     @classmethod
     def from_env(cls) -> Config:
         allowed = os.environ.get("TELEGRAM_ALLOWED_USERS", "")
         caps = os.environ.get("APIARY_CAPABILITIES", "")
+        working_dir = os.environ.get("CLAUDE_WORKING_DIR", "/workspace")
+
+        isolation_env = os.environ.get("CLAUDE_WORKTREE_ISOLATION")
+        if isolation_env is not None:
+            worktree_isolation = isolation_env.lower() not in ("0", "false", "no")
+        else:
+            # Auto-enable when the working directory is a git repo
+            worktree_isolation = os.path.isdir(os.path.join(working_dir, ".git"))
+
         return cls(
             apiary_base_url=os.environ.get("APIARY_BASE_URL", ""),
             apiary_hive_id=os.environ.get("APIARY_HIVE_ID", ""),
@@ -52,7 +62,8 @@ class Config:
                 os.environ.get("CLAUDE_MAX_BUDGET_USD", "5.0")
             ),
             claude_max_turns=int(os.environ.get("CLAUDE_MAX_TURNS", "30")),
-            claude_working_dir=os.environ.get("CLAUDE_WORKING_DIR", "/workspace"),
+            claude_working_dir=working_dir,
+            claude_worktree_isolation=worktree_isolation,
         )
 
     @property

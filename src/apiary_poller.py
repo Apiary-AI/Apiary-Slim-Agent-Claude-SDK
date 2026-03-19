@@ -9,6 +9,7 @@ import logging
 from .apiary_client import ApiaryClient
 from .claude_executor import ClaudeExecutor, ExecutionRequest
 from .config import Config
+from .worktree_manager import infer_branch
 
 log = logging.getLogger(__name__)
 
@@ -78,6 +79,13 @@ async def run_apiary_poller(
                         log.debug("Skipping already in-flight task %s", task_id)
                         continue
 
+                    # Don't claim new tasks while the executor is busy.
+                    # Claiming eagerly causes claim timeouts for queued tasks,
+                    # which sends them back to pending and creates a retry storm.
+                    if executor.is_busy:
+                        log.debug("Executor busy, deferring task %s", task_id)
+                        break
+
                     try:
                         await apiary.claim_task(task_id)
                     except Exception:
@@ -91,11 +99,16 @@ async def run_apiary_poller(
                         log.warning("No TELEGRAM_CHAT_ID set, skipping Apiary task notification")
                         chat_id = "0"
 
+                    branch = infer_branch(task)
+                    if branch:
+                        log.debug("Inferred branch %r for task %s", branch, task_id)
+
                     req = ExecutionRequest(
                         prompt=prompt,
                         chat_id=chat_id,
                         source="apiary",
                         apiary_task_id=task_id,
+                        branch=branch,
                     )
                     await executor.queue.put(req)
                     log.info("Enqueued apiary task %s (queue=%d)", task_id, executor.pending)

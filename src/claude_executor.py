@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sys
 import time
 from dataclasses import dataclass
 
@@ -36,6 +37,7 @@ from .config import Config
 from .module_loader import collect_mcp_servers, discover_modules
 from .session_store import SessionStore
 from .telegram_streamer import TelegramStreamer
+from .worktree_manager import ensure_worktree, is_git_repo
 
 log = logging.getLogger(__name__)
 
@@ -46,6 +48,7 @@ class ExecutionRequest:
     chat_id: int | str
     source: str  # "telegram" | "apiary"
     apiary_task_id: str | None = None
+    branch: str | None = None
 
 
 _modules = discover_modules()
@@ -58,10 +61,12 @@ class ClaudeExecutor:
         config: Config,
         apiary: ApiaryClient | None,
         bot: Bot,
+        persona: str | None = None,
     ) -> None:
         self._config = config
         self._apiary = apiary
         self._bot = bot
+        self._persona = persona
         self._sessions = SessionStore()
         self.queue: asyncio.Queue[ExecutionRequest] = asyncio.Queue()
         self._in_flight_apiary_tasks: set[str] = set()
@@ -69,6 +74,11 @@ class ClaudeExecutor:
     @property
     def pending(self) -> int:
         return self.queue.qsize()
+
+    @property
+    def is_busy(self) -> bool:
+        """True if a task is currently executing or queued."""
+        return bool(self._in_flight_apiary_tasks) or self.queue.qsize() > 0
 
     def add_apiary_task(self, task_id: str) -> None:
         self._in_flight_apiary_tasks.add(task_id)
@@ -122,6 +132,12 @@ class ClaudeExecutor:
                 log.debug("Progress update failed for task %s", task_id)
 
     async def _execute(self, req: ExecutionRequest, retries: int = 3) -> None:
+        if self._apiary:
+            try:
+                await self._apiary.update_status("busy")
+            except Exception:
+                log.debug("Failed to set agent status to busy")
+
         streamer = TelegramStreamer(self._bot, req.chat_id)
         await streamer.start()
         t0 = time.monotonic()
@@ -173,25 +189,78 @@ class ClaudeExecutor:
                     pass
             if req.apiary_task_id:
                 self.remove_apiary_task(req.apiary_task_id)
+            if self._apiary:
+                try:
+                    await self._apiary.update_status("online")
+                except Exception:
+                    log.debug("Failed to set agent status to online")
 
-    def _build_options(self, resume_session: str | None = None) -> ClaudeCodeOptions:
-        """Build ClaudeCodeOptions, optionally resuming a session."""
+    def _build_options(
+        self,
+        resume_session: str | None = None,
+        cwd: str | None = None,
+        system_prompt_append: str | None = None,
+    ) -> ClaudeCodeOptions:
+        """Build ClaudeCodeOptions, optionally resuming a session or overriding cwd."""
         opts: dict = {
             "model": self._config.claude_model,
             "max_turns": self._config.claude_max_turns,
             "permission_mode": "bypassPermissions",
-            "cwd": self._config.claude_working_dir,
+            "cwd": cwd or self._config.claude_working_dir,
         }
         if _mcp:
             opts["mcp_servers"] = _mcp
         if resume_session:
             opts["resume"] = resume_session
+        parts = []
+        if self._persona:
+            parts.append(self._persona)
+        if system_prompt_append:
+            parts.append(system_prompt_append)
+        if parts:
+            opts["append_system_prompt"] = "\n\n".join(parts)
         return ClaudeCodeOptions(**opts)
 
     async def _execute_inner(
         self, req: ExecutionRequest, streamer: TelegramStreamer, retries: int,
     ) -> None:
         full_text = ""
+
+        # Resolve worktree cwd for tasks that carry an explicit branch
+        cwd_override: str | None = None
+        if (
+            req.branch
+            and self._config.claude_worktree_isolation
+            and is_git_repo(self._config.claude_working_dir)
+        ):
+            try:
+                cwd_override = await ensure_worktree(
+                    self._config.claude_working_dir, req.branch
+                )
+            except Exception:
+                log.warning(
+                    "Failed to create worktree for branch %r; falling back to default cwd",
+                    req.branch,
+                    exc_info=True,
+                )
+
+        # Inject worktree instructions for Telegram requests without an explicit branch
+        system_prompt_append: str | None = None
+        if (
+            req.source == "telegram"
+            and not req.branch
+            and self._config.claude_worktree_isolation
+            and is_git_repo(self._config.claude_working_dir)
+        ):
+            wt_base = self._config.claude_working_dir
+            system_prompt_append = (
+                "## Worktree Isolation\n"
+                "When this task requires implementing code changes on a new branch:\n"
+                f"1. Choose a branch name, then: `git worktree add {wt_base}/.worktrees/<branch> -b <branch>`\n"
+                f"2. Do all file edits and git operations inside `{wt_base}/.worktrees/<branch>`\n"
+                "3. Commit, push the branch, and open a PR from the worktree.\n"
+                "For conversational replies or read-only tasks, skip this entirely."
+            )
 
         # Telegram messages resume the chat session; Apiary tasks run fresh
         resume_id = None
@@ -200,7 +269,11 @@ class ClaudeExecutor:
 
         for attempt in range(1, retries + 1):
             try:
-                options = self._build_options(resume_session=resume_id)
+                options = self._build_options(
+                    resume_session=resume_id,
+                    cwd=cwd_override,
+                    system_prompt_append=system_prompt_append,
+                )
                 async for message in query(
                     prompt=req.prompt,
                     options=options,
@@ -237,6 +310,29 @@ class ClaudeExecutor:
             except (ClaudeSDKError, Exception) as e:
                 err_str = str(e)
                 is_rate_limit = "rate_limit" in err_str.lower()
+                is_oauth_expired = (
+                    "OAuth token has expired" in err_str
+                    or ("oauth" in err_str.lower() and "expired" in err_str.lower())
+                )
+                is_auth_error = (
+                    is_oauth_expired
+                    or "authentication_error" in err_str
+                    or "Invalid authentication credentials" in err_str
+                )
+
+                if is_auth_error:
+                    if is_oauth_expired:
+                        log.critical(
+                            "Claude OAuth session expired. "
+                            "Re-run the OAuth flow (see README step 3) then restart. "
+                            "Shutting down."
+                        )
+                    else:
+                        log.critical(
+                            "Claude authentication failed — API key invalid or OAuth not configured. "
+                            "Shutting down."
+                        )
+                    sys.exit(1)
 
                 if is_rate_limit and attempt < retries:
                     wait = 30 * attempt

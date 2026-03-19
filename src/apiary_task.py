@@ -189,6 +189,40 @@ def delete_schedule(schedule_id: str) -> None:
             sys.exit(1)
 
 
+def update_memory(content: str, message: str | None = None, mode: str = "append") -> None:
+    """Update the MEMORY document in the active persona."""
+    base_url = os.environ.get("APIARY_BASE_URL", "").rstrip("/")
+    token = os.environ.get("APIARY_API_TOKEN", "")
+
+    if not base_url or not token:
+        print("Error: APIARY_BASE_URL and APIARY_API_TOKEN must be set", file=sys.stderr)
+        sys.exit(1)
+
+    body: dict = {"content": content}
+    if message:
+        body["message"] = message
+    if mode != "replace":
+        body["mode"] = mode
+
+    with httpx.Client(base_url=base_url, timeout=30.0, follow_redirects=True) as client:
+        resp = client.patch(
+            "/api/v1/persona/documents/MEMORY",
+            json=body,
+            headers=_headers(token),
+        )
+        if resp.status_code in (200, 201):
+            print("Memory updated.")
+        elif resp.status_code == 403:
+            print("Error: MEMORY document is locked by persona lock policy", file=sys.stderr)
+            sys.exit(1)
+        elif resp.status_code == 409:
+            print("Error: Persona version conflict — retry", file=sys.stderr)
+            sys.exit(1)
+        else:
+            print(f"Error: {resp.status_code} {resp.text}", file=sys.stderr)
+            sys.exit(1)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Apiary task & schedule helper")
     sub = parser.add_subparsers(dest="command")
@@ -222,6 +256,13 @@ def main() -> None:
     sched_del = sub.add_parser("delete-schedule", help="Delete a schedule")
     sched_del.add_argument("--id", required=True, help="Schedule ID")
 
+    # --- memory update ---
+    mem = sub.add_parser("memory", help="Update the MEMORY document in the active persona")
+    mem.add_argument("--content", required=True, help="Content to write (Markdown)")
+    mem.add_argument("--message", help="Optional changelog message")
+    mem.add_argument("--mode", default="append", choices=["append", "prepend", "replace"],
+                     help="Write mode (default: append)")
+
     args = parser.parse_args()
 
     if args.command == "create":
@@ -249,6 +290,8 @@ def main() -> None:
         list_schedules()
     elif args.command == "delete-schedule":
         delete_schedule(args.id)
+    elif args.command == "memory":
+        update_memory(content=args.content, message=args.message, mode=args.mode)
     else:
         parser.print_help()
         sys.exit(1)

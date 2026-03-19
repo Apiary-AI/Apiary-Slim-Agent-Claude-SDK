@@ -122,6 +122,32 @@ python3 /app/src/apiary_task.py schedules
 python3 /app/src/apiary_task.py delete-schedule --id "01ABC..."
 ```
 
+### Persona Memory
+
+To persist knowledge across executions, update the MEMORY document:
+
+```bash
+# Append new facts (default — no need to include existing content)
+python3 /app/src/apiary_task.py memory \
+  --content "New fact or knowledge to remember" \
+  [--message "What was added"]
+
+# Prepend (add to the top)
+python3 /app/src/apiary_task.py memory \
+  --content "Important note" \
+  --mode prepend
+
+# Full replace (use sparingly — only for restructuring)
+python3 /app/src/apiary_task.py memory \
+  --content "Complete new memory content" \
+  --mode replace
+```
+
+- Default mode is **append** — just write what's new, it gets added to the end
+- Current memory is already in your system prompt (via persona assembled)
+- Use this to record: project conventions, key decisions, recurring patterns, tech stack facts
+- Skip if nothing new worth persisting; don't update just to summarize a task
+
 ### IMPORTANT Rules
 
 - For reminders, deferred tasks, and recurring work: **ALWAYS use Apiary** (tasks or schedules)
@@ -137,7 +163,8 @@ python3 /app/src/apiary_task.py delete-schedule --id "01ABC..."
 
 Your PR comments and pushes trigger GitHub webhooks, which create new Apiary tasks. To avoid infinite loops:
 
-- **Before acting on a webhook task**, check the task payload for the event author/sender. If the action was performed by **your own GitHub user** (check `$GIT_USER_NAME` or the authenticated `gh` user), **skip the task** — just report "Skipping: event triggered by my own action" and finish.
+- **Comments and reviews are the real loop risk.** If the event is a PR comment, review, or review comment authored by your own GitHub user, skip it — acting would just produce another comment, which produces another webhook. Report "Skipping: comment event triggered by my own action" and finish.
+- **CI failures must always be investigated**, even when triggered by your own push. A push → CI fail → fix → push cycle is finite (it ends when CI passes). Do NOT skip CI failure events on the grounds that you made the triggering push.
 - When working on PRs, **prefer pushing commits over leaving comments**. Every PR comment triggers a webhook. Only comment when the result cannot be expressed as a commit.
 - **NEVER comment on a PR just to say "done" or "fixed"** — the push itself is sufficient.
 
