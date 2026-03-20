@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import re
+import signal
 import subprocess
 
 from telegram import Update
@@ -88,6 +90,13 @@ async def run_telegram_bot(
         executor.clear_session(update.effective_chat.id)
         await update.message.reply_text("🔄 Session cleared. Next message starts a fresh conversation.")
 
+    async def cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_user or not is_allowed(update.effective_user.id):
+            return
+        await update.message.reply_text("♻️ Restarting…")
+        log.info("Restart requested by user %s — sending SIGTERM", update.effective_user.id)
+        os.kill(os.getpid(), signal.SIGTERM)
+
     async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not is_allowed(update.effective_user.id):
             log.warning(
@@ -129,6 +138,7 @@ async def run_telegram_bot(
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("new", cmd_new))
+    app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     # Non-blocking start: initialize + start + begin polling

@@ -211,13 +211,15 @@ async def test_poller_sets_branch_from_push_ref(mock_apiary, executor, mock_conf
     assert req.branch == "fix-login"
 
 
-# --- Executor busy: second task not claimed ---
+# --- Executor at capacity: remaining tasks not claimed ---
 
-async def test_poller_defers_second_task_when_executor_busy(mock_apiary, executor, mock_config):
+async def test_poller_defers_when_no_free_slots(mock_apiary, executor, mock_config):
     mock_apiary.poll_tasks.return_value = [
         {"id": "task-a", "invoke": {"instructions": "first"}},
         {"id": "task-b", "invoke": {"instructions": "second"}},
     ]
+    # Simulate executor at capacity
+    executor._active_count = mock_config.claude_max_parallel
 
     task = asyncio.create_task(run_apiary_poller(mock_apiary, executor, mock_config))
     await asyncio.sleep(0.05)
@@ -225,18 +227,33 @@ async def test_poller_defers_second_task_when_executor_busy(mock_apiary, executo
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    # Only task-a should have been claimed; task-b deferred
-    mock_apiary.claim_task.assert_called_once_with("task-a")
+    # Neither task should have been claimed — executor was full before the first one
+    mock_apiary.claim_task.assert_not_called()
+    assert executor.queue.empty()
+
+
+async def test_poller_claims_multiple_when_slots_available(mock_apiary, executor, mock_config):
+    mock_apiary.poll_tasks.return_value = [
+        {"id": "task-a", "invoke": {"instructions": "first"}},
+        {"id": "task-b", "invoke": {"instructions": "second"}},
+    ]
+    # Executor has free slots (active_count=0, max_parallel=3)
+
+    task = asyncio.create_task(run_apiary_poller(mock_apiary, executor, mock_config))
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # Both tasks should be claimed since there are free slots
+    assert mock_apiary.claim_task.call_count == 2
     assert executor.has_apiary_task("task-a")
-    assert not executor.has_apiary_task("task-b")
-    assert executor.queue.qsize() == 1
+    assert executor.has_apiary_task("task-b")
+    assert executor.queue.qsize() == 2
 
 
-async def test_is_busy_true_when_task_queued(executor):
-    from src.claude_executor import ExecutionRequest
-    req = ExecutionRequest(prompt="x", chat_id="1", source="apiary", apiary_task_id="t1")
-    executor.add_apiary_task("t1")
-    await executor.queue.put(req)
+async def test_is_busy_true_when_active(executor):
+    executor._active_count = 1
     assert executor.is_busy
 
 

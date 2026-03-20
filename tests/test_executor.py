@@ -108,34 +108,22 @@ def test_build_options_cwd_override(executor, mock_config):
 
 def test_build_options_injects_persona_when_set(executor_with_persona):
     opts = executor_with_persona._build_options()
-    assert opts.system_prompt == {
-        "type": "preset",
-        "preset": "claude_code",
-        "append": "You are a helpful assistant.",
-    }
+    assert opts.append_system_prompt == "You are a helpful assistant."
 
 
 def test_build_options_no_system_prompt_when_persona_none(executor):
     opts = executor._build_options()
-    assert opts.system_prompt is None
+    assert opts.append_system_prompt is None
 
 
 def test_build_options_combines_persona_and_system_prompt_append(executor_with_persona):
     opts = executor_with_persona._build_options(system_prompt_append="## Extra\nDo stuff.")
-    assert opts.system_prompt == {
-        "type": "preset",
-        "preset": "claude_code",
-        "append": "You are a helpful assistant.\n\n## Extra\nDo stuff.",
-    }
+    assert opts.append_system_prompt == "You are a helpful assistant.\n\n## Extra\nDo stuff."
 
 
 def test_build_options_system_prompt_append_only(executor):
     opts = executor._build_options(system_prompt_append="## Hint\nDo worktree.")
-    assert opts.system_prompt == {
-        "type": "preset",
-        "preset": "claude_code",
-        "append": "## Hint\nDo worktree.",
-    }
+    assert opts.append_system_prompt == "## Hint\nDo worktree."
 
 
 # --- _execute_inner calls ensure_worktree when branch + isolation enabled ---
@@ -358,7 +346,137 @@ async def test_execute_inner_exits_on_oauth_expired(executor, mock_config):
     mock_exit.assert_called_once_with(1)
 
 
-async def test_execute_inner_no_worktree_hint_for_apiary(executor, mock_apiary, mock_config):
+# --- has_free_slots ---
+
+def test_has_free_slots_true_when_idle(executor):
+    assert executor.has_free_slots
+
+
+def test_has_free_slots_false_at_capacity(executor, mock_config):
+    executor._active_count = mock_config.claude_max_parallel
+    assert not executor.has_free_slots
+
+
+# --- _resolve_slot ---
+
+def test_resolve_slot_main_for_no_branch(executor, mock_config):
+    mock_config.claude_worktree_isolation = True
+    mock_config.claude_working_dir = "/workspace"
+    req = ExecutionRequest(prompt="hi", chat_id="1", source="telegram")
+    assert executor._resolve_slot(req) == "__main__"
+
+
+def test_resolve_slot_worktree_path_for_branch(executor, mock_config):
+    mock_config.claude_worktree_isolation = True
+    mock_config.claude_working_dir = "/workspace"
+    req = ExecutionRequest(prompt="hi", chat_id="1", source="apiary", branch="feat/x")
+    with patch("src.claude_executor.is_git_repo", return_value=True):
+        result = executor._resolve_slot(req)
+    assert result == "/workspace/.worktrees/feat-x"
+
+
+# --- Status transitions ---
+
+async def test_status_busy_on_first_task_only(executor, mock_apiary, mock_config):
+    """update_status('busy') is called once when two tasks run in parallel on different branches."""
+    mock_config.claude_worktree_isolation = True
+    mock_config.claude_working_dir = "/workspace"
+
+    async def fake_execute_inner(req, streamer, retries):
+        await asyncio.sleep(0.1)
+
+    with patch.object(executor, "_execute_inner", fake_execute_inner), \
+         patch("src.claude_executor.is_git_repo", return_value=True), \
+         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+        MockStreamer.return_value.start = AsyncMock()
+        req1 = ExecutionRequest(prompt="a", chat_id="1", source="apiary", branch="branch-a")
+        req2 = ExecutionRequest(prompt="b", chat_id="1", source="apiary", branch="branch-b")
+        await executor.queue.put(req1)
+        await executor.queue.put(req2)
+
+        run_task = asyncio.create_task(executor.run())
+        await asyncio.sleep(0.3)
+        run_task.cancel()
+        try:
+            await run_task
+        except asyncio.CancelledError:
+            pass
+
+    busy_calls = [c for c in mock_apiary.update_status.call_args_list if c.args == ("busy",)]
+    assert len(busy_calls) == 1
+
+
+async def test_status_online_when_all_done(executor, mock_apiary, mock_config):
+    """update_status('online') is called only when the last task finishes."""
+    mock_config.claude_worktree_isolation = True
+    mock_config.claude_working_dir = "/workspace"
+
+    async def fake_execute_inner(req, streamer, retries):
+        await asyncio.sleep(0.1)
+
+    with patch.object(executor, "_execute_inner", fake_execute_inner), \
+         patch("src.claude_executor.is_git_repo", return_value=True), \
+         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+        MockStreamer.return_value.start = AsyncMock()
+        req1 = ExecutionRequest(prompt="a", chat_id="1", source="apiary", branch="branch-a")
+        req2 = ExecutionRequest(prompt="b", chat_id="1", source="apiary", branch="branch-b")
+        await executor.queue.put(req1)
+        await executor.queue.put(req2)
+
+        run_task = asyncio.create_task(executor.run())
+        await asyncio.sleep(0.4)
+        run_task.cancel()
+        try:
+            await run_task
+        except asyncio.CancelledError:
+            pass
+
+    online_calls = [c for c in mock_apiary.update_status.call_args_list if c.args == ("online",)]
+    # Both tasks run in parallel on different branches, so online is called once when both finish
+    assert len(online_calls) == 1
+
+
+# --- Same-branch serialization ---
+
+async def test_same_branch_tasks_serialize(executor, mock_config):
+    """Two tasks targeting the same branch must not overlap."""
+    mock_config.claude_worktree_isolation = True
+    mock_config.claude_working_dir = "/workspace"
+
+    execution_log = []
+
+    async def fake_execute_inner(req, streamer, retries):
+        execution_log.append(f"start-{req.prompt}")
+        await asyncio.sleep(0.05)
+        execution_log.append(f"end-{req.prompt}")
+
+    with patch.object(executor, "_execute_inner", fake_execute_inner), \
+         patch("src.claude_executor.is_git_repo", return_value=True), \
+         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+        MockStreamer.return_value.start = AsyncMock()
+
+        req1 = ExecutionRequest(prompt="first", chat_id="1", source="apiary", branch="same-branch")
+        req2 = ExecutionRequest(prompt="second", chat_id="1", source="apiary", branch="same-branch")
+        await executor.queue.put(req1)
+        await executor.queue.put(req2)
+
+        run_task = asyncio.create_task(executor.run())
+        await asyncio.sleep(0.3)
+        run_task.cancel()
+        try:
+            await run_task
+        except asyncio.CancelledError:
+            pass
+
+    # Because they share the same worktree lock, first must finish before second starts
+    assert execution_log.index("end-first") < execution_log.index("start-second")
+
+
+async def test_execute_inner_injects_worktree_hint_for_apiary_without_branch(
+    executor, mock_apiary, mock_config
+):
+    """Apiary tasks without an explicit branch should get worktree instructions
+    so Claude branches from origin/main instead of the current HEAD."""
     mock_config.claude_worktree_isolation = True
     mock_config.claude_working_dir = "/workspace"
 
@@ -386,4 +504,6 @@ async def test_execute_inner_no_worktree_hint_for_apiary(executor, mock_apiary, 
         streamer.finish = AsyncMock()
         await executor._execute_inner(req, streamer, retries=1)
 
-    assert captured_appends[0] is None
+    assert captured_appends[0] is not None
+    assert "Worktree Isolation" in captured_appends[0]
+    assert "origin/main" in captured_appends[0]

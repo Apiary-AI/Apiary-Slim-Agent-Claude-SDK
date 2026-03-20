@@ -5,7 +5,7 @@ import tempfile
 
 import pytest
 
-from src.worktree_manager import infer_branch, is_git_repo, worktree_path
+from src.worktree_manager import infer_branch, is_git_repo, slot_key, worktree_path
 
 
 # --- worktree_path ---
@@ -33,6 +33,16 @@ def test_is_git_repo_true_when_dot_git_exists():
     with tempfile.TemporaryDirectory() as d:
         os.makedirs(os.path.join(d, ".git"))
         assert is_git_repo(d)
+
+
+# --- slot_key ---
+
+def test_slot_key_with_branch():
+    assert slot_key("/workspace", "feature/login") == "/workspace/.worktrees/feature-login"
+
+
+def test_slot_key_without_branch():
+    assert slot_key("/workspace", None) == "__main__"
 
 
 # --- infer_branch: PR head ref ---
@@ -95,6 +105,39 @@ def test_infer_branch_event_payload_nested_in_payload():
         },
     }
     assert infer_branch(task) == "nested-branch"
+
+
+# --- infer_branch: PR ref nested inside event_payload.body (Apiary webhook wrapping) ---
+
+def test_infer_branch_pr_ref_inside_body():
+    task = {
+        "id": "t9",
+        "payload": {
+            "event_payload": {
+                "action": "created",
+                "repository": {"full_name": "Org/Repo"},
+                "body": {
+                    "action": "created",
+                    "number": 42,
+                    "pull_request": {"head": {"ref": "feature/from-body"}},
+                },
+            },
+        },
+    }
+    assert infer_branch(task) == "feature/from-body"
+
+
+def test_infer_branch_push_ref_inside_body():
+    task = {
+        "id": "t10",
+        "payload": {
+            "event_payload": {
+                "action": "push",
+                "body": {"ref": "refs/heads/push-from-body"},
+            },
+        },
+    }
+    assert infer_branch(task) == "push-from-body"
 
 
 # --- infer_branch: no branch info ---

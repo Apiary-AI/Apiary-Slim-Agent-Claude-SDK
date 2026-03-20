@@ -16,7 +16,7 @@ log = logging.getLogger(__name__)
 
 # Telegram message text limit (leave margin for formatting)
 MAX_MSG_LEN = 4000
-MIN_EDIT_INTERVAL = 1.0  # seconds between edits
+MIN_EDIT_INTERVAL = 1.5  # seconds between edits (per-streamer)
 
 # ── Human-readable tool descriptions ─────────────────────────────────
 
@@ -118,6 +118,28 @@ def md_to_telegram(text: str) -> str:
 class TelegramStreamer:
     """Accumulates text and pushes it to Telegram via message editing."""
 
+    # Global rate limiter shared across ALL streamer instances (per-bot limit).
+    _global_lock: asyncio.Lock | None = None
+    _global_last_call: float = 0.0
+    _GLOBAL_MIN_INTERVAL: float = 0.35  # ~3 calls/sec max across all streamers
+
+    @classmethod
+    def _get_lock(cls) -> asyncio.Lock:
+        """Lazily create the lock inside the running event loop."""
+        if cls._global_lock is None:
+            cls._global_lock = asyncio.Lock()
+        return cls._global_lock
+
+    @classmethod
+    async def _rate_limit(cls) -> None:
+        """Wait until enough time has passed since the last Telegram API call."""
+        async with cls._get_lock():
+            now = time.monotonic()
+            wait = cls._GLOBAL_MIN_INTERVAL - (now - cls._global_last_call)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            cls._global_last_call = time.monotonic()
+
     def __init__(self, bot: Bot, chat_id: int | str) -> None:
         self._bot = bot
         self._chat_id = chat_id
@@ -132,7 +154,11 @@ class TelegramStreamer:
         self._status_ticker: asyncio.Task | None = None
 
     async def start(self) -> None:
-        await self._bot.send_chat_action(chat_id=self._chat_id, action=ChatAction.TYPING)
+        await self._rate_limit()
+        try:
+            await self._bot.send_chat_action(chat_id=self._chat_id, action=ChatAction.TYPING)
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
         self._current_msg_id = None
         self._buffer = ""
         self._last_edit = time.monotonic()
@@ -221,6 +247,7 @@ class TelegramStreamer:
         elapsed = self._format_elapsed()
         status_text = f"⏳ {self._status_description} ({elapsed})"
         try:
+            await self._rate_limit()
             if self._status_msg_id is None:
                 msg = await self._bot.send_message(
                     chat_id=self._chat_id, text=status_text,
@@ -238,9 +265,18 @@ class TelegramStreamer:
     async def error(self, error_text: str) -> None:
         """Send an error message (fire-and-forget — must never crash)."""
         try:
+            await self._rate_limit()
             await self._bot.send_message(
                 chat_id=self._chat_id, text=f"❌ {error_text}"
             )
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            try:
+                await self._bot.send_message(
+                    chat_id=self._chat_id, text=f"❌ {error_text}"
+                )
+            except Exception:
+                pass
         except Exception:
             log.warning("Failed to send error message to Telegram", exc_info=True)
 
@@ -248,16 +284,24 @@ class TelegramStreamer:
 
     async def _send_formatted(self, text: str) -> Any:
         """Send a new message with MarkdownV2, falling back to plain text."""
+        await self._rate_limit()
         try:
             return await self._bot.send_message(
                 chat_id=self._chat_id,
                 text=md_to_telegram(text),
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after)
+            return await self._send_formatted(text)
         except BadRequest:
-            return await self._bot.send_message(
-                chat_id=self._chat_id, text=text,
-            )
+            try:
+                return await self._bot.send_message(
+                    chat_id=self._chat_id, text=text,
+                )
+            except RetryAfter as e:
+                await asyncio.sleep(e.retry_after)
+                return await self._send_formatted(text)
 
     async def _delete_status(self) -> None:
         """Cancel the ticker and delete the ephemeral status message."""
@@ -266,17 +310,19 @@ class TelegramStreamer:
             self._status_ticker = None
         if self._status_msg_id is not None:
             try:
+                await self._rate_limit()
                 await self._bot.delete_message(
                     chat_id=self._chat_id,
                     message_id=self._status_msg_id,
                 )
-            except BadRequest:
+            except (BadRequest, RetryAfter):
                 pass
             self._status_msg_id = None
 
     async def _edit_current(self) -> None:
         if not self._current_msg_id or not self._buffer:
             return
+        await self._rate_limit()
         try:
             formatted = md_to_telegram(self._buffer[:4096])
             await self._bot.edit_message_text(

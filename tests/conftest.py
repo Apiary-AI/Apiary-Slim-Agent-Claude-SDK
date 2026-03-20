@@ -13,6 +13,7 @@ def mock_config():
     cfg.claude_working_dir = "/tmp"
     cfg.apiary_poll_interval = 1
     cfg.telegram_chat_id = "123"
+    cfg.claude_max_parallel = 3
     return cfg
 
 
@@ -25,6 +26,7 @@ def mock_apiary():
     a.complete_task = AsyncMock()
     a.fail_task = AsyncMock()
     a.heartbeat = AsyncMock()
+    a.update_status = AsyncMock()
     return a
 
 

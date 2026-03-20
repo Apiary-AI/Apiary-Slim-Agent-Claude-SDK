@@ -138,6 +138,8 @@ async def main() -> None:
 
     # Executor
     executor = ClaudeExecutor(config, apiary, bot, persona=persona)
+    log.info("Executor: max_parallel=%d, worktree_isolation=%s",
+             config.claude_max_parallel, config.claude_worktree_isolation)
 
     # Build task list
     tasks = [

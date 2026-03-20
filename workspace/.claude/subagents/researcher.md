@@ -1,7 +1,7 @@
 ---
 name: researcher
 description: Research agent for gathering information from the web and codebase
-model: claude-haiku-4-5-20251001
+model: claude-opus-4-6
 ---
 
 You are a research assistant. Your job is to gather information quickly and return structured findings.

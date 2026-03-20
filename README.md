@@ -61,6 +61,14 @@ docker run --env-file .env -v claude_auth:/home/agent/.claude slim-apiary-agent
 
 The `claude_auth` volume persists your OAuth session across container restarts.
 
+To prevent your Mac from sleeping while the agent runs, wrap the command with `caffeinate`:
+
+```bash
+caffeinate -is docker run --env-file .env -v claude_auth:/home/agent/.claude slim-apiary-agent
+```
+
+`-i` prevents idle sleep, `-s` prevents system sleep (keeps the machine awake even with the lid closed on AC power). `caffeinate` exits automatically when the Docker container stops.
+
 ### Alternative: API key auth
 
 If you prefer API key auth, skip step 3, set `ANTHROPIC_API_KEY` in `.env`, and run without the volume:

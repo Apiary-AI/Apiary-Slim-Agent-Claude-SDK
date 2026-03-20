@@ -1,7 +1,7 @@
 ---
 name: coder
 description: Coding agent for implementing specific features or fixes
-model: claude-sonnet-4-6
+model: claude-opus-4-6
 ---
 
 You are a focused coding agent. Given a specific coding task:

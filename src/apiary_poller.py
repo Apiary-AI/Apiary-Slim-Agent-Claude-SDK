@@ -53,6 +53,22 @@ async def run_apiary_poller(
                     if not prompt:
                         prompt = task.get("input", task.get("prompt", task.get("description", "")))
 
+                    # webhook_handler tasks may carry only event_payload and no prompt.
+                    # Synthesize a prompt so the agent can act on the event.
+                    if not prompt and task.get("type") == "webhook_handler":
+                        event_payload = (
+                            payload.get("event_payload")
+                            if isinstance(payload, dict)
+                            else None
+                        )
+                        if isinstance(event_payload, dict):
+                            action = event_payload.get("action", "unknown")
+                            repo = (event_payload.get("repository") or {}).get("full_name", "unknown")
+                            prompt = (
+                                f"Handle this GitHub webhook event: action={action}, "
+                                f"repo={repo}. Inspect the attached payload for full details."
+                            )
+
                     # Attach webhook/event payload as context so Claude
                     # can see the data it needs to act on.
                     context_data = task.get("payload") or task.get("event_payload")
@@ -82,8 +98,9 @@ async def run_apiary_poller(
                     # Don't claim new tasks while the executor is busy.
                     # Claiming eagerly causes claim timeouts for queued tasks,
                     # which sends them back to pending and creates a retry storm.
-                    if executor.is_busy:
-                        log.debug("Executor busy, deferring task %s", task_id)
+                    if not executor.has_free_slots:
+                        log.debug("Executor at capacity (%d slots), deferring remaining tasks",
+                                  config.claude_max_parallel)
                         break
 
                     try:

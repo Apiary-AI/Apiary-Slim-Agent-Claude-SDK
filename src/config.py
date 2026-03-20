@@ -29,6 +29,7 @@ class Config:
     claude_max_turns: int = 30
     claude_working_dir: str = "/workspace"
     claude_worktree_isolation: bool = False
+    claude_max_parallel: int = 3
 
     @classmethod
     def from_env(cls) -> Config:
@@ -64,6 +65,7 @@ class Config:
             claude_max_turns=int(os.environ.get("CLAUDE_MAX_TURNS", "30")),
             claude_working_dir=working_dir,
             claude_worktree_isolation=worktree_isolation,
+            claude_max_parallel=int(os.environ.get("CLAUDE_MAX_PARALLEL", "3")),
         )
 
     @property

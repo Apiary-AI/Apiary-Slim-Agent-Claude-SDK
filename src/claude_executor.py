@@ -37,7 +37,7 @@ from .config import Config
 from .module_loader import collect_mcp_servers, discover_modules
 from .session_store import SessionStore
 from .telegram_streamer import TelegramStreamer
-from .worktree_manager import ensure_worktree, is_git_repo
+from .worktree_manager import ensure_worktree, is_git_repo, worktree_path
 
 log = logging.getLogger(__name__)
 
@@ -70,6 +70,9 @@ class ClaudeExecutor:
         self._sessions = SessionStore()
         self.queue: asyncio.Queue[ExecutionRequest] = asyncio.Queue()
         self._in_flight_apiary_tasks: set[str] = set()
+        self._semaphore = asyncio.Semaphore(config.claude_max_parallel)
+        self._worktree_locks: dict[str, asyncio.Lock] = {}
+        self._active_count: int = 0
 
     @property
     def pending(self) -> int:
@@ -77,8 +80,13 @@ class ClaudeExecutor:
 
     @property
     def is_busy(self) -> bool:
-        """True if a task is currently executing or queued."""
-        return bool(self._in_flight_apiary_tasks) or self.queue.qsize() > 0
+        """True if any task is currently executing."""
+        return self._active_count > 0
+
+    @property
+    def has_free_slots(self) -> bool:
+        """True if the executor can accept more concurrent tasks."""
+        return self._active_count < self._config.claude_max_parallel
 
     def add_apiary_task(self, task_id: str) -> None:
         self._in_flight_apiary_tasks.add(task_id)
@@ -93,24 +101,44 @@ class ClaudeExecutor:
         """Clear the stored session for a chat, starting fresh next message."""
         self._sessions.clear(chat_id)
 
+    def _get_worktree_lock(self, slot: str) -> asyncio.Lock:
+        if slot not in self._worktree_locks:
+            self._worktree_locks[slot] = asyncio.Lock()
+        return self._worktree_locks[slot]
+
+    def _resolve_slot(self, req: ExecutionRequest) -> str:
+        if (
+            req.branch
+            and self._config.claude_worktree_isolation
+            and is_git_repo(self._config.claude_working_dir)
+        ):
+            return worktree_path(self._config.claude_working_dir, req.branch)
+        return "__main__"
+
     async def run(self) -> None:
-        """Infinite loop: pull requests from queue, execute one at a time."""
-        log.info("Claude executor started")
+        """Infinite loop: pull requests from queue, dispatch concurrent workers."""
+        log.info("Claude executor started (max_parallel=%d)", self._config.claude_max_parallel)
         while True:
             req = await self.queue.get()
+            asyncio.create_task(self._run_one(req))
+
+    async def _run_one(self, req: ExecutionRequest) -> None:
+        try:
+            async with self._semaphore:
+                slot = self._resolve_slot(req)
+                wt_lock = self._get_worktree_lock(slot)
+                async with wt_lock:
+                    await self._execute(req)
+        except asyncio.CancelledError:
             try:
-                await self._execute(req)
+                await asyncio.sleep(0)
             except asyncio.CancelledError:
-                # Probe whether this is a real shutdown or spurious SDK cancellation
-                try:
-                    await asyncio.sleep(0)
-                except asyncio.CancelledError:
-                    raise  # Real shutdown — propagate
-                log.warning("Spurious CancelledError during execution (suppressed)")
-            except Exception:
-                log.exception("Execution failed for request: %s", req)
-            finally:
-                self.queue.task_done()
+                raise
+            log.warning("Spurious CancelledError during execution (suppressed)")
+        except Exception:
+            log.exception("Execution failed for request: %s", req)
+        finally:
+            self.queue.task_done()
 
     async def _report_progress(
         self, task_id: str, claim_expired: asyncio.Event, interval: int = 30
@@ -132,7 +160,8 @@ class ClaudeExecutor:
                 log.debug("Progress update failed for task %s", task_id)
 
     async def _execute(self, req: ExecutionRequest, retries: int = 3) -> None:
-        if self._apiary:
+        self._active_count += 1
+        if self._active_count == 1 and self._apiary:
             try:
                 await self._apiary.update_status("busy")
             except Exception:
@@ -189,7 +218,8 @@ class ClaudeExecutor:
                     pass
             if req.apiary_task_id:
                 self.remove_apiary_task(req.apiary_task_id)
-            if self._apiary:
+            self._active_count -= 1
+            if self._active_count == 0 and self._apiary:
                 try:
                     await self._apiary.update_status("online")
                 except Exception:
@@ -244,11 +274,10 @@ class ClaudeExecutor:
                     exc_info=True,
                 )
 
-        # Inject worktree instructions for Telegram requests without an explicit branch
+        # Inject worktree instructions for requests without an explicit branch
         system_prompt_append: str | None = None
         if (
-            req.source == "telegram"
-            and not req.branch
+            not req.branch
             and self._config.claude_worktree_isolation
             and is_git_repo(self._config.claude_working_dir)
         ):
@@ -256,9 +285,12 @@ class ClaudeExecutor:
             system_prompt_append = (
                 "## Worktree Isolation\n"
                 "When this task requires implementing code changes on a new branch:\n"
-                f"1. Choose a branch name, then: `git worktree add {wt_base}/.worktrees/<branch> -b <branch>`\n"
-                f"2. Do all file edits and git operations inside `{wt_base}/.worktrees/<branch>`\n"
-                "3. Commit, push the branch, and open a PR from the worktree.\n"
+                f"1. First run `git -C {wt_base} fetch origin` to get latest refs.\n"
+                f"2. Choose a branch name, then: `git worktree add {wt_base}/.worktrees/<branch> -b <branch> origin/main`\n"
+                f"3. Do all file edits and git operations inside `{wt_base}/.worktrees/<branch>`\n"
+                "4. Commit, push the branch, and open a PR from the worktree.\n"
+                "IMPORTANT: Always branch from origin/main to avoid inheriting unrelated in-progress work.\n"
+                "NEVER create branches from the current HEAD of the main workspace — it may be on an unmerged feature branch.\n"
                 "For conversational replies or read-only tasks, skip this entirely."
             )
 
