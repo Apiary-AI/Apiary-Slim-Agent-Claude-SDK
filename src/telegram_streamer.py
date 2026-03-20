@@ -154,11 +154,11 @@ class TelegramStreamer:
         self._status_ticker: asyncio.Task | None = None
 
     async def start(self) -> None:
-        await self._rate_limit()
         try:
+            await self._rate_limit()
             await self._bot.send_chat_action(chat_id=self._chat_id, action=ChatAction.TYPING)
-        except RetryAfter as e:
-            await asyncio.sleep(e.retry_after)
+        except Exception:
+            pass  # Non-critical — typing indicator is cosmetic
         self._current_msg_id = None
         self._buffer = ""
         self._last_edit = time.monotonic()
@@ -173,6 +173,8 @@ class TelegramStreamer:
             # Send first message once we have content
             if self._current_msg_id is None:
                 msg = await self._send_formatted(self._buffer[:4096])
+                if msg is None:
+                    return  # Rate limited — buffer kept, will retry next append
                 self._current_msg_id = msg.message_id
                 self._messages.append(msg.message_id)
                 self._last_edit = time.monotonic()
@@ -201,6 +203,8 @@ class TelegramStreamer:
             # If no message sent yet, send one now
             if self._current_msg_id is None:
                 msg = await self._send_formatted(self._buffer[:4096])
+                if msg is None:
+                    return
                 self._current_msg_id = msg.message_id
                 self._messages.append(msg.message_id)
                 return
@@ -282,7 +286,7 @@ class TelegramStreamer:
 
     # ── Internal ──────────────────────────────────────────────────────
 
-    async def _send_formatted(self, text: str) -> Any:
+    async def _send_formatted(self, text: str, _attempt: int = 0) -> Any:
         """Send a new message with MarkdownV2, falling back to plain text."""
         await self._rate_limit()
         try:
@@ -292,16 +296,22 @@ class TelegramStreamer:
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
         except RetryAfter as e:
-            await asyncio.sleep(e.retry_after)
-            return await self._send_formatted(text)
+            if _attempt < 2:
+                log.warning("Telegram rate limit on send, waiting %ss (attempt %d)", e.retry_after, _attempt + 1)
+                await asyncio.sleep(min(e.retry_after, 10))
+                return await self._send_formatted(text, _attempt + 1)
+            log.warning("Telegram rate limit persists after retries, dropping message")
+            return None
         except BadRequest:
             try:
                 return await self._bot.send_message(
                     chat_id=self._chat_id, text=text,
                 )
             except RetryAfter as e:
-                await asyncio.sleep(e.retry_after)
-                return await self._send_formatted(text)
+                if _attempt < 2:
+                    await asyncio.sleep(min(e.retry_after, 10))
+                    return await self._send_formatted(text, _attempt + 1)
+                return None
 
     async def _delete_status(self) -> None:
         """Cancel the ticker and delete the ephemeral status message."""
@@ -333,9 +343,8 @@ class TelegramStreamer:
             )
             self._last_edit = time.monotonic()
         except RetryAfter as e:
-            log.warning("Telegram rate limit, waiting %s seconds", e.retry_after)
-            await asyncio.sleep(e.retry_after)
-            await self._edit_current()
+            log.warning("Telegram rate limit on edit, waiting %ss", min(e.retry_after, 10))
+            await asyncio.sleep(min(e.retry_after, 10))
         except BadRequest as e:
             if "message is not modified" not in str(e).lower():
                 # Fallback: send without formatting if MarkdownV2 fails
@@ -360,6 +369,8 @@ class TelegramStreamer:
 
         # Start new message with overflow
         msg = await self._send_formatted(overflow or "...")
+        if msg is None:
+            return  # Rate limited — content stays in buffer
         self._current_msg_id = msg.message_id
         self._messages.append(msg.message_id)
         self._buffer = overflow or ""

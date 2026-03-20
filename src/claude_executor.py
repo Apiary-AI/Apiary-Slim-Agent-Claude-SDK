@@ -172,7 +172,10 @@ class ClaudeExecutor:
                 log.debug("Failed to set agent status to busy")
 
         streamer = TelegramStreamer(self._bot, req.chat_id)
-        await streamer.start()
+        try:
+            await streamer.start()
+        except Exception:
+            log.debug("Streamer start failed (non-fatal)")
         t0 = time.monotonic()
         full_text = ""
 
