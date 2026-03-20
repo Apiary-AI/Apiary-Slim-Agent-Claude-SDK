@@ -74,6 +74,10 @@ class ClaudeExecutor:
         self._worktree_locks: dict[str, asyncio.Lock] = {}
         self._active_count: int = 0
 
+    def update_persona(self, prompt: str | None) -> None:
+        """Update the persona used for future executions."""
+        self._persona = prompt
+
     @property
     def pending(self) -> int:
         return self.queue.qsize()
@@ -366,15 +370,22 @@ class ClaudeExecutor:
                         )
                     sys.exit(1)
 
-                if is_rate_limit and attempt < retries:
+                # Don't retry if execution already produced output — side
+                # effects (GitHub comments, commits, etc.) cannot be undone.
+                if full_text.strip():
+                    log.warning(
+                        "Execution produced output but failed (attempt %d/%d); "
+                        "not retrying to avoid duplicate side effects",
+                        attempt, retries,
+                    )
+                elif is_rate_limit and attempt < retries:
                     wait = 30 * attempt
                     log.warning("Rate limited (attempt %d/%d), retrying in %ds", attempt, retries, wait)
                     await streamer.append(f"\n⏳ Rate limited, retrying in {wait}s...\n")
                     await asyncio.sleep(wait)
                     continue
-
                 # If resume failed (stale session), retry without resume
-                if resume_id and attempt < retries:
+                elif resume_id and attempt < retries:
                     log.warning("Session resume failed, retrying with fresh session")
                     self._sessions.clear(req.chat_id)
                     resume_id = None

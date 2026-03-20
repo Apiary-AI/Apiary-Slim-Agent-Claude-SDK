@@ -220,6 +220,24 @@ class ApiaryClient:
             log.warning("Failed to fetch persona; proceeding without it", exc_info=True)
             return None
 
+    async def get_persona_version(self, known_version: int | None = None) -> dict[str, Any]:
+        """Check the server-assigned persona version. Lightweight poll-friendly call."""
+        try:
+            params: dict[str, Any] = {}
+            if known_version is not None:
+                params["known_version"] = known_version
+            resp = await self._request("GET", "/api/v1/persona/version", params=params or None)
+            return resp.json()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 404:
+                log.debug("Persona version endpoint not available (404)")
+            else:
+                log.warning("Failed to check persona version", exc_info=True)
+            return {}
+        except Exception:
+            log.warning("Failed to check persona version", exc_info=True)
+            return {}
+
     async def update_persona_memory(
         self,
         content: str,
@@ -233,12 +251,10 @@ class ApiaryClient:
             message: Optional changelog message.
             mode: 'append' (default), 'prepend', or 'replace'.
         """
-        body: dict[str, Any] = {"content": content}
+        body: dict[str, Any] = {"content": content, "mode": mode}
         if message:
             body["message"] = message
-        if mode != "replace":
-            body["mode"] = mode
-        resp = await self._request("PATCH", "/api/v1/persona/documents/MEMORY", json=body)
+        resp = await self._request("PATCH", "/api/v1/persona/memory", json=body)
         return resp.json()
 
     # ── Lifecycle ─────────────────────────────────────────────────────

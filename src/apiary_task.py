@@ -198,15 +198,13 @@ def update_memory(content: str, message: str | None = None, mode: str = "append"
         print("Error: APIARY_BASE_URL and APIARY_API_TOKEN must be set", file=sys.stderr)
         sys.exit(1)
 
-    body: dict = {"content": content}
+    body: dict = {"content": content, "mode": mode}
     if message:
         body["message"] = message
-    if mode != "replace":
-        body["mode"] = mode
 
     with httpx.Client(base_url=base_url, timeout=30.0, follow_redirects=True) as client:
         resp = client.patch(
-            "/api/v1/persona/documents/MEMORY",
+            "/api/v1/persona/memory",
             json=body,
             headers=_headers(token),
         )

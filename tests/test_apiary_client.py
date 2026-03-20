@@ -177,7 +177,7 @@ async def test_update_persona_memory_append_default(apiary_client):
     apiary_client._client.request.assert_called_once()
     call_kwargs = apiary_client._client.request.call_args
     assert call_kwargs.args[0] == "PATCH"
-    assert call_kwargs.args[1] == "/api/v1/persona/documents/MEMORY"
+    assert call_kwargs.args[1] == "/api/v1/persona/memory"
     assert call_kwargs.kwargs["json"] == {"content": "new content", "mode": "append"}
     assert result == {"data": {"name": "MEMORY", "content": "new content"}}
 
@@ -189,8 +189,7 @@ async def test_update_persona_memory_replace_mode(apiary_client):
     await apiary_client.update_persona_memory("full content", mode="replace")
 
     call_kwargs = apiary_client._client.request.call_args
-    # mode=replace omits the mode field (server default)
-    assert call_kwargs.kwargs["json"] == {"content": "full content"}
+    assert call_kwargs.kwargs["json"] == {"content": "full content", "mode": "replace"}
 
 
 async def test_update_persona_memory_prepend_mode(apiary_client):
@@ -225,6 +224,52 @@ async def test_update_persona_memory_no_message(apiary_client):
 
     call_kwargs = apiary_client._client.request.call_args
     assert "message" not in call_kwargs.kwargs["json"]
+
+
+# --- get_persona_version ---
+
+async def test_get_persona_version_without_known_version(apiary_client):
+    resp = _mock_resp(200, json_data={"data": {"version": 5, "changed": False}})
+    apiary_client._client.request = AsyncMock(return_value=resp)
+
+    result = await apiary_client.get_persona_version()
+
+    apiary_client._client.request.assert_called_once()
+    call_kwargs = apiary_client._client.request.call_args
+    assert call_kwargs.args[0] == "GET"
+    assert call_kwargs.args[1] == "/api/v1/persona/version"
+    assert call_kwargs.kwargs["params"] is None
+    assert result == {"data": {"version": 5, "changed": False}}
+
+
+async def test_get_persona_version_with_known_version(apiary_client):
+    resp = _mock_resp(200, json_data={"data": {"version": 7, "changed": True}})
+    apiary_client._client.request = AsyncMock(return_value=resp)
+
+    result = await apiary_client.get_persona_version(known_version=5)
+
+    call_kwargs = apiary_client._client.request.call_args
+    assert call_kwargs.kwargs["params"] == {"known_version": 5}
+    assert result == {"data": {"version": 7, "changed": True}}
+
+
+async def test_get_persona_version_returns_empty_on_404(apiary_client):
+    err_resp = MagicMock()
+    err_resp.status_code = 404
+    exc = httpx.HTTPStatusError("not found", request=MagicMock(), response=err_resp)
+    apiary_client._client.request = AsyncMock(side_effect=exc)
+
+    result = await apiary_client.get_persona_version()
+
+    assert result == {}
+
+
+async def test_get_persona_version_returns_empty_on_exception(apiary_client):
+    apiary_client._client.request = AsyncMock(side_effect=Exception("connection error"))
+
+    result = await apiary_client.get_persona_version()
+
+    assert result == {}
 
 
 async def test_update_status_sends_patch(apiary_client):

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 
 from .apiary_client import ApiaryClient
 from .claude_executor import ClaudeExecutor, ExecutionRequest
@@ -12,6 +13,29 @@ from .config import Config
 from .worktree_manager import infer_branch
 
 log = logging.getLogger(__name__)
+
+# Cooldown (seconds) for deduplicating webhook events on the same entity.
+# Multiple webhook events for the same repo+PR/issue within this window
+# are auto-completed — only the first triggers an execution.
+WEBHOOK_ENTITY_COOLDOWN = 300
+
+
+def _webhook_entity_key(task: dict) -> str | None:
+    """Extract dedup key for a webhook task (e.g. 'owner/repo:pr:123')."""
+    payload = task.get("payload", {}) or {}
+    event_payload = payload.get("event_payload") if isinstance(payload, dict) else None
+    if not isinstance(event_payload, dict):
+        return None
+    repo = (event_payload.get("repository") or {}).get("full_name")
+    if not repo:
+        return None
+    pr = event_payload.get("pull_request") or {}
+    issue = event_payload.get("issue") or {}
+    if isinstance(pr, dict) and pr.get("number"):
+        return f"{repo}:pr:{pr['number']}"
+    if isinstance(issue, dict) and issue.get("number"):
+        return f"{repo}:issue:{issue['number']}"
+    return None
 
 
 async def run_apiary_poller(
@@ -26,6 +50,9 @@ async def run_apiary_poller(
     """
     log.info("Apiary poller started (interval=%ds)", config.apiary_poll_interval)
 
+    persona_version: int | None = None
+    recent_webhook_entities: dict[str, tuple[float, str]] = {}  # entity_key -> (mono_ts, primary_task_id)
+
     try:
         while True:
             # Heartbeat first — keeps agent online in Apiary
@@ -34,11 +61,56 @@ async def run_apiary_poller(
             except Exception:
                 log.exception("Heartbeat failed")
 
+            # Check for persona changes
+            try:
+                ver_data = await apiary.get_persona_version(known_version=persona_version)
+                data = ver_data.get("data", ver_data) if isinstance(ver_data, dict) else {}
+                changed = data.get("changed", False)
+                server_version = data.get("version")
+                if changed or (server_version is not None and server_version != persona_version):
+                    new_persona = await apiary.get_persona_assembled()
+                    executor.update_persona(new_persona)
+                    persona_version = server_version
+                    log.info("Persona refreshed (version=%s)", persona_version)
+                elif persona_version is None and server_version is not None:
+                    persona_version = server_version  # initial sync
+            except Exception:
+                log.debug("Persona version check failed", exc_info=True)
+
             # Then poll for tasks
             try:
                 tasks = await apiary.poll_tasks()
+
+                # Expire old webhook entity entries
+                _now = time.monotonic()
+                recent_webhook_entities = {
+                    k: v for k, v in recent_webhook_entities.items()
+                    if _now - v[0] < WEBHOOK_ENTITY_COOLDOWN
+                }
+
                 for task in tasks:
                     task_id = str(task.get("id", ""))
+
+                    # Webhook dedup: auto-complete events for recently handled entities
+                    if task.get("type") == "webhook_handler" and task_id:
+                        entity_key = _webhook_entity_key(task)
+                        if entity_key and entity_key in recent_webhook_entities:
+                            _, primary_id = recent_webhook_entities[entity_key]
+                            try:
+                                await apiary.claim_task(task_id)
+                                await apiary.complete_task(
+                                    task_id,
+                                    f"Consolidated: duplicate webhook for {entity_key}, "
+                                    f"already handled by task {primary_id}.",
+                                )
+                                log.info(
+                                    "Auto-completed duplicate webhook task %s (entity=%s)",
+                                    task_id, entity_key,
+                                )
+                            except Exception:
+                                log.debug("Failed to auto-complete duplicate webhook %s", task_id)
+                            continue
+
                     # Prompt can be in payload.prompt, payload.input,
                     # invoke.instructions, or top-level fields
                     payload = task.get("payload", {}) or {}
@@ -119,6 +191,12 @@ async def run_apiary_poller(
                     branch = infer_branch(task)
                     if branch:
                         log.debug("Inferred branch %r for task %s", branch, task_id)
+
+                    # Track webhook entity for cross-cycle dedup
+                    if task.get("type") == "webhook_handler":
+                        ek = _webhook_entity_key(task)
+                        if ek:
+                            recent_webhook_entities[ek] = (time.monotonic(), task_id)
 
                     req = ExecutionRequest(
                         prompt=prompt,

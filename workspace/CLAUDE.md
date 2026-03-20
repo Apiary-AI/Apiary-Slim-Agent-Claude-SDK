@@ -6,6 +6,7 @@ You are running inside a Docker container as part of the Slim Apiary Agent syste
 
 - **OS**: Debian (node:22-slim based)
 - **Working directory**: /workspace
+- **Cloned repos**: `/workspace/repos/` — repositories are cloned here. Before cloning, always check if the repo already exists at `/workspace/repos/<RepoName>`. If it does, use it (run `git fetch` if needed). Only clone if it's genuinely not there yet.
 - **Available tools**: git, node, npm, python3, pip
 - **GitHub API**: Always use `gh` CLI for GitHub operations (PRs, issues, API calls). Never use `curl` with the GitHub API directly — `gh` is pre-authenticated and handles pagination/auth automatically.
 - **User**: non-root `agent` user
@@ -167,6 +168,8 @@ Your PR comments and pushes trigger GitHub webhooks, which create new Apiary tas
 - **CI failures must always be investigated**, even when triggered by your own push. A push → CI fail → fix → push cycle is finite (it ends when CI passes). Do NOT skip CI failure events on the grounds that you made the triggering push.
 - When working on PRs, **prefer pushing commits over leaving comments**. Every PR comment triggers a webhook. Only comment when the result cannot be expressed as a commit.
 - **NEVER comment on a PR just to say "done" or "fixed"** — the push itself is sufficient.
+- **If a review has no actionable feedback** (approval, "LGTM", no findings, etc.), do NOT comment at all. Just report "No actionable feedback — nothing to do" and finish. Acknowledging a review with a comment is unnecessary noise and triggers another webhook.
+- **One comment max per task.** Never leave multiple comments on the same PR in a single execution. If you need to respond to multiple review points, consolidate into a single comment.
 
 ### Task Lifecycle (automatic)
 - Tasks are **polled** from the hive automatically by the agent daemon
