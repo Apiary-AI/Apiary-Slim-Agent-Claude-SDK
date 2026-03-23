@@ -85,7 +85,10 @@ async def test_execute_removes_task_after_claim_expiry(executor):
          patch.object(executor, "_execute_inner", fake_execute_inner), \
          patch("src.claude_executor.TelegramStreamer") as MockStreamer:
         MockStreamer.return_value.start = AsyncMock()
-        await asyncio.wait_for(executor._execute(req), timeout=2.0)
+        # Put on queue so task_done() in _run_one works correctly
+        await executor.queue.put(req)
+        await executor.queue.get()  # simulate run() pulling from queue
+        await asyncio.wait_for(executor._run_one(req), timeout=2.0)
 
     assert not executor.has_apiary_task("task-x")
 

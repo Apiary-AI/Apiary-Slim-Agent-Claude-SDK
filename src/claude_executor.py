@@ -132,12 +132,53 @@ class ClaudeExecutor:
             asyncio.create_task(self._run_one(req))
 
     async def _run_one(self, req: ExecutionRequest) -> None:
+        claim_expired = asyncio.Event()
+        progress_task: asyncio.Task | None = None
+
+        # Start heartbeat IMMEDIATELY — before semaphore/worktree waits.
+        # This keeps the server-side claim alive while queued.
+        if req.source == "apiary" and req.apiary_task_id and self._apiary:
+            progress_task = asyncio.create_task(
+                self._report_progress(req.apiary_task_id, claim_expired)
+            )
+
         try:
             async with self._semaphore:
+                if claim_expired.is_set():
+                    log.warning("Claim expired while waiting for semaphore: %s", req.apiary_task_id)
+                    return
+
                 slot = self._resolve_slot(req)
                 wt_lock = self._get_worktree_lock(slot)
-                async with wt_lock:
-                    await self._execute(req)
+
+                # Wait for worktree lock OR claim expiry — whichever comes first
+                lock_acquired = False
+                try:
+                    lock_task = asyncio.create_task(wt_lock.acquire())
+                    expire_task = asyncio.create_task(claim_expired.wait())
+                    done, pending = await asyncio.wait(
+                        [lock_task, expire_task],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for p in pending:
+                        p.cancel()
+                        try:
+                            await p
+                        except asyncio.CancelledError:
+                            pass
+
+                    if claim_expired.is_set():
+                        # Release lock if we got it while also expiring
+                        if lock_task in done and lock_task.result():
+                            wt_lock.release()
+                        log.warning("Claim expired while waiting for worktree lock: %s", req.apiary_task_id)
+                        return
+
+                    lock_acquired = True
+                    await self._execute(req, claim_expired)
+                finally:
+                    if lock_acquired:
+                        wt_lock.release()
         except asyncio.CancelledError:
             try:
                 await asyncio.sleep(0)
@@ -147,6 +188,14 @@ class ClaudeExecutor:
         except Exception:
             log.exception("Execution failed for request: %s", req)
         finally:
+            if progress_task:
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
+                    pass
+            if req.apiary_task_id:
+                self.remove_apiary_task(req.apiary_task_id)
             self.queue.task_done()
 
     async def _report_progress(
@@ -168,7 +217,9 @@ class ClaudeExecutor:
             except Exception:
                 log.debug("Progress update failed for task %s", task_id)
 
-    async def _execute(self, req: ExecutionRequest, retries: int = 3) -> None:
+    async def _execute(
+        self, req: ExecutionRequest, claim_expired: asyncio.Event, retries: int = 3,
+    ) -> None:
         self._active_count += 1
         if self._active_count == 1 and self._apiary:
             try:
@@ -183,15 +234,6 @@ class ClaudeExecutor:
             log.debug("Streamer start failed (non-fatal)")
         t0 = time.monotonic()
         full_text = ""
-
-        claim_expired = asyncio.Event()
-
-        # Start background progress reporter for Apiary tasks
-        progress_task: asyncio.Task | None = None
-        if req.source == "apiary" and req.apiary_task_id and self._apiary:
-            progress_task = asyncio.create_task(
-                self._report_progress(req.apiary_task_id, claim_expired)
-            )
 
         inner_task: asyncio.Task | None = None
         watcher_task: asyncio.Task | None = None
@@ -222,14 +264,6 @@ class ClaudeExecutor:
                     await watcher_task
                 except asyncio.CancelledError:
                     pass
-            if progress_task:
-                progress_task.cancel()
-                try:
-                    await progress_task
-                except asyncio.CancelledError:
-                    pass
-            if req.apiary_task_id:
-                self.remove_apiary_task(req.apiary_task_id)
             self._active_count -= 1
             if self._active_count == 0 and self._apiary:
                 try:
