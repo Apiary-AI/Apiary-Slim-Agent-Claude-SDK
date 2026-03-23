@@ -1,4 +1,9 @@
-"""Streams Claude output to Telegram by editing messages in real-time."""
+"""Streams Claude output to Telegram by editing messages in real-time.
+
+All Telegram API calls are delegated to a :class:`TelegramGateway` instance
+which serializes them through a single processing loop.  This class handles
+only buffer management, markdown formatting, and message tracking.
+"""
 
 from __future__ import annotations
 
@@ -8,9 +13,10 @@ import re
 import time
 from typing import Any
 
-from telegram import Bot
 from telegram.constants import ChatAction, ParseMode
-from telegram.error import BadRequest, RetryAfter
+from telegram.error import BadRequest
+
+from .telegram_gateway import TelegramGateway
 
 log = logging.getLogger(__name__)
 
@@ -92,11 +98,6 @@ def md_to_telegram(text: str) -> str:
     # Bold: **text** → *text*
     text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text)
 
-    # Escape special MarkdownV2 characters (except those we use for formatting)
-    # Must escape: _ [ ] ( ) ~ > + - = | { } . !
-    def _escape(t: str) -> str:
-        return re.sub(r"([_\[\]()~>+\-=|{}.!\\#])", r"\\\1", t)
-
     # Split by our placeholders, escape only non-code parts
     parts = re.split(r"(\x00(?:CODEBLOCK|INLINE)\d+\x00)", text)
     result = []
@@ -116,74 +117,14 @@ def md_to_telegram(text: str) -> str:
 
 
 class TelegramStreamer:
-    """Accumulates text and pushes it to Telegram via message editing."""
+    """Accumulates text and pushes it to Telegram via message editing.
 
-    # Global rate limiter shared across ALL streamer instances (per-bot limit).
-    _global_lock: asyncio.Lock | None = None
-    _global_last_call: float = 0.0
-    _backoff_until: float = 0.0  # monotonic timestamp — all calls pause until this
-    _consecutive_429s: int = 0
-    _GLOBAL_MIN_INTERVAL: float = 0.35  # ~3 calls/sec max across all streamers
-    _MAX_BACKOFF: float = 120.0  # cap retry_after to prevent hour-long bans
-    _CIRCUIT_BREAKER_THRESHOLD: int = 5  # after N consecutive 429s, drop messages
+    All Telegram API calls go through the gateway — this class never
+    touches the Bot object directly.
+    """
 
-    @classmethod
-    def _get_lock(cls) -> asyncio.Lock:
-        """Lazily create the lock inside the running event loop."""
-        if cls._global_lock is None:
-            cls._global_lock = asyncio.Lock()
-        return cls._global_lock
-
-    @classmethod
-    def _set_backoff(cls, retry_after: float) -> None:
-        """Set global backoff from a Telegram RetryAfter response."""
-        capped = min(retry_after, cls._MAX_BACKOFF)
-        cls._backoff_until = max(cls._backoff_until, time.monotonic() + capped)
-        cls._consecutive_429s += 1
-        log.warning(
-            "Telegram 429 — backoff %.1fs (capped from %.1fs), consecutive=%d",
-            capped, retry_after, cls._consecutive_429s,
-        )
-
-    @classmethod
-    def _reset_429_counter(cls) -> None:
-        """Reset consecutive 429 counter on a successful API call."""
-        cls._consecutive_429s = 0
-
-    @classmethod
-    def _is_circuit_open(cls) -> bool:
-        """True if too many consecutive 429s — callers should silently drop."""
-        return cls._consecutive_429s >= cls._CIRCUIT_BREAKER_THRESHOLD
-
-    @classmethod
-    async def _rate_limit(cls) -> None:
-        """Wait until enough time has passed since the last Telegram API call.
-
-        Raises ``RuntimeError`` if the circuit breaker has tripped (too many
-        consecutive 429s).  Callers should catch this and silently skip the
-        Telegram call so that task execution is not blocked.
-        """
-        if cls._is_circuit_open():
-            # Still respect backoff — check if it has expired and we can retry
-            if time.monotonic() < cls._backoff_until:
-                raise RuntimeError("Telegram circuit breaker open")
-            # Backoff expired — allow one probe call through
-            log.info("Telegram circuit breaker: probing after backoff expired")
-
-        async with cls._get_lock():
-            now = time.monotonic()
-            # Respect backoff from 429 responses
-            if cls._backoff_until > now:
-                backoff_wait = cls._backoff_until - now
-                await asyncio.sleep(backoff_wait)
-            # Normal rate limiting
-            wait = cls._GLOBAL_MIN_INTERVAL - (time.monotonic() - cls._global_last_call)
-            if wait > 0:
-                await asyncio.sleep(wait)
-            cls._global_last_call = time.monotonic()
-
-    def __init__(self, bot: Bot, chat_id: int | str) -> None:
-        self._bot = bot
+    def __init__(self, gateway: TelegramGateway, chat_id: int | str) -> None:
+        self._gateway = gateway
         self._chat_id = chat_id
         self._messages: list[int] = []  # sent message IDs
         self._buffer = ""
@@ -197,8 +138,7 @@ class TelegramStreamer:
 
     async def start(self) -> None:
         try:
-            await self._rate_limit()
-            await self._bot.send_chat_action(chat_id=self._chat_id, action=ChatAction.TYPING)
+            await self._gateway.send_chat_action(self._chat_id, ChatAction.TYPING)
         except Exception:
             pass  # Non-critical — typing indicator is cosmetic
         self._current_msg_id = None
@@ -293,74 +233,46 @@ class TelegramStreamer:
         elapsed = self._format_elapsed()
         status_text = f"⏳ {self._status_description} ({elapsed})"
         try:
-            await self._rate_limit()
             if self._status_msg_id is None:
-                msg = await self._bot.send_message(
-                    chat_id=self._chat_id, text=status_text,
+                msg = await self._gateway.send_message(
+                    self._chat_id, status_text,
                 )
-                self._status_msg_id = msg.message_id
+                if msg is not None:
+                    self._status_msg_id = msg.message_id
             else:
-                await self._bot.edit_message_text(
-                    chat_id=self._chat_id,
-                    message_id=self._status_msg_id,
-                    text=status_text,
+                await self._gateway.edit_message_text(
+                    self._chat_id,
+                    self._status_msg_id,
+                    status_text,
                 )
-            self._reset_429_counter()
-        except RetryAfter as e:
-            self._set_backoff(e.retry_after)
-        except (BadRequest, RuntimeError):
-            pass  # Non-critical — skip if update fails or circuit open
+        except BadRequest:
+            pass  # Non-critical — skip if update fails
 
     async def error(self, error_text: str) -> None:
         """Send an error message (fire-and-forget — must never crash)."""
         try:
-            await self._rate_limit()
-            await self._bot.send_message(
-                chat_id=self._chat_id, text=f"❌ {error_text}"
+            await self._gateway.send_message(
+                self._chat_id, f"❌ {error_text}",
             )
-            self._reset_429_counter()
-        except RetryAfter as e:
-            self._set_backoff(e.retry_after)
-            # Don't retry — just skip, error messages are best-effort
-        except RuntimeError:
-            pass  # circuit breaker open
         except Exception:
             log.warning("Failed to send error message to Telegram", exc_info=True)
 
     # ── Internal ──────────────────────────────────────────────────────
 
-    async def _send_formatted(self, text: str, _attempt: int = 0) -> Any:
+    async def _send_formatted(self, text: str) -> Any:
         """Send a new message with MarkdownV2, falling back to plain text."""
         try:
-            await self._rate_limit()
-        except RuntimeError:
-            return None  # circuit breaker open — silently drop
-        try:
-            msg = await self._bot.send_message(
-                chat_id=self._chat_id,
-                text=md_to_telegram(text),
+            return await self._gateway.send_message(
+                self._chat_id,
+                md_to_telegram(text),
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
-            self._reset_429_counter()
-            return msg
-        except RetryAfter as e:
-            self._set_backoff(e.retry_after)
-            if _attempt < 2:
-                await asyncio.sleep(min(e.retry_after, self._MAX_BACKOFF))
-                return await self._send_formatted(text, _attempt + 1)
-            return None
         except BadRequest:
             try:
-                msg = await self._bot.send_message(
-                    chat_id=self._chat_id, text=text,
+                return await self._gateway.send_message(
+                    self._chat_id, text,
                 )
-                self._reset_429_counter()
-                return msg
-            except RetryAfter as e:
-                self._set_backoff(e.retry_after)
-                if _attempt < 2:
-                    await asyncio.sleep(min(e.retry_after, self._MAX_BACKOFF))
-                    return await self._send_formatted(text, _attempt + 1)
+            except Exception:
                 return None
 
     async def _delete_status(self) -> None:
@@ -370,15 +282,8 @@ class TelegramStreamer:
             self._status_ticker = None
         if self._status_msg_id is not None:
             try:
-                await self._rate_limit()
-                await self._bot.delete_message(
-                    chat_id=self._chat_id,
-                    message_id=self._status_msg_id,
-                )
-                self._reset_429_counter()
-            except RetryAfter as e:
-                self._set_backoff(e.retry_after)
-            except (BadRequest, RuntimeError):
+                await self._gateway.delete_message(self._chat_id, self._status_msg_id)
+            except Exception:
                 pass
             self._status_msg_id = None
 
@@ -386,34 +291,25 @@ class TelegramStreamer:
         if not self._current_msg_id or not self._buffer:
             return
         try:
-            await self._rate_limit()
-        except RuntimeError:
-            return  # circuit breaker open — silently skip edit
-        try:
             formatted = md_to_telegram(self._buffer[:4096])
-            await self._bot.edit_message_text(
-                chat_id=self._chat_id,
-                message_id=self._current_msg_id,
-                text=formatted,
+            await self._gateway.edit_message_text(
+                self._chat_id,
+                self._current_msg_id,
+                formatted,
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
             self._last_edit = time.monotonic()
-            self._reset_429_counter()
-        except RetryAfter as e:
-            self._set_backoff(e.retry_after)
-            # Don't sleep here — just skip this edit, next one will respect backoff
         except BadRequest as e:
             if "message is not modified" not in str(e).lower():
-                # Fallback: send without formatting if MarkdownV2 fails
                 log.warning("Markdown parse failed, falling back to plain text: %s", e)
                 try:
-                    await self._bot.edit_message_text(
-                        chat_id=self._chat_id,
-                        message_id=self._current_msg_id,
-                        text=self._buffer[:4096],
+                    await self._gateway.edit_message_text(
+                        self._chat_id,
+                        self._current_msg_id,
+                        self._buffer[:4096],
                     )
                     self._last_edit = time.monotonic()
-                except BadRequest:
+                except Exception:
                     pass
 
     async def _finalize_current(self) -> None:

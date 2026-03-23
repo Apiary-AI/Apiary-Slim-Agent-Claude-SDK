@@ -14,6 +14,7 @@ from .apiary_poller import run_apiary_poller
 from .claude_executor import ClaudeExecutor
 from .config import Config
 from .telegram_bot import build_telegram_app, run_telegram_bot
+from .telegram_gateway import TelegramGateway
 from .worktree_manager import is_git_repo, prune_worktrees
 
 logging.basicConfig(
@@ -120,9 +121,10 @@ async def main() -> None:
         log.error("TELEGRAM_BOT_TOKEN is required")
         sys.exit(1)
 
-    # Telegram app
+    # Telegram app + centralized gateway
     bot_app = build_telegram_app(config)
     bot = bot_app.bot
+    gateway = TelegramGateway(bot)
 
     # Fetch persona at startup
     persona: str | None = None
@@ -137,7 +139,7 @@ async def main() -> None:
             log.warning("Could not fetch persona at startup", exc_info=True)
 
     # Executor
-    executor = ClaudeExecutor(config, apiary, bot, persona=persona)
+    executor = ClaudeExecutor(config, apiary, gateway, persona=persona)
     log.info("Executor: max_parallel=%d, worktree_isolation=%s",
              config.claude_max_parallel, config.claude_worktree_isolation)
 
@@ -145,6 +147,7 @@ async def main() -> None:
     tasks = [
         executor.run(),
         run_telegram_bot(bot_app, executor, config),
+        gateway.run(),
     ]
     if apiary:
         tasks.append(run_apiary_poller(apiary, executor, config))

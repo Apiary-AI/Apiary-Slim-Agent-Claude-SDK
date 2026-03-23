@@ -30,12 +30,11 @@ def _patched_parse(data: dict) -> Message:
 
 message_parser.parse_message = _patched_parse
 _sdk_client.parse_message = _patched_parse
-from telegram import Bot
-
 from .apiary_client import ApiaryClient
 from .config import Config
 from .module_loader import collect_mcp_servers, discover_modules
 from .session_store import SessionStore
+from .telegram_gateway import TelegramGateway
 from .telegram_streamer import TelegramStreamer
 from .worktree_manager import ensure_worktree, is_git_repo, worktree_path
 
@@ -60,12 +59,12 @@ class ClaudeExecutor:
         self,
         config: Config,
         apiary: ApiaryClient | None,
-        bot: Bot,
+        gateway: TelegramGateway,
         persona: str | None = None,
     ) -> None:
         self._config = config
         self._apiary = apiary
-        self._bot = bot
+        self._gateway = gateway
         self._persona = persona
         self._sessions = SessionStore()
         self.queue: asyncio.Queue[ExecutionRequest] = asyncio.Queue()
@@ -177,7 +176,7 @@ class ClaudeExecutor:
             except Exception:
                 log.debug("Failed to set agent status to busy")
 
-        streamer = TelegramStreamer(self._bot, req.chat_id)
+        streamer = TelegramStreamer(self._gateway, req.chat_id)
         try:
             await streamer.start()
         except Exception:

@@ -31,15 +31,20 @@ def mock_apiary():
 
 
 @pytest.fixture
-def mock_bot():
-    return AsyncMock()
+def mock_gateway():
+    gw = AsyncMock()
+    gw.send_message = AsyncMock()
+    gw.edit_message_text = AsyncMock()
+    gw.delete_message = AsyncMock()
+    gw.send_chat_action = AsyncMock()
+    return gw
 
 
 @pytest.fixture
-def executor(mock_config, mock_apiary, mock_bot):
-    return ClaudeExecutor(mock_config, mock_apiary, mock_bot)
+def executor(mock_config, mock_apiary, mock_gateway):
+    return ClaudeExecutor(mock_config, mock_apiary, mock_gateway)
 
 
 @pytest.fixture
-def executor_with_persona(mock_config, mock_apiary, mock_bot):
-    return ClaudeExecutor(mock_config, mock_apiary, mock_bot, persona="You are a helpful assistant.")
+def executor_with_persona(mock_config, mock_apiary, mock_gateway):
+    return ClaudeExecutor(mock_config, mock_apiary, mock_gateway, persona="You are a helpful assistant.")
