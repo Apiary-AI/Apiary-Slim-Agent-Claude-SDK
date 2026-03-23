@@ -121,7 +121,11 @@ class TelegramStreamer:
     # Global rate limiter shared across ALL streamer instances (per-bot limit).
     _global_lock: asyncio.Lock | None = None
     _global_last_call: float = 0.0
+    _backoff_until: float = 0.0  # monotonic timestamp — all calls pause until this
+    _consecutive_429s: int = 0
     _GLOBAL_MIN_INTERVAL: float = 0.35  # ~3 calls/sec max across all streamers
+    _MAX_BACKOFF: float = 120.0  # cap retry_after to prevent hour-long bans
+    _CIRCUIT_BREAKER_THRESHOLD: int = 5  # after N consecutive 429s, drop messages
 
     @classmethod
     def _get_lock(cls) -> asyncio.Lock:
@@ -131,11 +135,49 @@ class TelegramStreamer:
         return cls._global_lock
 
     @classmethod
+    def _set_backoff(cls, retry_after: float) -> None:
+        """Set global backoff from a Telegram RetryAfter response."""
+        capped = min(retry_after, cls._MAX_BACKOFF)
+        cls._backoff_until = max(cls._backoff_until, time.monotonic() + capped)
+        cls._consecutive_429s += 1
+        log.warning(
+            "Telegram 429 — backoff %.1fs (capped from %.1fs), consecutive=%d",
+            capped, retry_after, cls._consecutive_429s,
+        )
+
+    @classmethod
+    def _reset_429_counter(cls) -> None:
+        """Reset consecutive 429 counter on a successful API call."""
+        cls._consecutive_429s = 0
+
+    @classmethod
+    def _is_circuit_open(cls) -> bool:
+        """True if too many consecutive 429s — callers should silently drop."""
+        return cls._consecutive_429s >= cls._CIRCUIT_BREAKER_THRESHOLD
+
+    @classmethod
     async def _rate_limit(cls) -> None:
-        """Wait until enough time has passed since the last Telegram API call."""
+        """Wait until enough time has passed since the last Telegram API call.
+
+        Raises ``RuntimeError`` if the circuit breaker has tripped (too many
+        consecutive 429s).  Callers should catch this and silently skip the
+        Telegram call so that task execution is not blocked.
+        """
+        if cls._is_circuit_open():
+            # Still respect backoff — check if it has expired and we can retry
+            if time.monotonic() < cls._backoff_until:
+                raise RuntimeError("Telegram circuit breaker open")
+            # Backoff expired — allow one probe call through
+            log.info("Telegram circuit breaker: probing after backoff expired")
+
         async with cls._get_lock():
             now = time.monotonic()
-            wait = cls._GLOBAL_MIN_INTERVAL - (now - cls._global_last_call)
+            # Respect backoff from 429 responses
+            if cls._backoff_until > now:
+                backoff_wait = cls._backoff_until - now
+                await asyncio.sleep(backoff_wait)
+            # Normal rate limiting
+            wait = cls._GLOBAL_MIN_INTERVAL - (time.monotonic() - cls._global_last_call)
             if wait > 0:
                 await asyncio.sleep(wait)
             cls._global_last_call = time.monotonic()
@@ -263,8 +305,11 @@ class TelegramStreamer:
                     message_id=self._status_msg_id,
                     text=status_text,
                 )
-        except (BadRequest, RetryAfter):
-            pass  # Non-critical — skip if update fails
+            self._reset_429_counter()
+        except RetryAfter as e:
+            self._set_backoff(e.retry_after)
+        except (BadRequest, RuntimeError):
+            pass  # Non-critical — skip if update fails or circuit open
 
     async def error(self, error_text: str) -> None:
         """Send an error message (fire-and-forget — must never crash)."""
@@ -273,14 +318,12 @@ class TelegramStreamer:
             await self._bot.send_message(
                 chat_id=self._chat_id, text=f"❌ {error_text}"
             )
+            self._reset_429_counter()
         except RetryAfter as e:
-            await asyncio.sleep(e.retry_after)
-            try:
-                await self._bot.send_message(
-                    chat_id=self._chat_id, text=f"❌ {error_text}"
-                )
-            except Exception:
-                pass
+            self._set_backoff(e.retry_after)
+            # Don't retry — just skip, error messages are best-effort
+        except RuntimeError:
+            pass  # circuit breaker open
         except Exception:
             log.warning("Failed to send error message to Telegram", exc_info=True)
 
@@ -288,28 +331,35 @@ class TelegramStreamer:
 
     async def _send_formatted(self, text: str, _attempt: int = 0) -> Any:
         """Send a new message with MarkdownV2, falling back to plain text."""
-        await self._rate_limit()
         try:
-            return await self._bot.send_message(
+            await self._rate_limit()
+        except RuntimeError:
+            return None  # circuit breaker open — silently drop
+        try:
+            msg = await self._bot.send_message(
                 chat_id=self._chat_id,
                 text=md_to_telegram(text),
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
+            self._reset_429_counter()
+            return msg
         except RetryAfter as e:
+            self._set_backoff(e.retry_after)
             if _attempt < 2:
-                log.warning("Telegram rate limit on send, waiting %ss (attempt %d)", e.retry_after, _attempt + 1)
-                await asyncio.sleep(min(e.retry_after, 10))
+                await asyncio.sleep(min(e.retry_after, self._MAX_BACKOFF))
                 return await self._send_formatted(text, _attempt + 1)
-            log.warning("Telegram rate limit persists after retries, dropping message")
             return None
         except BadRequest:
             try:
-                return await self._bot.send_message(
+                msg = await self._bot.send_message(
                     chat_id=self._chat_id, text=text,
                 )
+                self._reset_429_counter()
+                return msg
             except RetryAfter as e:
+                self._set_backoff(e.retry_after)
                 if _attempt < 2:
-                    await asyncio.sleep(min(e.retry_after, 10))
+                    await asyncio.sleep(min(e.retry_after, self._MAX_BACKOFF))
                     return await self._send_formatted(text, _attempt + 1)
                 return None
 
@@ -325,14 +375,20 @@ class TelegramStreamer:
                     chat_id=self._chat_id,
                     message_id=self._status_msg_id,
                 )
-            except (BadRequest, RetryAfter):
+                self._reset_429_counter()
+            except RetryAfter as e:
+                self._set_backoff(e.retry_after)
+            except (BadRequest, RuntimeError):
                 pass
             self._status_msg_id = None
 
     async def _edit_current(self) -> None:
         if not self._current_msg_id or not self._buffer:
             return
-        await self._rate_limit()
+        try:
+            await self._rate_limit()
+        except RuntimeError:
+            return  # circuit breaker open — silently skip edit
         try:
             formatted = md_to_telegram(self._buffer[:4096])
             await self._bot.edit_message_text(
@@ -342,9 +398,10 @@ class TelegramStreamer:
                 parse_mode=ParseMode.MARKDOWN_V2,
             )
             self._last_edit = time.monotonic()
+            self._reset_429_counter()
         except RetryAfter as e:
-            log.warning("Telegram rate limit on edit, waiting %ss", min(e.retry_after, 10))
-            await asyncio.sleep(min(e.retry_after, 10))
+            self._set_backoff(e.retry_after)
+            # Don't sleep here — just skip this edit, next one will respect backoff
         except BadRequest as e:
             if "message is not modified" not in str(e).lower():
                 # Fallback: send without formatting if MarkdownV2 fails

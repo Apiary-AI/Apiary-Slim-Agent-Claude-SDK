@@ -89,8 +89,14 @@ class ClaudeExecutor:
 
     @property
     def has_free_slots(self) -> bool:
-        """True if the executor can accept more concurrent tasks."""
-        return self._active_count < self._config.claude_max_parallel
+        """True if the executor can accept more concurrent tasks.
+
+        Uses the in-flight task set (populated at claim time, cleared after
+        execution) to accurately count tasks that are queued, waiting for
+        the semaphore, OR actively executing.  ``queue.qsize()`` and
+        ``_active_count`` both miss the semaphore-waiting gap.
+        """
+        return len(self._in_flight_apiary_tasks) < self._config.claude_max_parallel
 
     def add_apiary_task(self, task_id: str) -> None:
         self._in_flight_apiary_tasks.add(task_id)

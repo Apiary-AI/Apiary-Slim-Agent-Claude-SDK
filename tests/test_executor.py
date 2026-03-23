@@ -353,7 +353,8 @@ def test_has_free_slots_true_when_idle(executor):
 
 
 def test_has_free_slots_false_at_capacity(executor, mock_config):
-    executor._active_count = mock_config.claude_max_parallel
+    for i in range(mock_config.claude_max_parallel):
+        executor.add_apiary_task(f"task-{i}")
     assert not executor.has_free_slots
 
 

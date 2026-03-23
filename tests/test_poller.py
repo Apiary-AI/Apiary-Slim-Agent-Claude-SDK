@@ -218,8 +218,9 @@ async def test_poller_defers_when_no_free_slots(mock_apiary, executor, mock_conf
         {"id": "task-a", "invoke": {"instructions": "first"}},
         {"id": "task-b", "invoke": {"instructions": "second"}},
     ]
-    # Simulate executor at capacity
-    executor._active_count = mock_config.claude_max_parallel
+    # Simulate executor at capacity (fill in-flight set)
+    for i in range(mock_config.claude_max_parallel):
+        executor.add_apiary_task(f"inflight-{i}")
 
     task = asyncio.create_task(run_apiary_poller(mock_apiary, executor, mock_config))
     await asyncio.sleep(0.05)

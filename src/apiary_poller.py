@@ -19,6 +19,10 @@ log = logging.getLogger(__name__)
 # are auto-completed — only the first triggers an execution.
 WEBHOOK_ENTITY_COOLDOWN = 300
 
+# Maximum number of times a task can be re-claimed after claim expiry.
+# After this limit the task is left for the server to handle (timeout/fail).
+MAX_TASK_CLAIMS = 3
+
 
 def _webhook_entity_key(task: dict) -> str | None:
     """Extract dedup key for a webhook task (e.g. 'owner/repo:pr:123')."""
@@ -52,6 +56,8 @@ async def run_apiary_poller(
 
     persona_version: int | None = None
     recent_webhook_entities: dict[str, tuple[float, str]] = {}  # entity_key -> (mono_ts, primary_task_id)
+    task_claim_counts: dict[str, int] = {}  # task_id -> number of times claimed
+    _failed_tasks: set[str] = set()  # tasks we already failed on the server
 
     try:
         while True:
@@ -167,6 +173,29 @@ async def run_apiary_poller(
                         log.debug("Skipping already in-flight task %s", task_id)
                         continue
 
+                    # Stop re-claiming tasks that keep expiring — prevents
+                    # infinite claim-expire-reclaim loops.  Claim + fail the
+                    # task so the server removes it from the pending queue,
+                    # otherwise it clogs every poll response forever.
+                    prior_claims = task_claim_counts.get(task_id, 0)
+                    if prior_claims >= MAX_TASK_CLAIMS:
+                        if task_id not in _failed_tasks:
+                            log.warning(
+                                "Task %s claimed %d times — failing on server",
+                                task_id, prior_claims,
+                            )
+                            try:
+                                await apiary.claim_task(task_id)
+                                await apiary.fail_task(
+                                    task_id,
+                                    f"Agent gave up after {prior_claims} claim attempts "
+                                    f"(claims kept expiring).",
+                                )
+                            except Exception:
+                                log.debug("Failed to fail zombie task %s", task_id)
+                            _failed_tasks.add(task_id)
+                        continue
+
                     # Don't claim new tasks while the executor is busy.
                     # Claiming eagerly causes claim timeouts for queued tasks,
                     # which sends them back to pending and creates a retry storm.
@@ -181,6 +210,7 @@ async def run_apiary_poller(
                         log.warning("Failed to claim task %s (maybe already claimed)", task_id)
                         continue
 
+                    task_claim_counts[task_id] = prior_claims + 1
                     executor.add_apiary_task(task_id)
 
                     chat_id = config.telegram_chat_id
