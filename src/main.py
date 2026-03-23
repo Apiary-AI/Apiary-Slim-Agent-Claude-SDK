@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import logging.handlers
+import os
 import signal
 import sys
 
@@ -17,11 +19,24 @@ from .telegram_bot import build_telegram_app, run_telegram_bot
 from .telegram_gateway import TelegramGateway
 from .worktree_manager import is_git_repo, prune_worktrees
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-8s %(name)s  %(message)s",
-    stream=sys.stderr,
+_LOG_FORMAT = "%(asctime)s %(levelname)-8s %(name)s  %(message)s"
+_LOG_DIR = os.path.join(os.environ.get("HOME", "/tmp"), ".claude", "logs")
+
+os.makedirs(_LOG_DIR, exist_ok=True)
+
+# Console (stderr) — same as before
+logging.basicConfig(level=logging.INFO, format=_LOG_FORMAT, stream=sys.stderr)
+
+# Persistent file — survives container restart via the /home/agent/.claude volume
+_file_handler = logging.handlers.RotatingFileHandler(
+    os.path.join(_LOG_DIR, "agent.log"),
+    maxBytes=5 * 1024 * 1024,  # 5 MB per file
+    backupCount=3,  # keep agent.log, agent.log.1, agent.log.2, agent.log.3
 )
+_file_handler.setFormatter(logging.Formatter(_LOG_FORMAT))
+_file_handler.setLevel(logging.INFO)
+logging.getLogger().addHandler(_file_handler)
+
 log = logging.getLogger(__name__)
 
 
