@@ -25,7 +25,15 @@ MAX_TASK_CLAIMS = 3
 
 
 def _webhook_entity_key(task: dict) -> str | None:
-    """Extract dedup key for a webhook task (e.g. 'owner/repo:pr:123')."""
+    """Extract dedup key for a webhook task (e.g. 'owner/repo:pr:123').
+
+    Covers multiple GitHub event types:
+    - pull_request / pull_request_review / pull_request_review_comment → pr number
+    - issues / issue_comment → issue number
+    - push → repo:push:branch (bot's own commits trigger these)
+    - check_run / check_suite → nested pull_requests array
+    - fallback → repo-level dedup if repo is known
+    """
     payload = task.get("payload", {}) or {}
     event_payload = payload.get("event_payload") if isinstance(payload, dict) else None
     if not isinstance(event_payload, dict):
@@ -33,13 +41,35 @@ def _webhook_entity_key(task: dict) -> str | None:
     repo = (event_payload.get("repository") or {}).get("full_name")
     if not repo:
         return None
+
+    # PR events (pull_request, pull_request_review, pull_request_review_comment)
     pr = event_payload.get("pull_request") or {}
-    issue = event_payload.get("issue") or {}
     if isinstance(pr, dict) and pr.get("number"):
         return f"{repo}:pr:{pr['number']}"
+
+    # Issue events
+    issue = event_payload.get("issue") or {}
     if isinstance(issue, dict) and issue.get("number"):
         return f"{repo}:issue:{issue['number']}"
-    return None
+
+    # Push events — dedup by branch
+    ref = event_payload.get("ref")
+    if ref and isinstance(ref, str):
+        branch = ref.removeprefix("refs/heads/")
+        return f"{repo}:push:{branch}"
+
+    # check_run / check_suite — nested pull_requests array
+    for key in ("check_run", "check_suite"):
+        check = event_payload.get(key)
+        if isinstance(check, dict):
+            prs = check.get("pull_requests") or []
+            if isinstance(prs, list) and prs:
+                pr_num = prs[0].get("number")
+                if pr_num:
+                    return f"{repo}:pr:{pr_num}"
+
+    # Fallback: repo-level dedup (catches any unknown event type)
+    return f"{repo}:repo"
 
 
 async def run_apiary_poller(
