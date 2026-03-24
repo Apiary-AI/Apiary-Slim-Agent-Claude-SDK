@@ -300,6 +300,7 @@ class ClaudeExecutor:
     async def _execute_inner(
         self, req: ExecutionRequest, streamer: TelegramStreamer, retries: int,
     ) -> None:
+        t0 = time.monotonic()
         full_text = ""
 
         # Resolve worktree cwd for tasks that carry an explicit branch
@@ -376,8 +377,16 @@ class ClaudeExecutor:
                 # Complete Apiary task if applicable
                 if req.source == "apiary" and req.apiary_task_id and self._apiary:
                     result = full_text[-2000:] if len(full_text) > 2000 else full_text
+                    elapsed = int(time.monotonic() - t0)
+                    summary = {
+                        "description": req.prompt[:200],
+                        "output_excerpt": full_text[:500] if full_text else None,
+                        "duration_seconds": elapsed,
+                    }
                     try:
-                        await self._apiary.complete_task(req.apiary_task_id, result)
+                        await self._apiary.complete_task(
+                            req.apiary_task_id, result, summary=summary,
+                        )
                     except Exception:
                         log.warning(
                             "Failed to complete apiary task %s — claim may have expired",
@@ -444,8 +453,16 @@ class ClaudeExecutor:
                 except Exception:
                     log.warning("Failed to send error notification", exc_info=True)
                 if req.source == "apiary" and req.apiary_task_id and self._apiary:
+                    elapsed = int(time.monotonic() - t0)
+                    summary = {
+                        "description": req.prompt[:200],
+                        "error": err_str[:500],
+                        "duration_seconds": elapsed,
+                    }
                     try:
-                        await self._apiary.fail_task(req.apiary_task_id, err_str)
+                        await self._apiary.fail_task(
+                            req.apiary_task_id, err_str, summary=summary,
+                        )
                     except Exception:
                         log.warning("Failed to mark apiary task %s as failed", req.apiary_task_id)
                 return

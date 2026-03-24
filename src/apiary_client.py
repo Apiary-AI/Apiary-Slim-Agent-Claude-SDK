@@ -104,21 +104,31 @@ class ApiaryClient:
         )
         return resp.json()
 
-    async def complete_task(self, task_id: str, result: str) -> dict[str, Any]:
+    async def complete_task(
+        self, task_id: str, result: str, summary: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         hive = self._config.apiary_hive_id
+        body: dict[str, Any] = {"result": {"output": result}}
+        if summary:
+            body["summary"] = summary
         resp = await self._request(
             "PATCH",
             f"/api/v1/hives/{hive}/tasks/{task_id}/complete",
-            json={"result": {"output": result}},
+            json=body,
         )
         return resp.json()
 
-    async def fail_task(self, task_id: str, error: str) -> dict[str, Any]:
+    async def fail_task(
+        self, task_id: str, error: str, summary: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         hive = self._config.apiary_hive_id
+        body: dict[str, Any] = {"error": {"message": error}}
+        if summary:
+            body["summary"] = summary
         resp = await self._request(
             "PATCH",
             f"/api/v1/hives/{hive}/tasks/{task_id}/fail",
-            json={"error": {"message": error}},
+            json=body,
         )
         return resp.json()
 
