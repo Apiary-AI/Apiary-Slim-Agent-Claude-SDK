@@ -68,8 +68,9 @@ def _webhook_entity_key(task: dict) -> str | None:
                 if pr_num:
                     return f"{repo}:pr:{pr_num}"
 
-    # Fallback: repo-level dedup (catches any unknown event type)
-    return f"{repo}:repo"
+    # No fallback — if we can't extract a specific entity, don't dedup.
+    # A repo-level fallback would incorrectly dedup different PRs/issues.
+    return None
 
 
 async def run_apiary_poller(
