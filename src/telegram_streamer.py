@@ -200,7 +200,23 @@ class TelegramStreamer:
             log.warning("Telegram network error in finish", exc_info=True)
 
     async def send_tool_notification(self, tool_name: str, tool_input: Any) -> None:
-        """Update a separate status message with current tool activity."""
+        """Update a separate status message with current tool activity.
+
+        When text has already been streamed, finalizes the current message
+        so that post-tool output starts in a fresh message.  This prevents
+        the "wall of text" problem where investigation notes and final
+        results are concatenated into a single unreadable block.
+        """
+        # Finalize current text message before showing tool status —
+        # post-tool output will start a new message.
+        if self._current_msg_id and self._buffer.strip():
+            try:
+                await self._edit_current()
+            except Exception:
+                pass
+            self._current_msg_id = None
+            self._buffer = ""
+
         self._tool_count += 1
         self._status_description = _humanize_tool(tool_name, tool_input)
         self._status_started = time.monotonic()
