@@ -1,0 +1,17 @@
+# Dockerfile.local — extend the base agent image with custom tools.
+# Copy this file to Dockerfile.local and customize.
+# This file is gitignored — your local additions won't affect other deployments.
+#
+# Build with: ./build.sh
+# (or manually: docker build -t slim-apiary-agent-base . && docker build -f Dockerfile.local -t slim-apiary-agent .)
+
+FROM slim-apiary-agent-base
+
+USER root
+
+# Example: add PHP for running Laravel tests
+# RUN apt-get update && \
+#     apt-get install -y --no-install-recommends php8.3-cli php8.3-sqlite3 php8.3-xml php8.3-mbstring && \
+#     rm -rf /var/lib/apt/lists/*
+
+USER agent
