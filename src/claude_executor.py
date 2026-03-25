@@ -271,6 +271,33 @@ class ClaudeExecutor:
                 except Exception:
                     log.debug("Failed to set agent status to online")
 
+    async def run_dream(self, task_id: str, prompt: str) -> None:
+        """Execute a dream task in the background — no streamer, no semaphore."""
+        log.info("Dream task %s starting in background", task_id)
+        try:
+            options = self._build_options()
+            full_text = ""
+            async for message in query(prompt=prompt, options=options):
+                text = self._extract_text(message)
+                if text:
+                    full_text += text
+
+            result = full_text[-2000:] if len(full_text) > 2000 else full_text
+            summary = {
+                "description": "Dream: automated reflection on recent work",
+                "output_excerpt": full_text[:500] if full_text else None,
+            }
+            if self._apiary:
+                await self._apiary.complete_task(task_id, result, summary=summary)
+            log.info("Dream task %s completed", task_id)
+        except Exception:
+            log.warning("Dream task %s failed", task_id, exc_info=True)
+            if self._apiary:
+                try:
+                    await self._apiary.fail_task(task_id, "Dream reflection failed")
+                except Exception:
+                    pass
+
     def _build_options(
         self,
         resume_session: str | None = None,

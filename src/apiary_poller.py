@@ -227,10 +227,11 @@ async def run_apiary_poller(
                             _failed_tasks.add(task_id)
                         continue
 
-                    # Don't claim new tasks while the executor is busy.
-                    # Claiming eagerly causes claim timeouts for queued tasks,
-                    # which sends them back to pending and creates a retry storm.
-                    if not executor.has_free_slots:
+                    # Dream tasks bypass capacity check — they run in background
+                    # without consuming a semaphore slot or Telegram output.
+                    is_dream = task.get("type") == "dream"
+
+                    if not is_dream and not executor.has_free_slots:
                         log.debug("Executor at capacity (%d slots), deferring remaining tasks",
                                   config.claude_max_parallel)
                         break
@@ -242,6 +243,12 @@ async def run_apiary_poller(
                         continue
 
                     task_claim_counts[task_id] = prior_claims + 1
+
+                    if is_dream:
+                        asyncio.create_task(executor.run_dream(task_id, prompt))
+                        log.info("Dream task %s started in background", task_id)
+                        continue
+
                     executor.add_apiary_task(task_id)
 
                     chat_id = config.telegram_chat_id
