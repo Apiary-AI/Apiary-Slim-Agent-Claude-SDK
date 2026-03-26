@@ -248,7 +248,21 @@ class ClaudeExecutor:
             if req.source == "apiary" and req.apiary_task_id:
                 watcher_task = asyncio.create_task(_watch_claim_expiry())
             try:
-                await inner_task
+                # Max execution timeout — safety net against zombie pipes
+                # where the Claude subprocess dies but grandchild processes
+                # keep stdout open, hanging the async-for loop forever.
+                max_timeout = self._config.claude_max_turns * 120  # ~2min per turn
+                await asyncio.wait_for(inner_task, timeout=max_timeout)
+            except asyncio.TimeoutError:
+                log.warning(
+                    "Execution timed out after %ds for task %s — possible zombie pipe",
+                    max_timeout, req.apiary_task_id or req.chat_id,
+                )
+                inner_task.cancel()
+                try:
+                    await inner_task
+                except asyncio.CancelledError:
+                    pass
             except asyncio.CancelledError:
                 if claim_expired.is_set():
                     log.warning(
