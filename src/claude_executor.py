@@ -288,10 +288,22 @@ class ClaudeExecutor:
     async def run_dream(self, task_id: str, prompt: str) -> None:
         """Execute a dream task in the background — no streamer, no semaphore."""
         log.info("Dream task %s starting in background", task_id)
+
+        # Progress heartbeat keeps the claim alive during reflection
+        claim_expired = asyncio.Event()
+        progress_task: asyncio.Task | None = None
+        if self._apiary:
+            progress_task = asyncio.create_task(
+                self._report_progress(task_id, claim_expired)
+            )
+
         try:
             options = self._build_options()
             full_text = ""
             async for message in query(prompt=prompt, options=options):
+                if claim_expired.is_set():
+                    log.warning("Dream task %s claim expired during execution", task_id)
+                    return
                 text = self._extract_text(message)
                 if text:
                     full_text += text
@@ -301,15 +313,22 @@ class ClaudeExecutor:
                 "description": "Dream: automated reflection on recent work",
                 "output_excerpt": full_text[:500] if full_text else None,
             }
-            if self._apiary:
+            if self._apiary and not claim_expired.is_set():
                 await self._apiary.complete_task(task_id, result, summary=summary)
             log.info("Dream task %s completed", task_id)
         except Exception:
             log.warning("Dream task %s failed", task_id, exc_info=True)
-            if self._apiary:
+            if self._apiary and not claim_expired.is_set():
                 try:
                     await self._apiary.fail_task(task_id, "Dream reflection failed")
                 except Exception:
+                    pass
+        finally:
+            if progress_task:
+                progress_task.cancel()
+                try:
+                    await progress_task
+                except asyncio.CancelledError:
                     pass
 
     def _build_options(
