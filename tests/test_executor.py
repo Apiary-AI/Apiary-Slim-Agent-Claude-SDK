@@ -282,7 +282,8 @@ async def test_execute_inner_injects_worktree_hint_for_telegram_with_isolation(
     assert "/workspace/.worktrees/<branch>" in captured_appends[0]
 
 
-async def test_execute_inner_no_worktree_hint_when_isolation_disabled(executor, mock_config):
+async def test_execute_inner_git_branching_hint_when_isolation_disabled(executor, mock_config):
+    """When worktree isolation is off, agent still gets git branching instructions."""
     mock_config.claude_worktree_isolation = False
     mock_config.claude_working_dir = "/workspace"
 
@@ -307,7 +308,9 @@ async def test_execute_inner_no_worktree_hint_when_isolation_disabled(executor, 
         streamer.finish = AsyncMock()
         await executor._execute_inner(req, streamer, retries=1)
 
-    assert captured_appends[0] is None
+    assert captured_appends[0] is not None
+    assert "origin/main" in captured_appends[0]
+    assert "NEVER branch from the current HEAD" in captured_appends[0]
 
 
 async def test_execute_inner_exits_on_auth_error(executor, mock_config):

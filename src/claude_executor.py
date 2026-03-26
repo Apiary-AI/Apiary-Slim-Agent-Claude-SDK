@@ -381,25 +381,37 @@ class ClaudeExecutor:
                     exc_info=True,
                 )
 
-        # Inject worktree instructions for requests without an explicit branch
+        # Inject branching instructions for tasks without an explicit branch
         system_prompt_append: str | None = None
+        wt_base = self._config.claude_working_dir
         if (
             not req.branch
-            and self._config.claude_worktree_isolation
-            and is_git_repo(self._config.claude_working_dir)
+            and is_git_repo(wt_base)
         ):
-            wt_base = self._config.claude_working_dir
-            system_prompt_append = (
-                "## Worktree Isolation\n"
-                "When this task requires implementing code changes on a new branch:\n"
-                f"1. First run `git -C {wt_base} fetch origin` to get latest refs.\n"
-                f"2. Choose a branch name, then: `git worktree add {wt_base}/.worktrees/<branch> -b <branch> origin/main`\n"
-                f"3. Do all file edits and git operations inside `{wt_base}/.worktrees/<branch>`\n"
-                "4. Commit, push the branch, and open a PR from the worktree.\n"
-                "IMPORTANT: Always branch from origin/main to avoid inheriting unrelated in-progress work.\n"
-                "NEVER create branches from the current HEAD of the main workspace — it may be on an unmerged feature branch.\n"
-                "For conversational replies or read-only tasks, skip this entirely."
-            )
+            if self._config.claude_worktree_isolation:
+                system_prompt_append = (
+                    "## Worktree Isolation\n"
+                    "When this task requires implementing code changes on a new branch:\n"
+                    f"1. First run `git -C {wt_base} fetch origin` to get latest refs.\n"
+                    f"2. Choose a branch name, then: `git worktree add {wt_base}/.worktrees/<branch> -b <branch> origin/main`\n"
+                    f"3. Do all file edits and git operations inside `{wt_base}/.worktrees/<branch>`\n"
+                    "4. Commit, push the branch, and open a PR from the worktree.\n"
+                    "IMPORTANT: Always branch from origin/main to avoid inheriting unrelated in-progress work.\n"
+                    "NEVER create branches from the current HEAD of the main workspace — it may be on an unmerged feature branch.\n"
+                    "For conversational replies or read-only tasks, skip this entirely."
+                )
+            else:
+                system_prompt_append = (
+                    "## Git Branching\n"
+                    "When this task requires implementing code changes:\n"
+                    f"1. First run `git -C {wt_base} fetch origin` to get latest refs.\n"
+                    f"2. ALWAYS create your branch from origin/main:\n"
+                    f"   `git -C {wt_base} checkout -b <branch-name> origin/main`\n"
+                    "3. Do your work, commit, push, and open a PR.\n"
+                    "CRITICAL: NEVER branch from the current HEAD — it may be on an unmerged "
+                    "feature branch from a previous task. Always use origin/main as the base.\n"
+                    "For conversational replies or read-only tasks, skip this entirely."
+                )
 
         # Telegram messages resume the chat session; Apiary tasks run fresh
         resume_id = None
