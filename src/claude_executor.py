@@ -331,6 +331,11 @@ class ClaudeExecutor:
                 except asyncio.CancelledError:
                     pass
 
+    # The Claude SDK passes both the prompt (--print) and system prompt
+    # (--append-system-prompt) as CLI arguments.  Linux ARG_MAX is ~2MB,
+    # so the combined size must stay well under that.
+    _MAX_CLI_BUDGET = 1_500_000  # 1.5MB safe limit
+
     def _build_options(
         self,
         resume_session: str | None = None,
@@ -354,7 +359,14 @@ class ClaudeExecutor:
         if system_prompt_append:
             parts.append(system_prompt_append)
         if parts:
-            opts["append_system_prompt"] = "\n\n".join(parts)
+            system_prompt = "\n\n".join(parts)
+            if len(system_prompt) > self._MAX_CLI_BUDGET:
+                log.warning(
+                    "System prompt too large (%dKB), truncating to fit CLI limits",
+                    len(system_prompt) // 1024,
+                )
+                system_prompt = system_prompt[:self._MAX_CLI_BUDGET]
+            opts["append_system_prompt"] = system_prompt
         return ClaudeCodeOptions(**opts)
 
     async def _execute_inner(
@@ -418,6 +430,14 @@ class ClaudeExecutor:
         if req.source == "telegram":
             resume_id = self._sessions.get(req.chat_id)
 
+        # Cap prompt size — the SDK passes it as a CLI arg (--print),
+        # which combined with --append-system-prompt must fit in ARG_MAX.
+        prompt_budget = self._MAX_CLI_BUDGET - len(self._persona or "")
+        prompt_text = req.prompt
+        if len(prompt_text) > prompt_budget:
+            log.warning("Prompt too large (%dKB), truncating", len(prompt_text) // 1024)
+            prompt_text = prompt_text[:prompt_budget] + "\n... (truncated)"
+
         for attempt in range(1, retries + 1):
             try:
                 options = self._build_options(
@@ -426,7 +446,7 @@ class ClaudeExecutor:
                     system_prompt_append=system_prompt_append,
                 )
                 async for message in query(
-                    prompt=req.prompt,
+                    prompt=prompt_text,
                     options=options,
                 ):
                     # Capture session_id from result

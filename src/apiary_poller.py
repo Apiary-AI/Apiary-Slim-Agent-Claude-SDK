@@ -193,7 +193,9 @@ async def run_apiary_poller(
                         )
                         # Cap payload size to avoid "Argument list too long" when
                         # the Claude CLI receives the full prompt as a CLI arg.
-                        max_payload = 100_000  # ~100KB
+                        # The persona alone is ~128KB, and ARG_MAX is ~2MB,
+                        # so keep payload well under the remaining budget.
+                        max_payload = 50_000  # ~50KB
                         if len(context_json) > max_payload:
                             context_json = context_json[:max_payload] + "\n... (truncated)"
                         prompt = (
