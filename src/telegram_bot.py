@@ -54,6 +54,54 @@ async def _resolve_pr_branch(pr_number: int, repo_dir: str) -> str | None:
     return None
 
 
+def _cleanup_stale_sessions(max_age_hours: int = 24) -> dict[str, int]:
+    """Remove old Claude session data to reclaim disk space."""
+    import shutil
+    import time
+
+    counts = {"projects": 0, "session_env": 0, "bytes_freed": 0}
+    cutoff = time.time() - (max_age_hours * 3600)
+    claude_dir = os.path.join(os.environ.get("HOME", "/tmp"), ".claude")
+
+    # Clean old project sessions
+    projects_dir = os.path.join(claude_dir, "projects", "-workspace")
+    if os.path.isdir(projects_dir):
+        for name in os.listdir(projects_dir):
+            path = os.path.join(projects_dir, name)
+            if not os.path.isdir(path):
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+                if mtime < cutoff:
+                    size = sum(
+                        os.path.getsize(os.path.join(dp, f))
+                        for dp, _, fns in os.walk(path)
+                        for f in fns
+                    )
+                    shutil.rmtree(path)
+                    counts["projects"] += 1
+                    counts["bytes_freed"] += size
+            except OSError:
+                pass
+
+    # Clean old session-env dirs
+    session_env_dir = os.path.join(claude_dir, "session-env")
+    if os.path.isdir(session_env_dir):
+        for name in os.listdir(session_env_dir):
+            path = os.path.join(session_env_dir, name)
+            if not os.path.isdir(path):
+                continue
+            try:
+                mtime = os.path.getmtime(path)
+                if mtime < cutoff:
+                    shutil.rmtree(path)
+                    counts["session_env"] += 1
+            except OSError:
+                pass
+
+    return counts
+
+
 async def _transcribe_voice(ogg_path: str, api_key: str) -> str | None:
     """Transcribe a voice message using OpenAI Whisper API."""
     if not api_key:
@@ -122,6 +170,18 @@ async def run_telegram_bot(
         await update.message.reply_text("♻️ Restarting…")
         log.info("Restart requested by user %s — sending SIGTERM", update.effective_user.id)
         os.kill(os.getpid(), signal.SIGTERM)
+
+    async def cmd_cleanup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_user or not is_allowed(update.effective_user.id):
+            return
+        counts = await asyncio.to_thread(_cleanup_stale_sessions, 24)
+        freed_mb = counts["bytes_freed"] / (1024 * 1024)
+        await update.message.reply_text(
+            f"🧹 Cleaned up:\n"
+            f"  Sessions: {counts['projects']}\n"
+            f"  Env snapshots: {counts['session_env']}\n"
+            f"  Freed: {freed_mb:.1f}MB"
+        )
 
     async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not is_allowed(update.effective_user.id):
@@ -227,6 +287,7 @@ async def run_telegram_bot(
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("restart", cmd_restart))
+    app.add_handler(CommandHandler("cleanup", cmd_cleanup))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
