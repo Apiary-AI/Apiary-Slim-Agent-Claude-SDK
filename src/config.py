@@ -22,6 +22,9 @@ class Config:
     telegram_allowed_users: list[int] = field(default_factory=list)
     telegram_chat_id: str = ""
 
+    # OpenAI (for Whisper voice transcription)
+    openai_api_key: str = ""
+
     # Claude
     anthropic_api_key: str = ""
     claude_model: str = "claude-sonnet-4-6"
@@ -57,6 +60,7 @@ class Config:
                 int(u.strip()) for u in allowed.split(",") if u.strip()
             ],
             telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
+            openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
             anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
             claude_model=os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6"),
             claude_max_budget_usd=float(

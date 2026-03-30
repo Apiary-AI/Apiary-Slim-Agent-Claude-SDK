@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -79,6 +80,7 @@ class ExecutionRequest:
     source: str  # "telegram" | "apiary"
     apiary_task_id: str | None = None
     branch: str | None = None
+    image_paths: list[str] | None = None
 
 
 _modules = discover_modules()
@@ -309,6 +311,13 @@ class ClaudeExecutor:
                     await watcher_task
                 except asyncio.CancelledError:
                     pass
+            # Clean up temp media files
+            if req.image_paths:
+                for p in req.image_paths:
+                    try:
+                        os.unlink(p)
+                    except OSError:
+                        pass
             self._active_count -= 1
             if self._active_count == 0 and self._apiary:
                 try:
@@ -461,10 +470,18 @@ class ClaudeExecutor:
         if req.source == "telegram":
             resume_id = self._sessions.get(req.chat_id)
 
+        # Prepend image references so Claude reads them via the Read tool
+        prompt_text = req.prompt
+        if req.image_paths:
+            image_refs = "\n".join(f"- {p}" for p in req.image_paths)
+            prompt_text = (
+                f"The user sent these images. Read them first, then respond.\n"
+                f"{image_refs}\n\n{prompt_text}"
+            )
+
         # Cap prompt size — the SDK passes it as a CLI arg (--print),
         # which combined with --append-system-prompt must fit in ARG_MAX.
         prompt_budget = self._MAX_CLI_BUDGET - len(self._persona or "")
-        prompt_text = req.prompt
         if len(prompt_text) > prompt_budget:
             log.warning("Prompt too large (%dKB), truncating", len(prompt_text) // 1024)
             prompt_text = prompt_text[:prompt_budget] + "\n... (truncated)"
