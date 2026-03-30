@@ -30,6 +30,37 @@ def _patched_parse(data: dict) -> Message:
 
 message_parser.parse_message = _patched_parse
 _sdk_client.parse_message = _patched_parse
+
+# Patch _build_command to use --append-system-prompt-file instead of
+# --append-system-prompt.  The persona can be >128KB which exceeds the
+# effective ARG_MAX in some container environments, causing E7.
+import tempfile as _tempfile
+
+_original_build_command = _sdk_client.SubprocessCLITransport._build_command
+
+
+def _patched_build_command(self: _sdk_client.SubprocessCLITransport) -> list[str]:
+    # Temporarily clear append_system_prompt so the original doesn't add it
+    saved = self._options.append_system_prompt
+    self._options.append_system_prompt = None
+    cmd = _original_build_command(self)
+    self._options.append_system_prompt = saved
+
+    if saved:
+        # Write to a temp file that persists for the subprocess lifetime
+        f = _tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+        f.write(saved)
+        f.close()
+        cmd.extend(["--append-system-prompt-file", f.name])
+        # Store ref so we can clean up later (best-effort)
+        if not hasattr(self, "_prompt_tempfiles"):
+            self._prompt_tempfiles = []
+        self._prompt_tempfiles.append(f.name)
+
+    return cmd
+
+
+_sdk_client.SubprocessCLITransport._build_command = _patched_build_command
 from .apiary_client import ApiaryClient
 from .config import Config
 from .module_loader import collect_mcp_servers, discover_modules
