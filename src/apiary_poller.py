@@ -191,6 +191,11 @@ async def run_apiary_poller(
                         context_json = json.dumps(
                             context_data, indent=2, ensure_ascii=False, default=str,
                         )
+                        # Cap payload size to avoid "Argument list too long" when
+                        # the Claude CLI receives the full prompt as a CLI arg.
+                        max_payload = 100_000  # ~100KB
+                        if len(context_json) > max_payload:
+                            context_json = context_json[:max_payload] + "\n... (truncated)"
                         prompt = (
                             f"{prompt}\n\n---\n\n"
                             f"**Task payload data:**\n```json\n{context_json}\n```"
