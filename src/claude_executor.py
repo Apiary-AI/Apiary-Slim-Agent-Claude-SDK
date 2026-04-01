@@ -561,6 +561,23 @@ class ClaudeExecutor:
                         )
                     sys.exit(1)
 
+                # Transient API errors (500, overloaded) are safe to retry
+                # even with output — Claude resumes the session.
+                is_api_500 = (
+                    "internal server error" in err_str.lower()
+                    or "api_error" in err_str.lower()
+                    or "overloaded" in err_str.lower()
+                )
+                if is_api_500 and attempt < retries:
+                    wait = 30 * attempt
+                    log.warning(
+                        "API server error (attempt %d/%d), retrying in %ds: %s",
+                        attempt, retries, wait, err_str[:100],
+                    )
+                    await streamer.append(f"\n⏳ API error, retrying in {wait}s...\n")
+                    await asyncio.sleep(wait)
+                    continue
+
                 # Don't retry if execution already produced output — side
                 # effects (GitHub comments, commits, etc.) cannot be undone.
                 if full_text.strip():
