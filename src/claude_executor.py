@@ -388,6 +388,7 @@ class ClaudeExecutor:
             "max_turns": self._config.claude_max_turns,
             "permission_mode": "bypassPermissions",
             "cwd": cwd or self._config.claude_working_dir,
+            "extra_args": {"effort": self._config.claude_effort},
         }
         if _mcp:
             opts["mcp_servers"] = _mcp

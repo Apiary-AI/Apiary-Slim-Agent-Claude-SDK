@@ -1,0 +1,29 @@
+services:
+  agent1:
+    build: .
+    container_name: agent1
+    restart: unless-stopped
+    env_file: .env.agent1
+    volumes:
+      - claude_auth_1:/home/agent/.claude
+
+  agent2:
+    build: .
+    container_name: agent2
+    restart: unless-stopped
+    env_file: .env.agent2
+    volumes:
+      - claude_auth_2:/home/agent/.claude
+
+  agent3:
+    build: .
+    container_name: agent3
+    restart: unless-stopped
+    env_file: .env.agent3
+    volumes:
+      - claude_auth_3:/home/agent/.claude
+
+volumes:
+  claude_auth_1:
+  claude_auth_2:
+  claude_auth_3:

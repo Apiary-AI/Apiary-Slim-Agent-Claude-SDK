@@ -27,11 +27,12 @@ class Config:
 
     # Claude
     anthropic_api_key: str = ""
-    claude_model: str = "claude-sonnet-4-6"
+    claude_model: str = "claude-opus-4-6"
     claude_max_budget_usd: float = 5.0
     claude_max_turns: int = 30
     claude_working_dir: str = "/workspace"
     claude_worktree_isolation: bool = False
+    claude_effort: str = "high"
     claude_max_parallel: int = 3
 
     @classmethod
@@ -62,7 +63,8 @@ class Config:
             telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
             openai_api_key=os.environ.get("OPENAI_API_KEY", ""),
             anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
-            claude_model=os.environ.get("CLAUDE_MODEL", "claude-sonnet-4-6"),
+            claude_model=os.environ.get("CLAUDE_MODEL", "claude-opus-4-6"),
+            claude_effort=os.environ.get("CLAUDE_EFFORT", "high"),
             claude_max_budget_usd=float(
                 os.environ.get("CLAUDE_MAX_BUDGET_USD", "5.0")
             ),

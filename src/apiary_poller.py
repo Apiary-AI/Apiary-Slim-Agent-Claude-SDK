@@ -86,6 +86,7 @@ async def run_apiary_poller(
     log.info("Apiary poller started (interval=%ds)", config.apiary_poll_interval)
 
     persona_version: int | None = None
+    platform_context_version: int | None = None
     recent_webhook_entities: dict[str, tuple[float, str]] = {}  # entity_key -> (mono_ts, primary_task_id)
     task_claim_counts: dict[str, int] = {}  # task_id -> number of times claimed
     _failed_tasks: set[str] = set()  # tasks we already failed on the server
@@ -98,19 +99,29 @@ async def run_apiary_poller(
             except Exception:
                 log.exception("Heartbeat failed")
 
-            # Check for persona changes
+            # Check for persona / platform context changes
             try:
-                ver_data = await apiary.get_persona_version(known_version=persona_version)
+                ver_data = await apiary.get_persona_version(
+                    known_version=persona_version,
+                    known_platform_version=platform_context_version,
+                )
                 data = ver_data.get("data", ver_data) if isinstance(ver_data, dict) else {}
                 changed = data.get("changed", False)
                 server_version = data.get("version")
+                server_platform_version = data.get("platform_context_version")
                 if changed or (server_version is not None and server_version != persona_version):
                     new_persona = await apiary.get_persona_assembled()
                     executor.update_persona(new_persona)
                     persona_version = server_version
-                    log.info("Persona refreshed (version=%s)", persona_version)
+                    if server_platform_version is not None:
+                        platform_context_version = server_platform_version
+                    log.info("Persona refreshed (version=%s, platform=%s)",
+                             persona_version, platform_context_version)
                 elif persona_version is None and server_version is not None:
                     persona_version = server_version  # initial sync
+                # Track platform context version even when persona hasn't changed
+                if server_platform_version is not None and platform_context_version is None:
+                    platform_context_version = server_platform_version
             except Exception:
                 log.debug("Persona version check failed", exc_info=True)
 

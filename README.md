@@ -25,7 +25,8 @@ Fill in your `.env`:
 | `APIARY_CAPABILITIES` | No | Comma-separated capabilities |
 | `APIARY_POLL_INTERVAL` | No | Poll interval in seconds (default: 5) |
 | `ANTHROPIC_API_KEY` | No | Only if not using OAuth |
-| `CLAUDE_MODEL` | No | Default: claude-sonnet-4-20250514 |
+| `CLAUDE_MODEL` | No | Default: claude-opus-4-6 |
+| `CLAUDE_EFFORT` | No | Effort level: low, medium, high, max (default: high) |
 | `CLAUDE_MAX_TURNS` | No | Default: 30 |
 | `CLAUDE_WORKING_DIR` | No | Default: /workspace |
 
@@ -75,6 +76,81 @@ If you prefer API key auth, skip step 3, set `ANTHROPIC_API_KEY` in `.env`, and 
 
 ```bash
 docker run --env-file .env slim-apiary-agent
+```
+
+## Multi-agent setup (Docker Compose)
+
+Run multiple independent agents, each with its own Telegram bot and Apiary registration.
+
+### 1. Create env files
+
+Each agent gets its own `.env.agentN`:
+
+```bash
+cp .env.example .env.agent1
+cp .env.example .env.agent2
+# ... etc
+```
+
+Fill in unique values per agent:
+- `APIARY_AGENT_ID` + `APIARY_API_TOKEN` (register each agent in Apiary dashboard)
+- `TELEGRAM_BOT_TOKEN` (create separate bots via @BotFather)
+
+Shared values (Git, GitHub, Apiary URL/Hive) can be the same across all agents.
+
+### 2. Build
+
+```bash
+docker compose build
+```
+
+### 3. Authenticate each agent (OAuth)
+
+Each agent needs its own Claude OAuth session, stored in a separate volume:
+
+```bash
+docker compose run --rm agent1 claude
+docker compose run --rm agent2 claude
+# ... etc
+```
+
+Open the printed URL for each, log in, then `Ctrl+C`.
+
+### 4. Run
+
+Start all agents:
+
+```bash
+docker compose up -d
+```
+
+Start a specific agent:
+
+```bash
+docker compose up -d agent1
+```
+
+View logs:
+
+```bash
+docker compose logs -f           # all agents
+docker compose logs -f agent1    # single agent
+```
+
+Stop all:
+
+```bash
+docker compose down
+```
+
+### Re-authenticate
+
+If OAuth expires for an agent, stop it and re-auth:
+
+```bash
+docker compose stop agent1
+docker compose run --rm agent1 claude
+docker compose up -d agent1
 ```
 
 ## Testing
