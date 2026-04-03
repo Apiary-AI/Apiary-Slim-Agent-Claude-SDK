@@ -27,6 +27,7 @@ build/
 Thumbs.db
 
 # Docker
+docker-compose.yml
 docker-compose.override.yml
 Dockerfile.local
 

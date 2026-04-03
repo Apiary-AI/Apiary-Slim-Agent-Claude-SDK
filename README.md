@@ -82,9 +82,13 @@ docker run --env-file .env slim-apiary-agent
 
 Run multiple independent agents, each with its own Telegram bot and Apiary registration.
 
-### 1. Create env files
+### 1. Create compose and env files
 
-Each agent gets its own `.env.agentN`:
+```bash
+cp docker-compose.example.yml docker-compose.yml
+```
+
+Edit `docker-compose.yml` to add/remove agents as needed. Then create env files:
 
 ```bash
 cp .env.example .env.agent1
