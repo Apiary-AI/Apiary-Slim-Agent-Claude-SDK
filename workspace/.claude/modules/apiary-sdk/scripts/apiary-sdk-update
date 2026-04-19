@@ -1,0 +1,32 @@
+#!/bin/bash
+# Pull latest Apiary SDK changes and reinstall the Python package.
+# Run this when the user asks for new SDK features or when check-updates reports drift.
+
+set -e
+
+VENDOR_DIR="/workspace/.claude/modules/apiary-sdk/vendor"
+REF="${APIARY_SDK_REF:-main}"
+
+if [ ! -d "$VENDOR_DIR/.git" ]; then
+    echo "SDK not vendored yet — run the container entrypoint (setup.sh) first." >&2
+    exit 1
+fi
+
+echo "Fetching origin/$REF..."
+git -C "$VENDOR_DIR" fetch --depth 1 origin "$REF"
+
+BEFORE=$(git -C "$VENDOR_DIR" rev-parse HEAD)
+git -C "$VENDOR_DIR" reset --hard "origin/$REF"
+AFTER=$(git -C "$VENDOR_DIR" rev-parse HEAD)
+
+if [ "$BEFORE" = "$AFTER" ]; then
+    echo "Already up to date ($AFTER)."
+    exit 0
+fi
+
+echo "Updated $BEFORE -> $AFTER. New commits:"
+git -C "$VENDOR_DIR" log --oneline "$BEFORE..$AFTER"
+
+echo "Reinstalling Python package..."
+python3 -m pip install --user --break-system-packages -q -e "$VENDOR_DIR/sdk/python"
+echo "Done."

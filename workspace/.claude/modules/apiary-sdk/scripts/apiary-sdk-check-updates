@@ -1,0 +1,26 @@
+#!/bin/bash
+# Check whether the vendored SDK is behind origin. Read-only — does not modify anything.
+# Exits 0 regardless of drift; prints a human-readable summary.
+
+set -e
+
+VENDOR_DIR="/workspace/.claude/modules/apiary-sdk/vendor"
+REF="${APIARY_SDK_REF:-main}"
+
+if [ ! -d "$VENDOR_DIR/.git" ]; then
+    echo "SDK not vendored yet — run the container entrypoint (setup.sh) first." >&2
+    exit 1
+fi
+
+git -C "$VENDOR_DIR" fetch --depth 1 origin "$REF" >/dev/null 2>&1
+
+BEHIND=$(git -C "$VENDOR_DIR" rev-list --count "HEAD..origin/$REF")
+if [ "$BEHIND" = "0" ]; then
+    echo "Up to date with origin/$REF."
+    exit 0
+fi
+
+echo "SDK is $BEHIND commit(s) behind origin/$REF. New commits:"
+git -C "$VENDOR_DIR" log --oneline "HEAD..origin/$REF"
+echo ""
+echo "Run apiary-sdk-update to apply."

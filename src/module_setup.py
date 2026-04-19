@@ -21,6 +21,16 @@ BEGIN_MARKER = "<!-- MODULES:BEGIN -->"
 END_MARKER = "<!-- MODULES:END -->"
 
 
+def run_setup_scripts(modules_dir: str) -> None:
+    """Run each module's setup.sh if present (for cloning vendored repos, etc.)."""
+    for entry in sorted(Path(modules_dir).iterdir()):
+        setup = entry / "setup.sh"
+        if setup.exists():
+            log.info("Running setup.sh for module %s", entry.name)
+            setup.chmod(setup.stat().st_mode | 0o111)
+            subprocess.run(["bash", str(setup)], check=True, cwd=str(entry))
+
+
 def install_requirements(modules_dir: str) -> None:
     """Install requirements.txt for each module that has one."""
     for entry in sorted(Path(modules_dir).iterdir()):
@@ -66,6 +76,7 @@ def main() -> None:
     modules = discover_modules(modules_dir)
     log.info("Discovered %d module(s): %s", len(modules), [m.name for m in modules])
 
+    run_setup_scripts(modules_dir)
     install_requirements(modules_dir)
 
     doc = generate_modules_doc(modules)
