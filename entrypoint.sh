@@ -21,10 +21,17 @@ if [ -n "$GIT_USER_EMAIL" ]; then
     git config --global user.email "$GIT_USER_EMAIL"
 fi
 
-# Configure GitHub CLI auth if token provided
+# Configure GitHub CLI auth if token provided.
+#
+# We intentionally do NOT use `git config --global url.<token-URL>.insteadOf`
+# here — that pattern embeds the token into every clone's .git/config as the
+# origin remote, so `git remote -v` prints the token in cleartext and any
+# command that dumps remote info leaks it. Instead we let `gh` register a
+# credential helper; git fetches the token on demand and never persists it
+# into repo configs or remote URLs.
 if [ -n "$GITHUB_TOKEN" ]; then
     echo "$GITHUB_TOKEN" | gh auth login --with-token 2>/dev/null || true
-    git config --global url."https://x-access-token:${GITHUB_TOKEN}@github.com/".insteadOf "https://github.com/"
+    gh auth setup-git 2>/dev/null || true
 fi
 
 # Run module setup (install deps, update CLAUDE.md)

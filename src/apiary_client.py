@@ -8,6 +8,16 @@ from typing import Any
 import httpx
 
 from .config import Config
+from .redactor import redact
+
+
+def _redact_summary(summary: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not summary:
+        return summary
+    out: dict[str, Any] = {}
+    for k, v in summary.items():
+        out[k] = redact(v) if isinstance(v, str) else v
+    return out
 
 log = logging.getLogger(__name__)
 
@@ -108,9 +118,10 @@ class ApiaryClient:
         self, task_id: str, result: str, summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         hive = self._config.apiary_hive_id
-        body: dict[str, Any] = {"result": {"output": result}}
-        if summary:
-            body["summary"] = summary
+        body: dict[str, Any] = {"result": {"output": redact(result)}}
+        redacted_summary = _redact_summary(summary)
+        if redacted_summary:
+            body["summary"] = redacted_summary
         resp = await self._request(
             "PATCH",
             f"/api/v1/hives/{hive}/tasks/{task_id}/complete",
@@ -122,9 +133,10 @@ class ApiaryClient:
         self, task_id: str, error: str, summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         hive = self._config.apiary_hive_id
-        body: dict[str, Any] = {"error": {"message": error}}
-        if summary:
-            body["summary"] = summary
+        body: dict[str, Any] = {"error": {"message": redact(error)}}
+        redacted_summary = _redact_summary(summary)
+        if redacted_summary:
+            body["summary"] = redacted_summary
         resp = await self._request(
             "PATCH",
             f"/api/v1/hives/{hive}/tasks/{task_id}/fail",
