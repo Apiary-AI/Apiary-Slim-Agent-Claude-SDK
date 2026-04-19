@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from src.claude_executor import ClaudeExecutor, ExecutionRequest
 from src.config import Config
+from src.runtime_config import RuntimeConfig
 
 
 def _make_update(text: str):
@@ -33,7 +34,12 @@ def mock_cfg():
     return cfg
 
 
-async def _invoke_handle_message(update, mock_executor, mock_cfg):
+@pytest.fixture
+def mock_runtime():
+    return RuntimeConfig(model="claude-opus-4-5", effort="high")
+
+
+async def _invoke_handle_message(update, mock_executor, mock_cfg, mock_runtime):
     """Register handlers via run_telegram_bot and extract handle_message, then call it."""
     from telegram.ext import Application
 
@@ -56,7 +62,7 @@ async def _invoke_handle_message(update, mock_executor, mock_cfg):
     import asyncio
     from src.telegram_bot import run_telegram_bot
 
-    task = asyncio.create_task(run_telegram_bot(fake_app, mock_executor, mock_cfg))
+    task = asyncio.create_task(run_telegram_bot(fake_app, mock_executor, mock_cfg, mock_runtime))
     # Give the coroutine enough time to register handlers (it blocks on asyncio.sleep)
     await asyncio.sleep(0)
     task.cancel()
@@ -72,10 +78,10 @@ async def _invoke_handle_message(update, mock_executor, mock_cfg):
 
 # --- --branch flag parsing ---
 
-async def test_handle_message_parses_branch_flag(mock_executor, mock_cfg):
+async def test_handle_message_parses_branch_flag(mock_executor, mock_cfg, mock_runtime):
     update = _make_update("--branch feature/login implement the login screen")
 
-    await _invoke_handle_message(update, mock_executor, mock_cfg)
+    await _invoke_handle_message(update, mock_executor, mock_cfg, mock_runtime)
 
     mock_executor.queue.put.assert_called_once()
     req: ExecutionRequest = mock_executor.queue.put.call_args[0][0]
@@ -84,10 +90,10 @@ async def test_handle_message_parses_branch_flag(mock_executor, mock_cfg):
     assert req.source == "telegram"
 
 
-async def test_handle_message_no_branch_flag(mock_executor, mock_cfg):
+async def test_handle_message_no_branch_flag(mock_executor, mock_cfg, mock_runtime):
     update = _make_update("what files are in the project?")
 
-    await _invoke_handle_message(update, mock_executor, mock_cfg)
+    await _invoke_handle_message(update, mock_executor, mock_cfg, mock_runtime)
 
     mock_executor.queue.put.assert_called_once()
     req: ExecutionRequest = mock_executor.queue.put.call_args[0][0]
@@ -99,12 +105,12 @@ async def test_handle_message_no_branch_flag(mock_executor, mock_cfg):
 # --- PR branch auto-resolution ---
 
 @patch("src.telegram_bot._resolve_pr_branch", new_callable=AsyncMock)
-async def test_handle_message_resolves_pr_branch(mock_resolve, mock_executor, mock_cfg):
+async def test_handle_message_resolves_pr_branch(mock_resolve, mock_executor, mock_cfg, mock_runtime):
     mock_cfg.claude_worktree_isolation = True
     mock_resolve.return_value = "feature/doc-locking"
     update = _make_update("check the feedback on PR #200")
 
-    await _invoke_handle_message(update, mock_executor, mock_cfg)
+    await _invoke_handle_message(update, mock_executor, mock_cfg, mock_runtime)
 
     mock_resolve.assert_called_once_with(200, "/workspace")
     req: ExecutionRequest = mock_executor.queue.put.call_args[0][0]
@@ -113,23 +119,23 @@ async def test_handle_message_resolves_pr_branch(mock_resolve, mock_executor, mo
 
 
 @patch("src.telegram_bot._resolve_pr_branch", new_callable=AsyncMock)
-async def test_handle_message_pr_resolve_returns_none(mock_resolve, mock_executor, mock_cfg):
+async def test_handle_message_pr_resolve_returns_none(mock_resolve, mock_executor, mock_cfg, mock_runtime):
     mock_cfg.claude_worktree_isolation = True
     mock_resolve.return_value = None
     update = _make_update("look at #999")
 
-    await _invoke_handle_message(update, mock_executor, mock_cfg)
+    await _invoke_handle_message(update, mock_executor, mock_cfg, mock_runtime)
 
     req: ExecutionRequest = mock_executor.queue.put.call_args[0][0]
     assert req.branch is None
 
 
 @patch("src.telegram_bot._resolve_pr_branch", new_callable=AsyncMock)
-async def test_handle_message_skips_resolve_when_isolation_off(mock_resolve, mock_executor, mock_cfg):
+async def test_handle_message_skips_resolve_when_isolation_off(mock_resolve, mock_executor, mock_cfg, mock_runtime):
     mock_cfg.claude_worktree_isolation = False
     update = _make_update("fix PR #100")
 
-    await _invoke_handle_message(update, mock_executor, mock_cfg)
+    await _invoke_handle_message(update, mock_executor, mock_cfg, mock_runtime)
 
     mock_resolve.assert_not_called()
     req: ExecutionRequest = mock_executor.queue.put.call_args[0][0]
@@ -137,11 +143,11 @@ async def test_handle_message_skips_resolve_when_isolation_off(mock_resolve, moc
 
 
 @patch("src.telegram_bot._resolve_pr_branch", new_callable=AsyncMock)
-async def test_handle_message_explicit_branch_skips_resolve(mock_resolve, mock_executor, mock_cfg):
+async def test_handle_message_explicit_branch_skips_resolve(mock_resolve, mock_executor, mock_cfg, mock_runtime):
     mock_cfg.claude_worktree_isolation = True
     update = _make_update("--branch my-branch fix PR #100")
 
-    await _invoke_handle_message(update, mock_executor, mock_cfg)
+    await _invoke_handle_message(update, mock_executor, mock_cfg, mock_runtime)
 
     mock_resolve.assert_not_called()
     req: ExecutionRequest = mock_executor.queue.put.call_args[0][0]
@@ -149,12 +155,12 @@ async def test_handle_message_explicit_branch_skips_resolve(mock_resolve, mock_e
 
 
 @patch("src.telegram_bot._resolve_pr_branch", new_callable=AsyncMock)
-async def test_handle_message_resolves_first_pr_reference(mock_resolve, mock_executor, mock_cfg):
+async def test_handle_message_resolves_first_pr_reference(mock_resolve, mock_executor, mock_cfg, mock_runtime):
     mock_cfg.claude_worktree_isolation = True
     mock_resolve.return_value = "fix/auth"
     update = _make_update("compare #50 and #51")
 
-    await _invoke_handle_message(update, mock_executor, mock_cfg)
+    await _invoke_handle_message(update, mock_executor, mock_cfg, mock_runtime)
 
     # Should resolve the first PR reference found
     mock_resolve.assert_called_once_with(50, "/workspace")

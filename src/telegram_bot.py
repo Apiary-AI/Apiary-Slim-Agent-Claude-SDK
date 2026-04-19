@@ -21,6 +21,7 @@ from telegram.ext import (
 
 from .claude_executor import ClaudeExecutor, ExecutionRequest
 from .config import Config
+from .runtime_config import RuntimeConfig
 
 log = logging.getLogger(__name__)
 
@@ -136,6 +137,7 @@ async def run_telegram_bot(
     app: Application,
     executor: ClaudeExecutor,
     config: Config,
+    runtime: RuntimeConfig,
 ) -> None:
     """Start the bot using non-blocking polling (compatible with asyncio.gather)."""
 
@@ -181,6 +183,59 @@ async def run_telegram_bot(
             f"  Sessions: {counts['projects']}\n"
             f"  Env snapshots: {counts['session_env']}\n"
             f"  Freed: {freed_mb:.1f}MB"
+        )
+
+    async def cmd_model(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_user or not is_allowed(update.effective_user.id):
+            return
+        args = ctx.args or []
+        if not args:
+            await update.message.reply_text(
+                f"Current model: `{runtime.model}`\n\n"
+                f"Usage: `/model <id>` or `/model list`",
+                parse_mode="Markdown",
+            )
+            return
+        if args[0] == "list":
+            listing = "\n".join(f"- `{m}`" for m in RuntimeConfig.KNOWN_MODELS)
+            await update.message.reply_text(
+                f"Known models:\n{listing}\n\n"
+                f"Any `claude-*` id is accepted — known list is a hint.",
+                parse_mode="Markdown",
+            )
+            return
+        try:
+            runtime.set_model(args[0])
+        except ValueError as e:
+            await update.message.reply_text(f"❌ {e}")
+            return
+        log.info("Model changed to %s by user %s", runtime.model, update.effective_user.id)
+        await update.message.reply_text(
+            f"✅ Model set to `{runtime.model}` (takes effect on next task).",
+            parse_mode="Markdown",
+        )
+
+    async def cmd_effort(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_user or not is_allowed(update.effective_user.id):
+            return
+        args = ctx.args or []
+        if not args:
+            levels = ", ".join(RuntimeConfig.EFFORT_LEVELS)
+            await update.message.reply_text(
+                f"Current effort: `{runtime.effort}`\n\n"
+                f"Usage: `/effort <{levels}>`",
+                parse_mode="Markdown",
+            )
+            return
+        try:
+            runtime.set_effort(args[0])
+        except ValueError as e:
+            await update.message.reply_text(f"❌ {e}")
+            return
+        log.info("Effort changed to %s by user %s", runtime.effort, update.effective_user.id)
+        await update.message.reply_text(
+            f"✅ Effort set to `{runtime.effort}` (takes effect on next task).",
+            parse_mode="Markdown",
         )
 
     async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -288,6 +343,8 @@ async def run_telegram_bot(
     app.add_handler(CommandHandler("new", cmd_new))
     app.add_handler(CommandHandler("restart", cmd_restart))
     app.add_handler(CommandHandler("cleanup", cmd_cleanup))
+    app.add_handler(CommandHandler("model", cmd_model))
+    app.add_handler(CommandHandler("effort", cmd_effort))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))

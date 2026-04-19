@@ -65,6 +65,7 @@ _sdk_client.SubprocessCLITransport._build_command = _patched_build_command
 from .apiary_client import ApiaryClient
 from .config import Config
 from .module_loader import collect_mcp_servers, discover_modules
+from .runtime_config import RuntimeConfig
 from .session_store import SessionStore
 from .telegram_gateway import TelegramGateway
 from .telegram_streamer import TelegramStreamer
@@ -91,11 +92,13 @@ class ClaudeExecutor:
     def __init__(
         self,
         config: Config,
+        runtime: RuntimeConfig,
         apiary: ApiaryClient | None,
         gateway: TelegramGateway,
         persona: str | None = None,
     ) -> None:
         self._config = config
+        self._runtime = runtime
         self._apiary = apiary
         self._gateway = gateway
         self._persona = persona
@@ -384,11 +387,11 @@ class ClaudeExecutor:
     ) -> ClaudeCodeOptions:
         """Build ClaudeCodeOptions, optionally resuming a session or overriding cwd."""
         opts: dict = {
-            "model": self._config.claude_model,
+            "model": self._runtime.model,
             "max_turns": self._config.claude_max_turns,
             "permission_mode": "bypassPermissions",
             "cwd": cwd or self._config.claude_working_dir,
-            "extra_args": {"effort": self._config.claude_effort},
+            "extra_args": {"effort": self._runtime.effort},
         }
         if _mcp:
             opts["mcp_servers"] = _mcp

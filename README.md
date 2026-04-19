@@ -183,4 +183,6 @@ tests/
 
 - Send any text message to your Telegram bot — Claude processes it and streams the response back
 - `/status` — check queue depth
+- `/model [<id>|list]` — show or change the Claude model. Any `claude-*` id is accepted; `/model list` prints known ids. Persists across restarts.
+- `/effort [low|medium|high|max]` — show or change reasoning effort. Persists across restarts.
 - Apiary tasks are automatically polled, claimed, executed, and completed

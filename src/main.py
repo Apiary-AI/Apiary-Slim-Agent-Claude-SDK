@@ -15,6 +15,7 @@ from .apiary_client import ApiaryClient
 from .apiary_poller import run_apiary_poller
 from .claude_executor import ClaudeExecutor
 from .config import Config
+from .runtime_config import RuntimeConfig
 from .telegram_bot import build_telegram_app, run_telegram_bot
 from .telegram_gateway import TelegramGateway
 from .worktree_manager import is_git_repo, prune_worktrees
@@ -153,15 +154,19 @@ async def main() -> None:
         except Exception:
             log.warning("Could not fetch persona at startup", exc_info=True)
 
+    # Runtime-tunable overrides (model, effort) — env defaults, persisted JSON overlays
+    runtime = RuntimeConfig.load(config)
+    log.info("Runtime: model=%s, effort=%s", runtime.model, runtime.effort)
+
     # Executor
-    executor = ClaudeExecutor(config, apiary, gateway, persona=persona)
+    executor = ClaudeExecutor(config, runtime, apiary, gateway, persona=persona)
     log.info("Executor: max_parallel=%d, worktree_isolation=%s",
              config.claude_max_parallel, config.claude_worktree_isolation)
 
     # Build task list
     tasks = [
         executor.run(),
-        run_telegram_bot(bot_app, executor, config),
+        run_telegram_bot(bot_app, executor, config, runtime),
         gateway.run(),
     ]
     if apiary:
