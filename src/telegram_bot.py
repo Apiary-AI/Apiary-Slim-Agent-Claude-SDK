@@ -338,6 +338,41 @@ async def run_telegram_bot(
             update.effective_user.id, executor.pending, transcript[:50],
         )
 
+    async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not update.effective_user or not is_allowed(update.effective_user.id):
+            return
+        if not update.message or not update.message.document:
+            return
+
+        doc = update.message.document
+        tg_file = await doc.get_file()
+        filename = doc.file_name or f"file_{update.message.message_id}"
+        path = f"/tmp/tg_doc_{update.message.message_id}_{filename}"
+        await tg_file.download_to_drive(path)
+
+        caption = update.message.caption or f"I sent you a file: {filename}. Work with it as needed."
+        branch: str | None = None
+        if caption.startswith("--branch "):
+            parts = caption.split(" ", 2)
+            if len(parts) >= 2:
+                branch = parts[1]
+                caption = parts[2] if len(parts) == 3 else f"I sent you a file: {filename}. Work with it as needed."
+
+        # Tell Claude where the file is so it can read/use it
+        prompt = (
+            f"The user sent a file. It has been saved to: {path}\n"
+            f"File name: {filename}\n\n{caption}"
+        )
+
+        req = ExecutionRequest(
+            prompt=prompt,
+            chat_id=update.effective_chat.id,
+            source="telegram",
+            branch=branch,
+        )
+        await executor.queue.put(req)
+        log.info("Enqueued document '%s' from user %s (queue=%d)", filename, update.effective_user.id, executor.pending)
+
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("new", cmd_new))
@@ -348,6 +383,7 @@ async def run_telegram_bot(
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
 
     # Non-blocking start: initialize + start + begin polling
     await app.initialize()
