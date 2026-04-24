@@ -6,6 +6,7 @@ import asyncio
 import logging
 import logging.handlers
 import os
+import shutil
 import signal
 import sys
 
@@ -130,6 +131,67 @@ async def _warn_missing_permissions(gateway: TelegramGateway, config: Config) ->
         log.debug("Failed to send missing-permissions warning to Telegram", exc_info=True)
 
 
+async def _monitor_disk(
+    gateway: TelegramGateway,
+    config: Config,
+    *,
+    path: str = "/home/agent/.claude",
+    interval_seconds: int = 300,
+    warn_threshold: float = 0.90,
+    clear_threshold: float = 0.85,
+) -> None:
+    """Poll disk usage on the session-state volume and alert via Telegram.
+
+    When a full disk truncates session_store.json / Claude CLI's per-chat
+    JSONL files, the symptom surfaces much later as "agent lost context"
+    — the operator sees a nonsense answer without any clue the underlying
+    cause was disk pressure.  This task surfaces the warning early.
+
+    Hysteresis via clear_threshold prevents alert flapping around the 90%
+    boundary; the "recovered" message only fires after an active alert.
+    """
+    alerted = False
+    while True:
+        try:
+            total, used, free = shutil.disk_usage(path)
+            usage = used / total if total else 0.0
+
+            if usage >= warn_threshold and not alerted:
+                free_gb = free / (1024 ** 3)
+                total_gb = total / (1024 ** 3)
+                log.error(
+                    "Disk nearly full: %.0f%% used (%.1fGB free of %.1fGB) at %s",
+                    usage * 100, free_gb, total_gb, path,
+                )
+                if config.telegram_chat_id:
+                    msg = (
+                        f"⚠️ Agent disk at {usage:.0%} "
+                        f"({free_gb:.1f}GB free of {total_gb:.1f}GB).\n"
+                        f"Session persistence may start failing — "
+                        f"free up disk on the host before the agent loses context."
+                    )
+                    try:
+                        await gateway.send_message(config.telegram_chat_id, msg)
+                    except Exception:
+                        log.debug("Failed to send disk warning", exc_info=True)
+                alerted = True
+            elif usage < clear_threshold and alerted:
+                log.info("Disk usage recovered: %.0f%%", usage * 100)
+                if config.telegram_chat_id:
+                    try:
+                        await gateway.send_message(
+                            config.telegram_chat_id,
+                            f"✅ Agent disk recovered to {usage:.0%}.",
+                        )
+                    except Exception:
+                        pass
+                alerted = False
+        except Exception:
+            log.debug("Disk check failed", exc_info=True)
+
+        await asyncio.sleep(interval_seconds)
+
+
 async def _check_claude_auth() -> None:
     """Make a minimal SDK call to verify Claude credentials before starting."""
     log.info("Verifying Claude authentication...")
@@ -234,6 +296,7 @@ async def main() -> None:
         executor.run(),
         run_telegram_bot(bot_app, executor, config, runtime),
         gateway.run(),
+        _monitor_disk(gateway, config),
     ]
     if superpos:
         tasks.append(run_superpos_poller(superpos, executor, config))

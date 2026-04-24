@@ -27,9 +27,27 @@ class SessionStore:
                 self._data = {}
 
     def _save(self) -> None:
+        """Atomically persist the session map.
+
+        Writes to a sibling tempfile and renames on success.  If the disk
+        is full ``write_text`` fails on the temp file, so the real file
+        keeps its previous contents instead of being truncated to 0 bytes
+        mid-write (the failure mode that wiped sessions when the Docker
+        VM filled up).
+        """
         try:
             self._path.parent.mkdir(parents=True, exist_ok=True)
-            self._path.write_text(json.dumps(self._data))
+            tmp_path = self._path.with_suffix(self._path.suffix + ".tmp")
+            try:
+                tmp_path.write_text(json.dumps(self._data))
+                tmp_path.replace(self._path)
+            except OSError:
+                # Best-effort cleanup of the half-written temp file
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+                raise
         except OSError:
             log.warning("Failed to persist session store to %s", self._path)
 

@@ -35,11 +35,16 @@ def test_md_escapes_outside_code_but_not_inside():
 
 # --- _humanize_tool ---
 
-def test_humanize_bash_strips_at_double_ampersand():
-    assert _humanize_tool("Bash", {"command": "cd /tmp && ls"}) == "Running command: cd /tmp"
+def test_humanize_bash_shows_full_command_across_double_ampersand():
+    # Previously this was split at "&&" and only the first segment was shown,
+    # which hid the actual work (e.g. "cd /repo && php artisan test" → "cd /repo").
+    assert _humanize_tool("Bash", {"command": "cd /tmp && ls"}) == "Running command: cd /tmp && ls"
 
-def test_humanize_bash_strips_at_pipe():
-    assert _humanize_tool("Bash", {"command": "git log | head -5"}) == "Running command: git log"
+def test_humanize_bash_shows_full_command_across_pipe():
+    assert _humanize_tool("Bash", {"command": "git log | head -5"}) == "Running command: git log | head -5"
+
+def test_humanize_bash_collapses_whitespace():
+    assert _humanize_tool("Bash", {"command": "echo\n  hello\t world"}) == "Running command: echo hello world"
 
 def test_humanize_read_extracts_filename():
     assert _humanize_tool("Read", {"file_path": "/some/path/file.py"}) == "Reading: file.py"
