@@ -1,11 +1,11 @@
 #!/bin/bash
-# Pull latest Apiary SDK changes and reinstall the Python package.
+# Pull latest Superpos SDK changes and reinstall the Python package.
 # Run this when the user asks for new SDK features or when check-updates reports drift.
 
 set -e
 
-VENDOR_DIR="/workspace/.claude/modules/apiary-sdk/vendor"
-REF="${APIARY_SDK_REF:-main}"
+VENDOR_DIR="/workspace/.claude/modules/superpos-sdk/vendor"
+REF="${SUPERPOS_SDK_REF:-main}"
 
 if [ ! -d "$VENDOR_DIR/.git" ]; then
     echo "SDK not vendored yet — run the container entrypoint (setup.sh) first." >&2

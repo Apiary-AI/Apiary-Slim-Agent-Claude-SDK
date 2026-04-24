@@ -1,4 +1,4 @@
-"""Thin async HTTP client for Apiary REST API."""
+"""Thin async HTTP client for Superpos REST API."""
 
 from __future__ import annotations
 
@@ -22,12 +22,12 @@ def _redact_summary(summary: dict[str, Any] | None) -> dict[str, Any] | None:
 log = logging.getLogger(__name__)
 
 
-class ApiaryClient:
+class SuperposClient:
     def __init__(self, config: Config) -> None:
         self._config = config
-        self._base_url = config.apiary_base_url.rstrip("/")
-        self._token: str = config.apiary_api_token
-        self._refresh_token: str = config.apiary_refresh_token
+        self._base_url = config.superpos_base_url.rstrip("/")
+        self._token: str = config.superpos_api_token
+        self._refresh_token: str = config.superpos_refresh_token
         self._client = httpx.AsyncClient(
             base_url=self._base_url,
             timeout=30.0,
@@ -51,7 +51,7 @@ class ApiaryClient:
             ("/api/v1/agents/token/refresh", {"refresh_token": self._refresh_token}),
             ("/api/v1/agents/refresh", {"refresh_token": self._refresh_token}),
             ("/api/v1/agents/login", {
-                "agent_id": self._config.apiary_agent_id,
+                "agent_id": self._config.superpos_agent_id,
                 "refresh_token": self._refresh_token,
             }),
         ]:
@@ -68,7 +68,7 @@ class ApiaryClient:
                 self._token = data.get("token", self._token)
                 if "refresh_token" in data:
                     self._refresh_token = data["refresh_token"]
-                log.info("Apiary token refreshed via %s", endpoint)
+                log.info("Superpos token refreshed via %s", endpoint)
                 return True
             except httpx.HTTPStatusError:
                 continue
@@ -83,7 +83,7 @@ class ApiaryClient:
             method, path, headers=self._headers(), **kwargs
         )
         if resp.status_code == 401:
-            log.warning("Apiary 401 — attempting token refresh")
+            log.warning("Superpos 401 — attempting token refresh")
             if await self.refresh_auth():
                 resp = await self._client.request(
                     method, path, headers=self._headers(), **kwargs
@@ -96,18 +96,18 @@ class ApiaryClient:
     async def poll_tasks(self) -> list[dict[str, Any]]:
         resp = await self._request(
             "GET",
-            f"/api/v1/hives/{self._config.apiary_hive_id}/tasks/poll",
+            f"/api/v1/hives/{self._config.superpos_hive_id}/tasks/poll",
             params={
-                "capabilities": ",".join(self._config.apiary_capabilities),
+                "capabilities": ",".join(self._config.superpos_capabilities),
             }
-            if self._config.apiary_capabilities
+            if self._config.superpos_capabilities
             else None,
         )
         data = resp.json()
         return data.get("data", data) if isinstance(data, dict) else data
 
     async def claim_task(self, task_id: str) -> dict[str, Any]:
-        hive = self._config.apiary_hive_id
+        hive = self._config.superpos_hive_id
         resp = await self._request(
             "PATCH",
             f"/api/v1/hives/{hive}/tasks/{task_id}/claim",
@@ -117,7 +117,7 @@ class ApiaryClient:
     async def complete_task(
         self, task_id: str, result: str, summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        hive = self._config.apiary_hive_id
+        hive = self._config.superpos_hive_id
         body: dict[str, Any] = {"result": {"output": redact(result)}}
         redacted_summary = _redact_summary(summary)
         if redacted_summary:
@@ -132,7 +132,7 @@ class ApiaryClient:
     async def fail_task(
         self, task_id: str, error: str, summary: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        hive = self._config.apiary_hive_id
+        hive = self._config.superpos_hive_id
         body: dict[str, Any] = {"error": {"message": redact(error)}}
         redacted_summary = _redact_summary(summary)
         if redacted_summary:
@@ -148,7 +148,7 @@ class ApiaryClient:
                           target_agent_id: str | None = None,
                           target_capability: str | None = None,
                           priority: int = 2) -> dict[str, Any]:
-        hive = self._config.apiary_hive_id
+        hive = self._config.superpos_hive_id
         body: dict[str, Any] = {"type": task_type}
         if payload:
             body["payload"] = payload
@@ -172,7 +172,7 @@ class ApiaryClient:
                               run_at: str | None = None,
                               task_target_agent_id: str | None = None,
                               overlap_policy: str = "skip") -> dict[str, Any]:
-        hive = self._config.apiary_hive_id
+        hive = self._config.superpos_hive_id
         body: dict[str, Any] = {
             "name": name,
             "trigger_type": trigger_type,
@@ -197,18 +197,18 @@ class ApiaryClient:
         return resp.json()
 
     async def list_schedules(self) -> list[dict[str, Any]]:
-        hive = self._config.apiary_hive_id
+        hive = self._config.superpos_hive_id
         resp = await self._request("GET", f"/api/v1/hives/{hive}/schedules")
         data = resp.json()
         return data.get("data", []) if isinstance(data, dict) else data
 
     async def delete_schedule(self, schedule_id: str) -> None:
-        hive = self._config.apiary_hive_id
+        hive = self._config.superpos_hive_id
         await self._request("DELETE", f"/api/v1/hives/{hive}/schedules/{schedule_id}")
 
     async def update_progress(self, task_id: str, progress: int) -> dict[str, Any]:
         """Report task progress (0-100). Resets progress_timeout on the server."""
-        hive = self._config.apiary_hive_id
+        hive = self._config.superpos_hive_id
         resp = await self._request(
             "PATCH",
             f"/api/v1/hives/{hive}/tasks/{task_id}/progress",

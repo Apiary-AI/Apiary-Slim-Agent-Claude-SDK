@@ -1,6 +1,6 @@
-# slim-apiary-agent-cc
+# superpos-claude-agent
 
-Docker agent that bridges **Apiary** and **Telegram** with **Claude Code** as the brain.
+Docker agent that bridges **Superpos** and **Telegram** with **Claude Code** as the brain.
 
 ## Setup
 
@@ -16,26 +16,26 @@ Fill in your `.env`:
 |---|---|---|
 | `TELEGRAM_BOT_TOKEN` | Yes | From @BotFather |
 | `TELEGRAM_ALLOWED_USERS` | Yes | Your Telegram user ID (comma-separated for multiple) |
-| `TELEGRAM_CHAT_ID` | No | Default chat for Apiary task notifications |
-| `APIARY_BASE_URL` | No | Your Apiary instance URL |
-| `APIARY_HIVE_ID` | No | Hive ID from Apiary UI |
-| `APIARY_AGENT_ID` | No | Agent ID from agent creation dialog |
-| `APIARY_API_TOKEN` | No | API Token from agent creation dialog |
-| `APIARY_REFRESH_TOKEN` | No | Refresh Token from agent creation dialog |
-| `APIARY_CAPABILITIES` | No | Comma-separated capabilities |
-| `APIARY_POLL_INTERVAL` | No | Poll interval in seconds (default: 5) |
+| `TELEGRAM_CHAT_ID` | No | Default chat for Superpos task notifications |
+| `SUPERPOS_BASE_URL` | No | Your Superpos instance URL |
+| `SUPERPOS_HIVE_ID` | No | Hive ID from Superpos UI |
+| `SUPERPOS_AGENT_ID` | No | Agent ID from agent creation dialog |
+| `SUPERPOS_API_TOKEN` | No | API Token from agent creation dialog |
+| `SUPERPOS_REFRESH_TOKEN` | No | Refresh Token from agent creation dialog |
+| `SUPERPOS_CAPABILITIES` | No | Comma-separated capabilities |
+| `SUPERPOS_POLL_INTERVAL` | No | Poll interval in seconds (default: 5) |
 | `ANTHROPIC_API_KEY` | No | Only if not using OAuth |
 | `CLAUDE_MODEL` | No | Default: claude-opus-4-6 |
 | `CLAUDE_EFFORT` | No | Effort level: low, medium, high, max (default: high) |
 | `CLAUDE_MAX_TURNS` | No | Default: 30 |
 | `CLAUDE_WORKING_DIR` | No | Default: /workspace |
 
-Apiary variables are optional — if omitted, only the Telegram bot runs.
+Superpos variables are optional — if omitted, only the Telegram bot runs.
 
 ### 2. Build
 
 ```bash
-docker build -t slim-apiary-agent .
+docker build -t superpos-claude-agent .
 ```
 
 ### 3. Authenticate Claude (OAuth)
@@ -43,7 +43,7 @@ docker build -t slim-apiary-agent .
 One-time step. This lets you use your Claude Pro/Max subscription instead of paying per API call.
 
 ```bash
-docker run -it -v claude_auth:/home/agent/.claude --entrypoint claude slim-apiary-agent
+docker run -it -v claude_auth:/home/agent/.claude --entrypoint claude superpos-claude-agent
 ```
 
 The CLI will print a URL like:
@@ -57,7 +57,7 @@ Open that URL in your browser, log in with your Claude account, and the CLI will
 ### 4. Run
 
 ```bash
-docker run --env-file .env -v claude_auth:/home/agent/.claude slim-apiary-agent
+docker run --env-file .env -v claude_auth:/home/agent/.claude superpos-claude-agent
 ```
 
 The `claude_auth` volume persists your OAuth session across container restarts.
@@ -65,7 +65,7 @@ The `claude_auth` volume persists your OAuth session across container restarts.
 To prevent your Mac from sleeping while the agent runs, wrap the command with `caffeinate`:
 
 ```bash
-caffeinate -is docker run --env-file .env -v claude_auth:/home/agent/.claude slim-apiary-agent
+caffeinate -is docker run --env-file .env -v claude_auth:/home/agent/.claude superpos-claude-agent
 ```
 
 `-i` prevents idle sleep, `-s` prevents system sleep (keeps the machine awake even with the lid closed on AC power). `caffeinate` exits automatically when the Docker container stops.
@@ -75,12 +75,12 @@ caffeinate -is docker run --env-file .env -v claude_auth:/home/agent/.claude sli
 If you prefer API key auth, skip step 3, set `ANTHROPIC_API_KEY` in `.env`, and run without the volume:
 
 ```bash
-docker run --env-file .env slim-apiary-agent
+docker run --env-file .env superpos-claude-agent
 ```
 
 ## Multi-agent setup (Docker Compose)
 
-Run multiple independent agents, each with its own Telegram bot and Apiary registration.
+Run multiple independent agents, each with its own Telegram bot and Superpos registration.
 
 ### 1. Create compose and env files
 
@@ -97,10 +97,10 @@ cp .env.example .env.agent2
 ```
 
 Fill in unique values per agent:
-- `APIARY_AGENT_ID` + `APIARY_API_TOKEN` (register each agent in Apiary dashboard)
+- `SUPERPOS_AGENT_ID` + `SUPERPOS_API_TOKEN` (register each agent in Superpos dashboard)
 - `TELEGRAM_BOT_TOKEN` (create separate bots via @BotFather)
 
-Shared values (Git, GitHub, Apiary URL/Hive) can be the same across all agents.
+Shared values (Git, GitHub, Superpos URL/Hive) can be the same across all agents.
 
 ### 2. Build
 
@@ -174,7 +174,7 @@ No credentials or environment variables needed — everything is mocked.
 
 ```
 tests/
-  conftest.py          # shared fixtures (executor, mock_apiary, mock_config)
+  conftest.py          # shared fixtures (executor, mock_superpos, mock_config)
   test_executor.py     # dedup methods, _report_progress 409/500, claim-expiry cleanup
   test_poller.py       # skip in-flight tasks, claim+enqueue new tasks, skip malformed tasks
 ```
@@ -185,4 +185,4 @@ tests/
 - `/status` — check queue depth
 - `/model [<id>|list]` — show or change the Claude model. Any `claude-*` id is accepted; `/model list` prints known ids. Persists across restarts.
 - `/effort [low|medium|high|max]` — show or change reasoning effort. Persists across restarts.
-- Apiary tasks are automatically polled, claimed, executed, and completed
+- Superpos tasks are automatically polled, claimed, executed, and completed

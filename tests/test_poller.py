@@ -2,71 +2,71 @@ import asyncio
 
 import pytest
 
-from src.apiary_poller import run_apiary_poller
+from src.superpos_poller import run_superpos_poller
 from src.claude_executor import ExecutionRequest
 
 
 # --- Already in-flight task is not re-claimed ---
 
-async def test_poller_skips_in_flight_task(mock_apiary, executor, mock_config):
-    mock_apiary.poll_tasks.return_value = [
+async def test_poller_skips_in_flight_task(mock_superpos, executor, mock_config):
+    mock_superpos.poll_tasks.return_value = [
         {"id": "task-1", "invoke": {"instructions": "do something"}}
     ]
-    executor.add_apiary_task("task-1")  # simulate already claimed
+    executor.add_superpos_task("task-1")  # simulate already claimed
 
-    task = asyncio.create_task(run_apiary_poller(mock_apiary, executor, mock_config))
+    task = asyncio.create_task(run_superpos_poller(mock_superpos, executor, mock_config))
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    mock_apiary.claim_task.assert_not_called()
+    mock_superpos.claim_task.assert_not_called()
     assert executor.queue.empty()
 
 
 # --- New task is claimed, registered in in-flight, and enqueued ---
 
-async def test_poller_claims_and_enqueues_new_task(mock_apiary, executor, mock_config):
-    mock_apiary.poll_tasks.return_value = [
+async def test_poller_claims_and_enqueues_new_task(mock_superpos, executor, mock_config):
+    mock_superpos.poll_tasks.return_value = [
         {"id": "task-2", "invoke": {"instructions": "do something"}}
     ]
 
-    task = asyncio.create_task(run_apiary_poller(mock_apiary, executor, mock_config))
+    task = asyncio.create_task(run_superpos_poller(mock_superpos, executor, mock_config))
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    mock_apiary.claim_task.assert_called_once_with("task-2")
-    assert executor.has_apiary_task("task-2")
+    mock_superpos.claim_task.assert_called_once_with("task-2")
+    assert executor.has_superpos_task("task-2")
     assert not executor.queue.empty()
     req = executor.queue.get_nowait()
-    assert req.apiary_task_id == "task-2"
-    assert req.source == "apiary"
+    assert req.superpos_task_id == "task-2"
+    assert req.source == "superpos"
 
 
 # --- Task with missing id/prompt is skipped without claiming ---
 
-async def test_poller_skips_task_without_prompt(mock_apiary, executor, mock_config):
-    mock_apiary.poll_tasks.return_value = [{"id": "task-3"}]  # no prompt
+async def test_poller_skips_task_without_prompt(mock_superpos, executor, mock_config):
+    mock_superpos.poll_tasks.return_value = [{"id": "task-3"}]  # no prompt
 
-    task = asyncio.create_task(run_apiary_poller(mock_apiary, executor, mock_config))
+    task = asyncio.create_task(run_superpos_poller(mock_superpos, executor, mock_config))
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    mock_apiary.claim_task.assert_not_called()
+    mock_superpos.claim_task.assert_not_called()
 
 
 # --- Prompt extraction from payload.prompt ---
 
-async def test_poller_extracts_prompt_from_payload_prompt(mock_apiary, executor, mock_config):
-    mock_apiary.poll_tasks.return_value = [
+async def test_poller_extracts_prompt_from_payload_prompt(mock_superpos, executor, mock_config):
+    mock_superpos.poll_tasks.return_value = [
         {"id": "task-p1", "payload": {"prompt": "from payload"}}
     ]
 
-    task = asyncio.create_task(run_apiary_poller(mock_apiary, executor, mock_config))
+    task = asyncio.create_task(run_superpos_poller(mock_superpos, executor, mock_config))
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -78,12 +78,12 @@ async def test_poller_extracts_prompt_from_payload_prompt(mock_apiary, executor,
 
 # --- Prompt extraction from payload.input ---
 
-async def test_poller_extracts_prompt_from_payload_input(mock_apiary, executor, mock_config):
-    mock_apiary.poll_tasks.return_value = [
+async def test_poller_extracts_prompt_from_payload_input(mock_superpos, executor, mock_config):
+    mock_superpos.poll_tasks.return_value = [
         {"id": "task-p2", "payload": {"input": "from input"}}
     ]
 
-    task = asyncio.create_task(run_apiary_poller(mock_apiary, executor, mock_config))
+    task = asyncio.create_task(run_superpos_poller(mock_superpos, executor, mock_config))
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -95,12 +95,12 @@ async def test_poller_extracts_prompt_from_payload_input(mock_apiary, executor, 
 
 # --- Prompt extraction from top-level field ---
 
-async def test_poller_extracts_prompt_from_top_level_description(mock_apiary, executor, mock_config):
-    mock_apiary.poll_tasks.return_value = [
+async def test_poller_extracts_prompt_from_top_level_description(mock_superpos, executor, mock_config):
+    mock_superpos.poll_tasks.return_value = [
         {"id": "task-p3", "description": "top-level description"}
     ]
 
-    task = asyncio.create_task(run_apiary_poller(mock_apiary, executor, mock_config))
+    task = asyncio.create_task(run_superpos_poller(mock_superpos, executor, mock_config))
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -112,44 +112,44 @@ async def test_poller_extracts_prompt_from_top_level_description(mock_apiary, ex
 
 # --- Claim failure: task not enqueued, loop continues ---
 
-async def test_poller_skips_task_when_claim_fails(mock_apiary, executor, mock_config):
-    mock_apiary.poll_tasks.return_value = [
+async def test_poller_skips_task_when_claim_fails(mock_superpos, executor, mock_config):
+    mock_superpos.poll_tasks.return_value = [
         {"id": "task-cf", "invoke": {"instructions": "do something"}}
     ]
-    mock_apiary.claim_task.side_effect = Exception("already claimed")
+    mock_superpos.claim_task.side_effect = Exception("already claimed")
 
-    task = asyncio.create_task(run_apiary_poller(mock_apiary, executor, mock_config))
+    task = asyncio.create_task(run_superpos_poller(mock_superpos, executor, mock_config))
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
     assert executor.queue.empty()
-    assert not executor.has_apiary_task("task-cf")
+    assert not executor.has_superpos_task("task-cf")
 
 
 # --- Heartbeat failure: polling still happens ---
 
-async def test_poller_continues_after_heartbeat_failure(mock_apiary, executor, mock_config):
-    mock_apiary.heartbeat.side_effect = Exception("connection refused")
-    mock_apiary.poll_tasks.return_value = [
+async def test_poller_continues_after_heartbeat_failure(mock_superpos, executor, mock_config):
+    mock_superpos.heartbeat.side_effect = Exception("connection refused")
+    mock_superpos.poll_tasks.return_value = [
         {"id": "task-hb", "invoke": {"instructions": "do something"}}
     ]
 
-    task = asyncio.create_task(run_apiary_poller(mock_apiary, executor, mock_config))
+    task = asyncio.create_task(run_superpos_poller(mock_superpos, executor, mock_config))
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
-    mock_apiary.claim_task.assert_called_once_with("task-hb")
+    mock_superpos.claim_task.assert_called_once_with("task-hb")
     assert not executor.queue.empty()
 
 
 # --- Context data appended to prompt ---
 
-async def test_poller_appends_event_payload_to_prompt(mock_apiary, executor, mock_config):
-    mock_apiary.poll_tasks.return_value = [
+async def test_poller_appends_event_payload_to_prompt(mock_superpos, executor, mock_config):
+    mock_superpos.poll_tasks.return_value = [
         {
             "id": "task-ctx",
             "invoke": {"instructions": "process this"},
@@ -157,7 +157,7 @@ async def test_poller_appends_event_payload_to_prompt(mock_apiary, executor, moc
         }
     ]
 
-    task = asyncio.create_task(run_apiary_poller(mock_apiary, executor, mock_config))
+    task = asyncio.create_task(run_superpos_poller(mock_superpos, executor, mock_config))
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -171,8 +171,8 @@ async def test_poller_appends_event_payload_to_prompt(mock_apiary, executor, moc
 
 # --- Branch inference: PR head ref ---
 
-async def test_poller_sets_branch_from_pr_head_ref(mock_apiary, executor, mock_config):
-    mock_apiary.poll_tasks.return_value = [
+async def test_poller_sets_branch_from_pr_head_ref(mock_superpos, executor, mock_config):
+    mock_superpos.poll_tasks.return_value = [
         {
             "id": "task-branch",
             "invoke": {"instructions": "review PR"},
@@ -180,7 +180,7 @@ async def test_poller_sets_branch_from_pr_head_ref(mock_apiary, executor, mock_c
         }
     ]
 
-    task = asyncio.create_task(run_apiary_poller(mock_apiary, executor, mock_config))
+    task = asyncio.create_task(run_superpos_poller(mock_superpos, executor, mock_config))
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -192,8 +192,8 @@ async def test_poller_sets_branch_from_pr_head_ref(mock_apiary, executor, mock_c
 
 # --- Branch inference: push ref ---
 
-async def test_poller_sets_branch_from_push_ref(mock_apiary, executor, mock_config):
-    mock_apiary.poll_tasks.return_value = [
+async def test_poller_sets_branch_from_push_ref(mock_superpos, executor, mock_config):
+    mock_superpos.poll_tasks.return_value = [
         {
             "id": "task-push",
             "invoke": {"instructions": "run checks"},
@@ -201,7 +201,7 @@ async def test_poller_sets_branch_from_push_ref(mock_apiary, executor, mock_conf
         }
     ]
 
-    task = asyncio.create_task(run_apiary_poller(mock_apiary, executor, mock_config))
+    task = asyncio.create_task(run_superpos_poller(mock_superpos, executor, mock_config))
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
@@ -213,43 +213,43 @@ async def test_poller_sets_branch_from_push_ref(mock_apiary, executor, mock_conf
 
 # --- Executor at capacity: remaining tasks not claimed ---
 
-async def test_poller_defers_when_no_free_slots(mock_apiary, executor, mock_config):
-    mock_apiary.poll_tasks.return_value = [
+async def test_poller_defers_when_no_free_slots(mock_superpos, executor, mock_config):
+    mock_superpos.poll_tasks.return_value = [
         {"id": "task-a", "invoke": {"instructions": "first"}},
         {"id": "task-b", "invoke": {"instructions": "second"}},
     ]
     # Simulate executor at capacity (fill in-flight set)
     for i in range(mock_config.claude_max_parallel):
-        executor.add_apiary_task(f"inflight-{i}")
+        executor.add_superpos_task(f"inflight-{i}")
 
-    task = asyncio.create_task(run_apiary_poller(mock_apiary, executor, mock_config))
+    task = asyncio.create_task(run_superpos_poller(mock_superpos, executor, mock_config))
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
     # Neither task should have been claimed — executor was full before the first one
-    mock_apiary.claim_task.assert_not_called()
+    mock_superpos.claim_task.assert_not_called()
     assert executor.queue.empty()
 
 
-async def test_poller_claims_multiple_when_slots_available(mock_apiary, executor, mock_config):
-    mock_apiary.poll_tasks.return_value = [
+async def test_poller_claims_multiple_when_slots_available(mock_superpos, executor, mock_config):
+    mock_superpos.poll_tasks.return_value = [
         {"id": "task-a", "invoke": {"instructions": "first"}},
         {"id": "task-b", "invoke": {"instructions": "second"}},
     ]
     # Executor has free slots (active_count=0, max_parallel=3)
 
-    task = asyncio.create_task(run_apiary_poller(mock_apiary, executor, mock_config))
+    task = asyncio.create_task(run_superpos_poller(mock_superpos, executor, mock_config))
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
 
     # Both tasks should be claimed since there are free slots
-    assert mock_apiary.claim_task.call_count == 2
-    assert executor.has_apiary_task("task-a")
-    assert executor.has_apiary_task("task-b")
+    assert mock_superpos.claim_task.call_count == 2
+    assert executor.has_superpos_task("task-a")
+    assert executor.has_superpos_task("task-b")
     assert executor.queue.qsize() == 2
 
 
@@ -264,12 +264,12 @@ async def test_is_busy_false_when_idle(executor):
 
 # --- No branch info → branch is None ---
 
-async def test_poller_branch_is_none_when_no_context(mock_apiary, executor, mock_config):
-    mock_apiary.poll_tasks.return_value = [
+async def test_poller_branch_is_none_when_no_context(mock_superpos, executor, mock_config):
+    mock_superpos.poll_tasks.return_value = [
         {"id": "task-nobranch", "invoke": {"instructions": "generic task"}}
     ]
 
-    task = asyncio.create_task(run_apiary_poller(mock_apiary, executor, mock_config))
+    task = asyncio.create_task(run_superpos_poller(mock_superpos, executor, mock_config))
     await asyncio.sleep(0.05)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):

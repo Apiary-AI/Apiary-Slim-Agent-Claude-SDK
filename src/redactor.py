@@ -1,6 +1,6 @@
 """Strip known secret patterns from text before it leaves the container.
 
-Applied to outbound text on two boundaries: Telegram streaming and Apiary
+Applied to outbound text on two boundaries: Telegram streaming and Superpos
 task result/error payloads. Defence-in-depth — the first line of defence
 is not putting tokens in URLs / logs in the first place.
 

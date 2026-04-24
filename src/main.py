@@ -11,8 +11,8 @@ import sys
 
 from claude_code_sdk import ClaudeCodeOptions, ClaudeSDKError, query
 
-from .apiary_client import ApiaryClient
-from .apiary_poller import run_apiary_poller
+from .superpos_client import SuperposClient
+from .superpos_poller import run_superpos_poller
 from .claude_executor import ClaudeExecutor
 from .config import Config
 from .runtime_config import RuntimeConfig
@@ -50,7 +50,7 @@ _AUTH_HELP_OAUTH_EXPIRED = """
 ║                                                              ║
 ║    docker run -it \\                                         ║
 ║      -v claude_auth:/home/agent/.claude \\                   ║
-║      --entrypoint claude slim-apiary-agent                   ║
+║      --entrypoint claude superpos-claude-agent                   ║
 ║                                                              ║
 ║  Open the printed URL in your browser and log in.            ║
 ║  Then restart the agent (keep the -v flag).                  ║
@@ -67,7 +67,7 @@ _AUTH_HELP_INVALID_KEY = """
 ║                                                              ║
 ║    docker run -it \\                                         ║
 ║      -v claude_auth:/home/agent/.claude \\                   ║
-║      --entrypoint claude slim-apiary-agent                   ║
+║      --entrypoint claude superpos-claude-agent                   ║
 ║                                                              ║
 ║    Open the printed URL in your browser and log in.          ║
 ║    Then run the agent with the same -v flag.                 ║
@@ -120,18 +120,18 @@ async def main() -> None:
     # Verify Claude auth before starting anything else
     await _check_claude_auth()
 
-    # Apiary client (optional)
-    apiary: ApiaryClient | None = None
-    if config.apiary_enabled:
-        apiary = ApiaryClient(config)
-        log.info("Apiary integration enabled (%s)", config.apiary_base_url)
+    # Superpos client (optional)
+    superpos: SuperposClient | None = None
+    if config.superpos_enabled:
+        superpos = SuperposClient(config)
+        log.info("Superpos integration enabled (%s)", config.superpos_base_url)
         try:
-            await apiary.update_status("online")
+            await superpos.update_status("online")
             log.info("Agent status set to online")
         except Exception:
             log.warning("Failed to set agent status to online", exc_info=True)
     else:
-        log.info("Apiary integration disabled (missing config)")
+        log.info("Superpos integration disabled (missing config)")
 
     if not config.telegram_enabled:
         log.error("TELEGRAM_BOT_TOKEN is required")
@@ -144,9 +144,9 @@ async def main() -> None:
 
     # Fetch persona at startup
     persona: str | None = None
-    if apiary:
+    if superpos:
         try:
-            persona = await apiary.get_persona_assembled()
+            persona = await superpos.get_persona_assembled()
             if persona:
                 log.info("Persona loaded (version from assembled endpoint)")
             else:
@@ -159,7 +159,7 @@ async def main() -> None:
     log.info("Runtime: model=%s, effort=%s", runtime.model, runtime.effort)
 
     # Executor
-    executor = ClaudeExecutor(config, runtime, apiary, gateway, persona=persona)
+    executor = ClaudeExecutor(config, runtime, superpos, gateway, persona=persona)
     log.info("Executor: max_parallel=%d, worktree_isolation=%s",
              config.claude_max_parallel, config.claude_worktree_isolation)
 
@@ -169,8 +169,8 @@ async def main() -> None:
         run_telegram_bot(bot_app, executor, config, runtime),
         gateway.run(),
     ]
-    if apiary:
-        tasks.append(run_apiary_poller(apiary, executor, config))
+    if superpos:
+        tasks.append(run_superpos_poller(superpos, executor, config))
 
     # Graceful shutdown on SIGTERM/SIGINT
     loop = asyncio.get_running_loop()
@@ -191,13 +191,13 @@ async def main() -> None:
     try:
         await asyncio.gather(*tasks)
     finally:
-        if apiary:
+        if superpos:
             try:
-                await apiary.update_status("offline")
+                await superpos.update_status("offline")
                 log.info("Agent status set to offline")
             except Exception:
                 log.debug("Failed to set agent status to offline (shutdown)")
-            await apiary.close()
+            await superpos.close()
 
 
 def _shutdown(loop: asyncio.AbstractEventLoop) -> None:

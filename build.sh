@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -e
 
-IMAGE_NAME="${1:-slim-apiary-agent}"
+IMAGE_NAME="${1:-superpos-claude-agent}"
 
 # Always build the base image
 docker build -t "${IMAGE_NAME}-base" .

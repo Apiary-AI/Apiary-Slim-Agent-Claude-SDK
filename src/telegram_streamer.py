@@ -120,9 +120,15 @@ def md_to_telegram(text: str) -> str:
 class TelegramStreamer:
     """Accumulates text and pushes it to Telegram via message editing.
 
-    All Telegram API calls go through the gateway — this class never
-    touches the Bot object directly.
+    All Telegram I/O runs in a background flusher task so callers
+    (the Claude executor) never block on Telegram.  ``append`` and
+    ``send_tool_notification`` only mutate local state and wake the
+    flusher — if Telegram is rate-limited or unreachable, Claude keeps
+    reading its stdout pipe and the flusher catches up later.
     """
+
+    _FINISH_DRAIN_TIMEOUT = 30.0  # bounded wait for final drain
+    _ERROR_SEND_TIMEOUT = 5.0
 
     def __init__(self, gateway: TelegramGateway, chat_id: int | str) -> None:
         self._gateway = gateway
@@ -137,79 +143,145 @@ class TelegramStreamer:
         self._status_started: float = 0.0
         self._status_ticker: asyncio.Task | None = None
 
+        # Decoupling state — the flusher owns all gateway interaction
+        self._pending_text: str = ""
+        self._pending_tool: tuple[str, Any] | None = None
+        self._wake = asyncio.Event()
+        self._closing = False
+        self._flusher: asyncio.Task | None = None
+
     async def start(self) -> None:
+        self._current_msg_id = None
+        self._buffer = ""
+        self._last_edit = time.monotonic()
+        # Typing indicator is cosmetic — don't block on it
+        asyncio.create_task(self._safe_chat_action())
+        if self._flusher is None:
+            self._flusher = asyncio.create_task(self._flush_loop())
+
+    async def _safe_chat_action(self) -> None:
         try:
             await self._gateway.send_chat_action(self._chat_id, ChatAction.TYPING)
         except Exception:
             pass  # Non-critical — typing indicator is cosmetic
-        self._current_msg_id = None
-        self._buffer = ""
-        self._last_edit = time.monotonic()
 
     async def append(self, text: str) -> None:
-        """Append text to the stream. Edits the current message if enough time passed."""
+        """Enqueue text for the flusher — never blocks on Telegram."""
         if not text:
             return
-        self._buffer += redact(text)
-
-        try:
-            # Send first message once we have content
-            if self._current_msg_id is None:
-                msg = await self._send_formatted(self._buffer[:4096])
-                if msg is None:
-                    return  # Rate limited — buffer kept, will retry next append
-                self._current_msg_id = msg.message_id
-                self._messages.append(msg.message_id)
-                self._last_edit = time.monotonic()
-                return
-
-            # If buffer exceeds limit, finalize current message and start a new one
-            if len(self._buffer) > MAX_MSG_LEN:
-                await self._finalize_current()
-                return
-
-            # Rate-limit edits
-            now = time.monotonic()
-            if now - self._last_edit >= MIN_EDIT_INTERVAL:
-                await self._edit_current()
-        except Exception:
-            log.warning("Telegram network error in append (text buffered)", exc_info=True)
-
-    async def finish(self) -> None:
-        """Finalize the stream: flush remaining buffer and clean up status."""
-        try:
-            await self._delete_status()
-
-            if not self._buffer:
-                return
-
-            # If no message sent yet, send one now
-            if self._current_msg_id is None:
-                msg = await self._send_formatted(self._buffer[:4096])
-                if msg is None:
-                    return
-                self._current_msg_id = msg.message_id
-                self._messages.append(msg.message_id)
-                return
-
-            # Handle overflow on final flush
-            if len(self._buffer) > MAX_MSG_LEN:
-                await self._finalize_current()
-
-            await self._edit_current()
-        except Exception:
-            log.warning("Telegram network error in finish", exc_info=True)
+        self._pending_text += redact(text)
+        self._wake.set()
 
     async def send_tool_notification(self, tool_name: str, tool_input: Any) -> None:
-        """Update a separate status message with current tool activity.
+        """Enqueue a tool-activity notification for the flusher.
 
-        When text has already been streamed, finalizes the current message
-        so that post-tool output starts in a fresh message.  This prevents
-        the "wall of text" problem where investigation notes and final
-        results are concatenated into a single unreadable block.
+        Only the latest pending notification is kept — if multiple tool
+        calls fire before the flusher runs, older ones are collapsed.
         """
-        # Finalize current text message before showing tool status —
-        # post-tool output will start a new message.
+        self._pending_tool = (tool_name, tool_input)
+        self._wake.set()
+
+    async def finish(self) -> None:
+        """Signal the flusher to drain remaining output and exit.
+
+        Idempotent.  Always returns within ``_FINISH_DRAIN_TIMEOUT``
+        seconds even if Telegram is unreachable — the flusher is
+        cancelled on timeout so the caller never hangs.
+        """
+        self._closing = True
+        self._wake.set()
+        flusher = self._flusher
+        if flusher is None:
+            return
+        try:
+            await asyncio.wait_for(flusher, timeout=self._FINISH_DRAIN_TIMEOUT)
+        except asyncio.TimeoutError:
+            flusher.cancel()
+            try:
+                await flusher
+            except (asyncio.CancelledError, Exception):
+                pass
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning("Flusher raised during finish", exc_info=True)
+        finally:
+            self._flusher = None
+
+    async def _flush_loop(self) -> None:
+        """Drain pending text/tool updates to Telegram in the background."""
+        try:
+            while True:
+                await self._wake.wait()
+                self._wake.clear()
+
+                pending_tool = self._pending_tool
+                self._pending_tool = None
+                pending_text = self._pending_text
+                self._pending_text = ""
+
+                try:
+                    if pending_tool is not None:
+                        await self._handle_tool_notification(*pending_tool)
+                    if pending_text:
+                        self._buffer += pending_text
+                        await self._render_buffer()
+                except Exception:
+                    log.warning("Flush iteration failed (non-fatal)", exc_info=True)
+
+                if self._closing and not self._pending_text and self._pending_tool is None:
+                    try:
+                        await self._final_drain()
+                    except Exception:
+                        log.warning("Final drain failed", exc_info=True)
+                    return
+
+                # Pace edits; new append()s during the sleep just coalesce
+                await asyncio.sleep(MIN_EDIT_INTERVAL)
+        except asyncio.CancelledError:
+            raise
+
+    async def _render_buffer(self) -> None:
+        """Send the first message, edit current, or overflow to a new one."""
+        if self._current_msg_id is None:
+            msg = await self._send_formatted(self._buffer[:4096])
+            if msg is None:
+                return  # gateway rate-limited — buffer retained, retry next wake
+            self._current_msg_id = msg.message_id
+            self._messages.append(msg.message_id)
+            self._last_edit = time.monotonic()
+            return
+
+        if len(self._buffer) > MAX_MSG_LEN:
+            await self._finalize_current()
+            return
+
+        now = time.monotonic()
+        if now - self._last_edit >= MIN_EDIT_INTERVAL:
+            await self._edit_current()
+
+    async def _final_drain(self) -> None:
+        """Last-chance flush of any remaining buffered content."""
+        await self._delete_status()
+
+        if not self._buffer:
+            return
+
+        if self._current_msg_id is None:
+            msg = await self._send_formatted(self._buffer[:4096])
+            if msg is None:
+                return
+            self._current_msg_id = msg.message_id
+            self._messages.append(msg.message_id)
+            return
+
+        if len(self._buffer) > MAX_MSG_LEN:
+            await self._finalize_current()
+
+        await self._edit_current()
+
+    async def _handle_tool_notification(self, tool_name: str, tool_input: Any) -> None:
+        """Finalize current text then update the status message."""
         if self._current_msg_id and self._buffer.strip():
             try:
                 await self._edit_current()
@@ -222,13 +294,11 @@ class TelegramStreamer:
         self._status_description = redact(_humanize_tool(tool_name, tool_input))
         self._status_started = time.monotonic()
 
-        # Cancel previous ticker if running
         if self._status_ticker and not self._status_ticker.done():
             self._status_ticker.cancel()
 
         await self._update_status_text()
 
-        # Start ticker to update elapsed time every 10s
         self._status_ticker = asyncio.create_task(self._run_status_ticker())
 
     async def _run_status_ticker(self) -> None:
@@ -266,11 +336,20 @@ class TelegramStreamer:
             pass  # Non-critical — skip if update fails
 
     async def error(self, error_text: str) -> None:
-        """Send an error message (fire-and-forget — must never crash)."""
+        """Send an error message (fire-and-forget — must never crash or hang).
+
+        Uses a short timeout so a wedged Telegram gateway can't stall the
+        caller's error path.
+        """
         try:
-            await self._gateway.send_message(
-                self._chat_id, f"❌ {redact(error_text)}",
+            await asyncio.wait_for(
+                self._gateway.send_message(
+                    self._chat_id, f"❌ {redact(error_text)}",
+                ),
+                timeout=self._ERROR_SEND_TIMEOUT,
             )
+        except asyncio.TimeoutError:
+            log.warning("Timed out sending error message to Telegram")
         except Exception:
             log.warning("Failed to send error message to Telegram", exc_info=True)
 

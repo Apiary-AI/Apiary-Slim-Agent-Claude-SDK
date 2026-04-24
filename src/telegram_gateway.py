@@ -38,6 +38,7 @@ class _TelegramRequest:
     kwargs: dict[str, Any] = field(compare=False)
     future: asyncio.Future = field(compare=False)
     supersede_key: str | None = field(default=None, compare=False)
+    attempts: int = field(default=0, compare=False)
 
 
 class TelegramGateway:
@@ -55,11 +56,13 @@ class TelegramGateway:
         min_interval: float = 0.35,
         max_backoff: float = 120.0,
         circuit_threshold: int = 5,
+        max_high_priority_attempts: int = 5,
     ) -> None:
         self._bot = bot
         self._min_interval = min_interval
         self._max_backoff = max_backoff
         self._circuit_threshold = circuit_threshold
+        self._max_high_priority_attempts = max_high_priority_attempts
 
         self._queue: asyncio.PriorityQueue[_TelegramRequest] = asyncio.PriorityQueue()
         self._pending_supersede: dict[str, _TelegramRequest] = {}
@@ -189,11 +192,24 @@ class TelegramGateway:
                         e.retry_after,
                         self._consecutive_429s,
                     )
-                    if req.priority <= Priority.HIGH:
+                    req.attempts += 1
+                    if (
+                        req.priority <= Priority.HIGH
+                        and req.attempts < self._max_high_priority_attempts
+                    ):
                         # Re-enqueue high-priority requests for retry
                         self._queue.put_nowait(req)
-                    elif not req.future.done():
-                        req.future.set_result(None)
+                    else:
+                        # Give up — HIGH priority after cap, or lower priority
+                        # dropped on first 429.  Callers never hang waiting
+                        # for Telegram to recover.
+                        if req.priority <= Priority.HIGH:
+                            log.warning(
+                                "Dropping HIGH-priority %s after %d attempts",
+                                req.method, req.attempts,
+                            )
+                        if not req.future.done():
+                            req.future.set_result(None)
 
                     if self._consecutive_429s >= self._circuit_threshold:
                         self._purge_droppable()

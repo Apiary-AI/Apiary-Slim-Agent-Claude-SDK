@@ -1,4 +1,4 @@
-"""Apiary polling daemon — polls for tasks and enqueues them for Claude."""
+"""Superpos polling daemon — polls for tasks and enqueues them for Claude."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import json
 import logging
 import time
 
-from .apiary_client import ApiaryClient
+from .superpos_client import SuperposClient
 from .claude_executor import ClaudeExecutor, ExecutionRequest
 from .config import Config
 from .worktree_manager import infer_branch
@@ -73,17 +73,17 @@ def _webhook_entity_key(task: dict) -> str | None:
     return None
 
 
-async def run_apiary_poller(
-    apiary: ApiaryClient,
+async def run_superpos_poller(
+    superpos: SuperposClient,
     executor: ClaudeExecutor,
     config: Config,
 ) -> None:
-    """Poll Apiary for tasks and enqueue them for execution.
+    """Poll Superpos for tasks and enqueue them for execution.
 
     Heartbeat is sent on every poll iteration so the agent stays online
-    in the Apiary dashboard without a separate background loop.
+    in the Superpos dashboard without a separate background loop.
     """
-    log.info("Apiary poller started (interval=%ds)", config.apiary_poll_interval)
+    log.info("Superpos poller started (interval=%ds)", config.superpos_poll_interval)
 
     persona_version: int | None = None
     platform_context_version: int | None = None
@@ -93,15 +93,15 @@ async def run_apiary_poller(
 
     try:
         while True:
-            # Heartbeat first — keeps agent online in Apiary
+            # Heartbeat first — keeps agent online in Superpos
             try:
-                await apiary.heartbeat()
+                await superpos.heartbeat()
             except Exception:
                 log.exception("Heartbeat failed")
 
             # Check for persona / platform context changes
             try:
-                ver_data = await apiary.get_persona_version(
+                ver_data = await superpos.get_persona_version(
                     known_version=persona_version,
                     known_platform_version=platform_context_version,
                 )
@@ -110,7 +110,7 @@ async def run_apiary_poller(
                 server_version = data.get("version")
                 server_platform_version = data.get("platform_context_version")
                 if changed or (server_version is not None and server_version != persona_version):
-                    new_persona = await apiary.get_persona_assembled()
+                    new_persona = await superpos.get_persona_assembled()
                     executor.update_persona(new_persona)
                     persona_version = server_version
                     if server_platform_version is not None:
@@ -127,7 +127,7 @@ async def run_apiary_poller(
 
             # Then poll for tasks
             try:
-                tasks = await apiary.poll_tasks()
+                tasks = await superpos.poll_tasks()
 
                 # Expire old webhook entity entries
                 _now = time.monotonic()
@@ -145,8 +145,8 @@ async def run_apiary_poller(
                         if entity_key and entity_key in recent_webhook_entities:
                             _, primary_id = recent_webhook_entities[entity_key]
                             try:
-                                await apiary.claim_task(task_id)
-                                await apiary.complete_task(
+                                await superpos.claim_task(task_id)
+                                await superpos.complete_task(
                                     task_id,
                                     f"Consolidated: duplicate webhook for {entity_key}, "
                                     f"already handled by task {primary_id}.",
@@ -218,7 +218,7 @@ async def run_apiary_poller(
                         log.warning("Skipping task with missing id/prompt: %s", task)
                         continue
 
-                    if executor.has_apiary_task(task_id):
+                    if executor.has_superpos_task(task_id):
                         log.debug("Skipping already in-flight task %s", task_id)
                         continue
 
@@ -234,8 +234,8 @@ async def run_apiary_poller(
                                 task_id, prior_claims,
                             )
                             try:
-                                await apiary.claim_task(task_id)
-                                await apiary.fail_task(
+                                await superpos.claim_task(task_id)
+                                await superpos.fail_task(
                                     task_id,
                                     f"Agent gave up after {prior_claims} claim attempts "
                                     f"(claims kept expiring).",
@@ -245,33 +245,47 @@ async def run_apiary_poller(
                             _failed_tasks.add(task_id)
                         continue
 
-                    # Dream tasks bypass capacity check — they run in background
-                    # without consuming a semaphore slot or Telegram output.
-                    is_dream = task.get("type") == "dream"
+                    # Background tasks (dream, knowledge_fillin) bypass the
+                    # Telegram streamer and the semaphore — they're internal
+                    # housekeeping, not user-facing work.
+                    task_type = task.get("type")
+                    is_background = task_type in ("dream", "knowledge_fillin")
 
-                    if not is_dream and not executor.has_free_slots:
+                    if not is_background and not executor.has_free_slots:
                         log.debug("Executor at capacity (%d slots), deferring remaining tasks",
                                   config.claude_max_parallel)
                         break
 
                     try:
-                        await apiary.claim_task(task_id)
+                        await superpos.claim_task(task_id)
                     except Exception:
                         log.warning("Failed to claim task %s (maybe already claimed)", task_id)
                         continue
 
                     task_claim_counts[task_id] = prior_claims + 1
 
-                    if is_dream:
-                        asyncio.create_task(executor.run_dream(task_id, prompt))
-                        log.info("Dream task %s started in background", task_id)
+                    if is_background:
+                        # Use server-provided timeout; default to 5 min so a
+                        # stuck subprocess can't hang the agent forever.
+                        raw_timeout = task.get("timeout_seconds")
+                        try:
+                            timeout_s = int(raw_timeout) if raw_timeout else 300
+                        except (TypeError, ValueError):
+                            timeout_s = 300
+                        asyncio.create_task(
+                            executor.run_background(task_id, prompt, task_type, timeout_s)
+                        )
+                        log.info(
+                            "%s task %s started in background (timeout=%ds)",
+                            task_type.replace("_", " ").capitalize(), task_id, timeout_s,
+                        )
                         continue
 
-                    executor.add_apiary_task(task_id)
+                    executor.add_superpos_task(task_id)
 
                     chat_id = config.telegram_chat_id
                     if not chat_id:
-                        log.warning("No TELEGRAM_CHAT_ID set, skipping Apiary task notification")
+                        log.warning("No TELEGRAM_CHAT_ID set, skipping Superpos task notification")
                         chat_id = "0"
 
                     branch = infer_branch(task)
@@ -287,18 +301,18 @@ async def run_apiary_poller(
                     req = ExecutionRequest(
                         prompt=prompt,
                         chat_id=chat_id,
-                        source="apiary",
-                        apiary_task_id=task_id,
+                        source="superpos",
+                        superpos_task_id=task_id,
                         branch=branch,
                     )
                     await executor.queue.put(req)
-                    log.info("Enqueued apiary task %s (queue=%d)", task_id, executor.pending)
+                    log.info("Enqueued superpos task %s (queue=%d)", task_id, executor.pending)
 
             except Exception:
-                log.exception("Apiary poll error")
+                log.exception("Superpos poll error")
 
-            await asyncio.sleep(config.apiary_poll_interval)
+            await asyncio.sleep(config.superpos_poll_interval)
 
     except asyncio.CancelledError:
-        log.info("Apiary poller shutting down")
+        log.info("Superpos poller shutting down")
         raise

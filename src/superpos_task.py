@@ -1,4 +1,4 @@
-"""CLI helper for creating Apiary tasks and schedules from within the container."""
+"""CLI helper for creating Superpos tasks and schedules from within the container."""
 
 from __future__ import annotations
 
@@ -11,13 +11,13 @@ import httpx
 
 
 def _base_config() -> tuple[str, str, str, str]:
-    base_url = os.environ.get("APIARY_BASE_URL", "").rstrip("/")
-    hive_id = os.environ.get("APIARY_HIVE_ID", "")
-    agent_id = os.environ.get("APIARY_AGENT_ID", "")
-    token = os.environ.get("APIARY_API_TOKEN", "")
+    base_url = os.environ.get("SUPERPOS_BASE_URL", "").rstrip("/")
+    hive_id = os.environ.get("SUPERPOS_HIVE_ID", "")
+    agent_id = os.environ.get("SUPERPOS_AGENT_ID", "")
+    token = os.environ.get("SUPERPOS_API_TOKEN", "")
 
     if not base_url or not hive_id or not token:
-        print("Error: APIARY_BASE_URL, APIARY_HIVE_ID, and APIARY_API_TOKEN must be set", file=sys.stderr)
+        print("Error: SUPERPOS_BASE_URL, SUPERPOS_HIVE_ID, and SUPERPOS_API_TOKEN must be set", file=sys.stderr)
         sys.exit(1)
 
     return base_url, hive_id, agent_id, token
@@ -39,9 +39,9 @@ def create_task(
     payload_extra: dict | None = None,
     timeout_seconds: int = 1800,
 ) -> None:
-    """Create a task in Apiary.
+    """Create a task in Superpos.
 
-    Fields reference (from Apiary CreateTaskRequest validation):
+    Fields reference (from Superpos CreateTaskRequest validation):
       - type (required, string, max 100)
       - payload (optional, object) — free-form task data
       - invoke.instructions (optional) — control-plane instructions for the agent
@@ -92,12 +92,12 @@ def create_schedule(
     self_target: bool = True,
     overlap_policy: str = "skip",
 ) -> None:
-    """Create a task schedule in Apiary.
+    """Create a task schedule in Superpos.
 
     Trigger types: once, interval, cron
     Overlap policies: skip, allow, cancel_previous
 
-    Fields reference (from Apiary CreateTaskScheduleRequest):
+    Fields reference (from Superpos CreateTaskScheduleRequest):
       - name (required, string, max 150)
       - trigger_type (required: once|interval|cron)
       - cron_expression (required if cron, e.g. "*/5 * * * *")
@@ -191,11 +191,11 @@ def delete_schedule(schedule_id: str) -> None:
 
 def update_memory(content: str, message: str | None = None, mode: str = "append") -> None:
     """Update the MEMORY document in the active persona."""
-    base_url = os.environ.get("APIARY_BASE_URL", "").rstrip("/")
-    token = os.environ.get("APIARY_API_TOKEN", "")
+    base_url = os.environ.get("SUPERPOS_BASE_URL", "").rstrip("/")
+    token = os.environ.get("SUPERPOS_API_TOKEN", "")
 
     if not base_url or not token:
-        print("Error: APIARY_BASE_URL and APIARY_API_TOKEN must be set", file=sys.stderr)
+        print("Error: SUPERPOS_BASE_URL and SUPERPOS_API_TOKEN must be set", file=sys.stderr)
         sys.exit(1)
 
     body: dict = {"content": content, "mode": mode}
@@ -222,7 +222,7 @@ def update_memory(content: str, message: str | None = None, mode: str = "append"
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Apiary task & schedule helper")
+    parser = argparse.ArgumentParser(description="Superpos task & schedule helper")
     sub = parser.add_subparsers(dest="command")
 
     # --- task create ---

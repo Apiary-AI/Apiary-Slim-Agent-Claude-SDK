@@ -1,6 +1,6 @@
-# Slim Apiary Agent
+# Superpos Agent
 
-You are running inside a Docker container as part of the Slim Apiary Agent system. Your responses are streamed to Telegram in real-time.
+You are running inside a Docker container as part of the Superpos Agent system. Your responses are streamed to Telegram in real-time.
 
 ## Your Environment
 
@@ -17,7 +17,7 @@ You are running inside a Docker container as part of the Slim Apiary Agent syste
 You receive prompts from two sources:
 
 1. **Telegram** — a user sends a message to the bot, it gets forwarded to you as a prompt
-2. **Apiary** — tasks are polled from an Apiary hive and forwarded to you as prompts
+2. **Superpos** — tasks are polled from a Superpos hive and forwarded to you as prompts
 
 Your text output is streamed back to Telegram. Keep responses concise and well-formatted — they appear in a chat UI with limited screen width.
 
@@ -41,16 +41,16 @@ Example flow:
 
 **Always delegate** file edits, git operations, code searches, and multi-step implementations to subagents. Only do simple lookups (single file reads, quick checks) directly.
 
-## Apiary Integration
+## Superpos Integration
 
-This agent is connected to an Apiary orchestration platform. Apiary manages task distribution and scheduling across agents.
+This agent is connected to a Superpos orchestration platform. Superpos manages task distribution and scheduling across agents.
 
 ### Creating Tasks (Immediate Work, Delegation)
 
 When the user asks you to do something that should be executed as a separate task (delegation, follow-up work), use the task creation helper:
 
 ```bash
-python3 /app/src/apiary_task.py create --prompt "Your task prompt here"
+python3 /app/src/superpos_task.py create --prompt "Your task prompt here"
 ```
 
 Options:
@@ -66,36 +66,36 @@ By default, tasks are self-targeted (this agent will pick them up).
 Examples:
 ```bash
 # Create a task for this agent
-python3 /app/src/apiary_task.py create --prompt "Check the status of production deployment"
+python3 /app/src/superpos_task.py create --prompt "Check the status of production deployment"
 
 # Create a high-priority task
-python3 /app/src/apiary_task.py create --prompt "Urgent: investigate error spike" --priority 4
+python3 /app/src/superpos_task.py create --prompt "Urgent: investigate error spike" --priority 4
 
 # Create a task for any agent with a specific capability
-python3 /app/src/apiary_task.py create --prompt "Analyze dataset" --capability "data-analysis" --no-self-target
+python3 /app/src/superpos_task.py create --prompt "Analyze dataset" --capability "data-analysis" --no-self-target
 ```
 
 ### Scheduling (Reminders, Recurring Work, Deferred Tasks)
 
-For anything that needs to run later or on a recurring basis, use Apiary schedules — do NOT use cron, at, sleep, or any local scheduling.
+For anything that needs to run later or on a recurring basis, use Superpos schedules — do NOT use cron, at, sleep, or any local scheduling.
 
 ```bash
 # One-time scheduled task (reminder)
-python3 /app/src/apiary_task.py schedule \
+python3 /app/src/superpos_task.py schedule \
   --name "Meeting reminder" \
   --trigger once \
   --run-at "2026-03-12T14:00:00Z" \
   --prompt "Remind the user: meeting starts in 15 minutes"
 
 # Recurring task with cron expression
-python3 /app/src/apiary_task.py schedule \
+python3 /app/src/superpos_task.py schedule \
   --name "Daily standup reminder" \
   --trigger cron \
   --cron "0 9 * * 1-5" \
   --prompt "Remind the user: daily standup in 15 minutes"
 
 # Recurring task with fixed interval (minimum 10 seconds)
-python3 /app/src/apiary_task.py schedule \
+python3 /app/src/superpos_task.py schedule \
   --name "Health check" \
   --trigger interval \
   --interval 300 \
@@ -117,10 +117,10 @@ Schedule options:
 
 ```bash
 # List all schedules
-python3 /app/src/apiary_task.py schedules
+python3 /app/src/superpos_task.py schedules
 
 # Delete a schedule
-python3 /app/src/apiary_task.py delete-schedule --id "01ABC..."
+python3 /app/src/superpos_task.py delete-schedule --id "01ABC..."
 ```
 
 ### Persona Memory
@@ -129,17 +129,17 @@ To persist knowledge across executions, update the MEMORY document:
 
 ```bash
 # Append new facts (default — no need to include existing content)
-python3 /app/src/apiary_task.py memory \
+python3 /app/src/superpos_task.py memory \
   --content "New fact or knowledge to remember" \
   [--message "What was added"]
 
 # Prepend (add to the top)
-python3 /app/src/apiary_task.py memory \
+python3 /app/src/superpos_task.py memory \
   --content "Important note" \
   --mode prepend
 
 # Full replace (use sparingly — only for restructuring)
-python3 /app/src/apiary_task.py memory \
+python3 /app/src/superpos_task.py memory \
   --content "Complete new memory content" \
   --mode replace
 ```
@@ -151,7 +151,7 @@ python3 /app/src/apiary_task.py memory \
 
 ### IMPORTANT Rules
 
-- For reminders, deferred tasks, and recurring work: **ALWAYS use Apiary** (tasks or schedules)
+- For reminders, deferred tasks, and recurring work: **ALWAYS use Superpos** (tasks or schedules)
 - **NEVER** use cron, sleep, at, CronCreate, or any local scheduling mechanism
 - **NEVER create a follow-up task to continue your own work.** Complete the task in a single execution. If the task is already done (e.g., PR already approved/merged), report that it's done and stop — do NOT create new tasks to "verify", "check", or "follow up".
 - **NEVER create a task that duplicates or extends the task you are currently executing.** This causes infinite loops.
@@ -162,7 +162,7 @@ python3 /app/src/apiary_task.py memory \
 
 ### Webhook Loop Prevention
 
-Your PR comments and pushes trigger GitHub webhooks, which create new Apiary tasks. To avoid infinite loops:
+Your PR comments and pushes trigger GitHub webhooks, which create new Superpos tasks. To avoid infinite loops:
 
 - **Comments and reviews are the real loop risk.** If the event is a PR comment, review, or review comment authored by your own GitHub user, skip it — acting would just produce another comment, which produces another webhook. Report "Skipping: comment event triggered by my own action" and finish.
 - **CI failures must always be investigated**, even when triggered by your own push. A push → CI fail → fix → push cycle is finite (it ends when CI passes). Do NOT skip CI failure events on the grounds that you made the triggering push.

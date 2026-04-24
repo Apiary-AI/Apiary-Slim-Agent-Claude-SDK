@@ -11,30 +11,30 @@ from src.config import Config
 # --- Dedup method unit tests (pure sync logic) ---
 
 def test_has_task_initially_false(executor):
-    assert not executor.has_apiary_task("abc")
+    assert not executor.has_superpos_task("abc")
 
 
 def test_add_then_has(executor):
-    executor.add_apiary_task("abc")
-    assert executor.has_apiary_task("abc")
+    executor.add_superpos_task("abc")
+    assert executor.has_superpos_task("abc")
 
 
 def test_remove_clears_task(executor):
-    executor.add_apiary_task("abc")
-    executor.remove_apiary_task("abc")
-    assert not executor.has_apiary_task("abc")
+    executor.add_superpos_task("abc")
+    executor.remove_superpos_task("abc")
+    assert not executor.has_superpos_task("abc")
 
 
 def test_remove_nonexistent_is_safe(executor):
-    executor.remove_apiary_task("nonexistent")  # must not raise
+    executor.remove_superpos_task("nonexistent")  # must not raise
 
 
 # --- _report_progress: 409 sets event, other errors don't ---
 
-async def test_report_progress_409_sets_event(executor, mock_apiary):
+async def test_report_progress_409_sets_event(executor, mock_superpos):
     mock_response = Mock()
     mock_response.status_code = 409
-    mock_apiary.update_progress.side_effect = httpx.HTTPStatusError(
+    mock_superpos.update_progress.side_effect = httpx.HTTPStatusError(
         "conflict", request=Mock(), response=mock_response
     )
     claim_expired = asyncio.Event()
@@ -42,10 +42,10 @@ async def test_report_progress_409_sets_event(executor, mock_apiary):
     assert claim_expired.is_set()
 
 
-async def test_report_progress_500_does_not_set_event(executor, mock_apiary):
+async def test_report_progress_500_does_not_set_event(executor, mock_superpos):
     mock_response = Mock()
     mock_response.status_code = 500
-    mock_apiary.update_progress.side_effect = [
+    mock_superpos.update_progress.side_effect = [
         httpx.HTTPStatusError("server error", request=Mock(), response=mock_response),
         asyncio.CancelledError(),  # stop the loop on second iteration
     ]
@@ -55,8 +55,8 @@ async def test_report_progress_500_does_not_set_event(executor, mock_apiary):
     assert not claim_expired.is_set()
 
 
-async def test_report_progress_generic_exception_does_not_set_event(executor, mock_apiary):
-    mock_apiary.update_progress.side_effect = [
+async def test_report_progress_generic_exception_does_not_set_event(executor, mock_superpos):
+    mock_superpos.update_progress.side_effect = [
         Exception("network error"),
         asyncio.CancelledError(),
     ]
@@ -69,7 +69,7 @@ async def test_report_progress_generic_exception_does_not_set_event(executor, mo
 # --- Claim expiry removes task from in-flight set ---
 
 async def test_execute_removes_task_after_claim_expiry(executor):
-    executor.add_apiary_task("task-x")
+    executor.add_superpos_task("task-x")
 
     async def fake_report_progress(task_id, claim_expired, interval=30):
         claim_expired.set()
@@ -78,7 +78,7 @@ async def test_execute_removes_task_after_claim_expiry(executor):
         await asyncio.sleep(10)  # blocks until cancelled
 
     req = ExecutionRequest(
-        prompt="hello", chat_id="123", source="apiary", apiary_task_id="task-x"
+        prompt="hello", chat_id="123", source="superpos", superpos_task_id="task-x"
     )
 
     with patch.object(executor, "_report_progress", fake_report_progress), \
@@ -90,7 +90,7 @@ async def test_execute_removes_task_after_claim_expiry(executor):
         await executor.queue.get()  # simulate run() pulling from queue
         await asyncio.wait_for(executor._run_one(req), timeout=2.0)
 
-    assert not executor.has_apiary_task("task-x")
+    assert not executor.has_superpos_task("task-x")
 
 
 # --- _build_options uses cwd override when provided ---
@@ -131,15 +131,15 @@ def test_build_options_system_prompt_append_only(executor):
 
 # --- _execute_inner calls ensure_worktree when branch + isolation enabled ---
 
-async def test_execute_inner_calls_ensure_worktree_for_apiary_with_branch(
-    executor, mock_apiary, mock_config
+async def test_execute_inner_calls_ensure_worktree_for_superpos_with_branch(
+    executor, mock_superpos, mock_config
 ):
     mock_config.claude_worktree_isolation = True
     mock_config.claude_working_dir = "/workspace"
 
     req = ExecutionRequest(
-        prompt="review PR", chat_id="123", source="apiary",
-        apiary_task_id="task-wt", branch="feature/my-branch",
+        prompt="review PR", chat_id="123", source="superpos",
+        superpos_task_id="task-wt", branch="feature/my-branch",
     )
 
     async def _empty():
@@ -193,8 +193,8 @@ async def test_execute_inner_skips_worktree_when_isolation_disabled(executor, mo
     mock_config.claude_working_dir = "/workspace"
 
     req = ExecutionRequest(
-        prompt="do it", chat_id="123", source="apiary",
-        apiary_task_id="task-no-wt", branch="some-branch",
+        prompt="do it", chat_id="123", source="superpos",
+        superpos_task_id="task-no-wt", branch="some-branch",
     )
 
     async def _empty():
@@ -219,8 +219,8 @@ async def test_execute_inner_falls_back_when_worktree_fails(executor, mock_confi
     mock_config.claude_working_dir = "/workspace"
 
     req = ExecutionRequest(
-        prompt="do it", chat_id="123", source="apiary",
-        apiary_task_id="task-fail", branch="bad-branch",
+        prompt="do it", chat_id="123", source="superpos",
+        superpos_task_id="task-fail", branch="bad-branch",
     )
 
     captured_cwd = []
@@ -360,7 +360,7 @@ def test_has_free_slots_true_when_idle(executor):
 
 def test_has_free_slots_false_at_capacity(executor, mock_config):
     for i in range(mock_config.claude_max_parallel):
-        executor.add_apiary_task(f"task-{i}")
+        executor.add_superpos_task(f"task-{i}")
     assert not executor.has_free_slots
 
 
@@ -376,7 +376,7 @@ def test_resolve_slot_main_for_no_branch(executor, mock_config):
 def test_resolve_slot_worktree_path_for_branch(executor, mock_config):
     mock_config.claude_worktree_isolation = True
     mock_config.claude_working_dir = "/workspace"
-    req = ExecutionRequest(prompt="hi", chat_id="1", source="apiary", branch="feat/x")
+    req = ExecutionRequest(prompt="hi", chat_id="1", source="superpos", branch="feat/x")
     with patch("src.claude_executor.is_git_repo", return_value=True):
         result = executor._resolve_slot(req)
     assert result == "/workspace/.worktrees/feat-x"
@@ -384,7 +384,7 @@ def test_resolve_slot_worktree_path_for_branch(executor, mock_config):
 
 # --- Status transitions ---
 
-async def test_status_busy_on_first_task_only(executor, mock_apiary, mock_config):
+async def test_status_busy_on_first_task_only(executor, mock_superpos, mock_config):
     """update_status('busy') is called once when two tasks run in parallel on different branches."""
     mock_config.claude_worktree_isolation = True
     mock_config.claude_working_dir = "/workspace"
@@ -396,8 +396,8 @@ async def test_status_busy_on_first_task_only(executor, mock_apiary, mock_config
          patch("src.claude_executor.is_git_repo", return_value=True), \
          patch("src.claude_executor.TelegramStreamer") as MockStreamer:
         MockStreamer.return_value.start = AsyncMock()
-        req1 = ExecutionRequest(prompt="a", chat_id="1", source="apiary", branch="branch-a")
-        req2 = ExecutionRequest(prompt="b", chat_id="1", source="apiary", branch="branch-b")
+        req1 = ExecutionRequest(prompt="a", chat_id="1", source="superpos", branch="branch-a")
+        req2 = ExecutionRequest(prompt="b", chat_id="1", source="superpos", branch="branch-b")
         await executor.queue.put(req1)
         await executor.queue.put(req2)
 
@@ -409,11 +409,11 @@ async def test_status_busy_on_first_task_only(executor, mock_apiary, mock_config
         except asyncio.CancelledError:
             pass
 
-    busy_calls = [c for c in mock_apiary.update_status.call_args_list if c.args == ("busy",)]
+    busy_calls = [c for c in mock_superpos.update_status.call_args_list if c.args == ("busy",)]
     assert len(busy_calls) == 1
 
 
-async def test_status_online_when_all_done(executor, mock_apiary, mock_config):
+async def test_status_online_when_all_done(executor, mock_superpos, mock_config):
     """update_status('online') is called only when the last task finishes."""
     mock_config.claude_worktree_isolation = True
     mock_config.claude_working_dir = "/workspace"
@@ -425,8 +425,8 @@ async def test_status_online_when_all_done(executor, mock_apiary, mock_config):
          patch("src.claude_executor.is_git_repo", return_value=True), \
          patch("src.claude_executor.TelegramStreamer") as MockStreamer:
         MockStreamer.return_value.start = AsyncMock()
-        req1 = ExecutionRequest(prompt="a", chat_id="1", source="apiary", branch="branch-a")
-        req2 = ExecutionRequest(prompt="b", chat_id="1", source="apiary", branch="branch-b")
+        req1 = ExecutionRequest(prompt="a", chat_id="1", source="superpos", branch="branch-a")
+        req2 = ExecutionRequest(prompt="b", chat_id="1", source="superpos", branch="branch-b")
         await executor.queue.put(req1)
         await executor.queue.put(req2)
 
@@ -438,7 +438,7 @@ async def test_status_online_when_all_done(executor, mock_apiary, mock_config):
         except asyncio.CancelledError:
             pass
 
-    online_calls = [c for c in mock_apiary.update_status.call_args_list if c.args == ("online",)]
+    online_calls = [c for c in mock_superpos.update_status.call_args_list if c.args == ("online",)]
     # Both tasks run in parallel on different branches, so online is called once when both finish
     assert len(online_calls) == 1
 
@@ -462,8 +462,8 @@ async def test_same_branch_tasks_serialize(executor, mock_config):
          patch("src.claude_executor.TelegramStreamer") as MockStreamer:
         MockStreamer.return_value.start = AsyncMock()
 
-        req1 = ExecutionRequest(prompt="first", chat_id="1", source="apiary", branch="same-branch")
-        req2 = ExecutionRequest(prompt="second", chat_id="1", source="apiary", branch="same-branch")
+        req1 = ExecutionRequest(prompt="first", chat_id="1", source="superpos", branch="same-branch")
+        req2 = ExecutionRequest(prompt="second", chat_id="1", source="superpos", branch="same-branch")
         await executor.queue.put(req1)
         await executor.queue.put(req2)
 
@@ -479,17 +479,17 @@ async def test_same_branch_tasks_serialize(executor, mock_config):
     assert execution_log.index("end-first") < execution_log.index("start-second")
 
 
-async def test_execute_inner_injects_worktree_hint_for_apiary_without_branch(
-    executor, mock_apiary, mock_config
+async def test_execute_inner_injects_worktree_hint_for_superpos_without_branch(
+    executor, mock_superpos, mock_config
 ):
-    """Apiary tasks without an explicit branch should get worktree instructions
+    """Superpos tasks without an explicit branch should get worktree instructions
     so Claude branches from origin/main instead of the current HEAD."""
     mock_config.claude_worktree_isolation = True
     mock_config.claude_working_dir = "/workspace"
 
     req = ExecutionRequest(
-        prompt="do apiary task", chat_id="123", source="apiary",
-        apiary_task_id="task-999",
+        prompt="do superpos task", chat_id="123", source="superpos",
+        superpos_task_id="task-999",
     )
 
     captured_appends = []

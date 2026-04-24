@@ -8,14 +8,14 @@ from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class Config:
-    # Apiary
-    apiary_base_url: str = ""
-    apiary_hive_id: str = ""
-    apiary_agent_id: str = ""
-    apiary_api_token: str = ""
-    apiary_refresh_token: str = ""
-    apiary_capabilities: list[str] = field(default_factory=list)
-    apiary_poll_interval: int = 5
+    # Superpos
+    superpos_base_url: str = ""
+    superpos_hive_id: str = ""
+    superpos_agent_id: str = ""
+    superpos_api_token: str = ""
+    superpos_refresh_token: str = ""
+    superpos_capabilities: list[str] = field(default_factory=list)
+    superpos_poll_interval: int = 5
 
     # Telegram
     telegram_bot_token: str = ""
@@ -38,7 +38,7 @@ class Config:
     @classmethod
     def from_env(cls) -> Config:
         allowed = os.environ.get("TELEGRAM_ALLOWED_USERS", "")
-        caps = os.environ.get("APIARY_CAPABILITIES", "")
+        caps = os.environ.get("SUPERPOS_CAPABILITIES", "")
         working_dir = os.environ.get("CLAUDE_WORKING_DIR", "/workspace")
 
         isolation_env = os.environ.get("CLAUDE_WORKTREE_ISOLATION")
@@ -49,13 +49,13 @@ class Config:
             worktree_isolation = os.path.isdir(os.path.join(working_dir, ".git"))
 
         return cls(
-            apiary_base_url=os.environ.get("APIARY_BASE_URL", ""),
-            apiary_hive_id=os.environ.get("APIARY_HIVE_ID", ""),
-            apiary_agent_id=os.environ.get("APIARY_AGENT_ID", ""),
-            apiary_api_token=os.environ.get("APIARY_API_TOKEN", ""),
-            apiary_refresh_token=os.environ.get("APIARY_REFRESH_TOKEN", ""),
-            apiary_capabilities=[c.strip() for c in caps.split(",") if c.strip()],
-            apiary_poll_interval=int(os.environ.get("APIARY_POLL_INTERVAL", "5")),
+            superpos_base_url=os.environ.get("SUPERPOS_BASE_URL", ""),
+            superpos_hive_id=os.environ.get("SUPERPOS_HIVE_ID", ""),
+            superpos_agent_id=os.environ.get("SUPERPOS_AGENT_ID", ""),
+            superpos_api_token=os.environ.get("SUPERPOS_API_TOKEN", ""),
+            superpos_refresh_token=os.environ.get("SUPERPOS_REFRESH_TOKEN", ""),
+            superpos_capabilities=[c.strip() for c in caps.split(",") if c.strip()],
+            superpos_poll_interval=int(os.environ.get("SUPERPOS_POLL_INTERVAL", "5")),
             telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
             telegram_allowed_users=[
                 int(u.strip()) for u in allowed.split(",") if u.strip()
@@ -75,12 +75,12 @@ class Config:
         )
 
     @property
-    def apiary_enabled(self) -> bool:
+    def superpos_enabled(self) -> bool:
         return bool(
-            self.apiary_base_url
-            and self.apiary_hive_id
-            and self.apiary_agent_id
-            and self.apiary_api_token
+            self.superpos_base_url
+            and self.superpos_hive_id
+            and self.superpos_agent_id
+            and self.superpos_api_token
         )
 
     @property

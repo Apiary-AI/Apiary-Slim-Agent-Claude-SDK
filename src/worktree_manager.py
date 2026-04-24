@@ -33,7 +33,7 @@ def slot_key(base: str, branch: str | None) -> str:
 
 
 def infer_branch(task: dict) -> str | None:
-    """Extract branch name from an Apiary task's event payload.
+    """Extract branch name from a Superpos task's event payload.
 
     Priority:
     1. event_payload.pull_request.head.ref  (PR events)
@@ -50,7 +50,7 @@ def infer_branch(task: dict) -> str | None:
 
     if isinstance(event_payload, dict):
         # The actual GitHub event may be at the top level or nested
-        # inside a "body" key (Apiary webhook handler wraps it).
+        # inside a "body" key (Superpos webhook handler wraps it).
         bodies = [event_payload]
         body = event_payload.get("body")
         if isinstance(body, dict):

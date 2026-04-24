@@ -4,8 +4,8 @@
 
 set -e
 
-VENDOR_DIR="/workspace/.claude/modules/apiary-sdk/vendor"
-REF="${APIARY_SDK_REF:-main}"
+VENDOR_DIR="/workspace/.claude/modules/superpos-sdk/vendor"
+REF="${SUPERPOS_SDK_REF:-main}"
 
 if [ ! -d "$VENDOR_DIR/.git" ]; then
     echo "SDK not vendored yet — run the container entrypoint (setup.sh) first." >&2
@@ -23,4 +23,4 @@ fi
 echo "SDK is $BEHIND commit(s) behind origin/$REF. New commits:"
 git -C "$VENDOR_DIR" log --oneline "HEAD..origin/$REF"
 echo ""
-echo "Run apiary-sdk-update to apply."
+echo "Run superpos-sdk-update to apply."

@@ -107,7 +107,7 @@ def test_infer_branch_event_payload_nested_in_payload():
     assert infer_branch(task) == "nested-branch"
 
 
-# --- infer_branch: PR ref nested inside event_payload.body (Apiary webhook wrapping) ---
+# --- infer_branch: PR ref nested inside event_payload.body (Superpos webhook wrapping) ---
 
 def test_infer_branch_pr_ref_inside_body():
     task = {

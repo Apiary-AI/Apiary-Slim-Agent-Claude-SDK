@@ -3,9 +3,9 @@
 # This file is gitignored — your local additions won't affect other deployments.
 #
 # Build with: ./build.sh
-# (or manually: docker build -t slim-apiary-agent-base . && docker build -f Dockerfile.local -t slim-apiary-agent .)
+# (or manually: docker build -t superpos-claude-agent-base . && docker build -f Dockerfile.local -t superpos-claude-agent .)
 
-FROM slim-apiary-agent-base
+FROM superpos-claude-agent-base
 
 USER root
 
