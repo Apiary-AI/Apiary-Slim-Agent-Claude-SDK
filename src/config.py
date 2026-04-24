@@ -6,8 +6,16 @@ import os
 from dataclasses import dataclass, field
 
 
-@dataclass(frozen=True)
+@dataclass
 class Config:
+    """Runtime configuration for the agent.
+
+    Superpos fields (hive_id, capabilities, permissions) are seeded from
+    env vars and overwritten at startup by ``/agents/me`` when reachable.
+    The dataclass is mutable so that refresh lives here rather than in a
+    parallel profile object threaded through every call site.
+    """
+
     # Superpos
     superpos_base_url: str = ""
     superpos_hive_id: str = ""
@@ -15,6 +23,7 @@ class Config:
     superpos_api_token: str = ""
     superpos_refresh_token: str = ""
     superpos_capabilities: list[str] = field(default_factory=list)
+    superpos_permissions: list[str] = field(default_factory=list)
     superpos_poll_interval: int = 5
 
     # Telegram
@@ -86,3 +95,23 @@ class Config:
     @property
     def telegram_enabled(self) -> bool:
         return bool(self.telegram_bot_token)
+
+    def has_permission(self, permission: str) -> bool:
+        """Check whether the agent has a given permission.
+
+        Matches exact, ``category:*`` wildcards, and the ``admin:*``
+        superwildcard.  If permissions are empty (unknown — /me failed
+        and env doesn't carry them), returns True so the agent tries the
+        call; the server will reject if it truly lacks the right.
+        """
+        if not self.superpos_permissions:
+            return True
+        if permission in self.superpos_permissions:
+            return True
+        if "admin:*" in self.superpos_permissions:
+            return True
+        if ":" in permission:
+            category = permission.split(":", 1)[0]
+            if f"{category}:*" in self.superpos_permissions:
+                return True
+        return False

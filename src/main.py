@@ -89,6 +89,47 @@ def _auth_error_message(err: str) -> str | None:
     return None
 
 
+_REQUIRED_PERMISSIONS = ("tasks:read", "tasks:claim", "tasks:update")
+_OPTIONAL_PERMISSIONS = ("tasks:create", "knowledge:write")
+
+
+async def _warn_missing_permissions(gateway: TelegramGateway, config: Config) -> None:
+    """If the agent's /me profile lacks critical permissions, log and notify.
+
+    Runs as a one-shot coroutine alongside gateway.run() so the send_message
+    can actually be processed.  Fire-and-forget — never raises.
+    """
+    # No data yet means /me hasn't been fetched (or failed); nothing to check.
+    if not config.superpos_permissions:
+        return
+
+    missing_required = [p for p in _REQUIRED_PERMISSIONS if not config.has_permission(p)]
+    missing_optional = [p for p in _OPTIONAL_PERMISSIONS if not config.has_permission(p)]
+
+    if missing_required:
+        log.error("Agent missing required permissions: %s", missing_required)
+    if missing_optional:
+        log.warning("Agent missing optional permissions: %s", missing_optional)
+
+    if not missing_required and not missing_optional:
+        return
+    if not config.telegram_chat_id:
+        return
+
+    lines = ["⚠️ Agent started with missing permissions:"]
+    if missing_required:
+        lines.append(f"  • Required (agent will malfunction): {', '.join(missing_required)}")
+    if missing_optional:
+        lines.append(f"  • Optional (some tasks may fail): {', '.join(missing_optional)}")
+    lines.append("")
+    lines.append("Grant them in the Superpos dashboard and restart the agent.")
+
+    try:
+        await gateway.send_message(config.telegram_chat_id, "\n".join(lines))
+    except Exception:
+        log.debug("Failed to send missing-permissions warning to Telegram", exc_info=True)
+
+
 async def _check_claude_auth() -> None:
     """Make a minimal SDK call to verify Claude credentials before starting."""
     log.info("Verifying Claude authentication...")
@@ -130,6 +171,31 @@ async def main() -> None:
             log.info("Agent status set to online")
         except Exception:
             log.warning("Failed to set agent status to online", exc_info=True)
+
+        # Overlay server-authoritative profile (hive_id, capabilities,
+        # permissions) on top of env config.  Env stays as the fallback
+        # so a /me outage doesn't ground the agent.
+        me = await superpos.fetch_me()
+        if me:
+            if me.get("hive_id"):
+                config.superpos_hive_id = me["hive_id"]
+            caps = me.get("capabilities")
+            if isinstance(caps, list) and caps:
+                config.superpos_capabilities = [str(c) for c in caps]
+            perms = me.get("permissions")
+            if isinstance(perms, list):
+                config.superpos_permissions = [str(p) for p in perms]
+            log.info(
+                "Agent profile: name=%r hive=%s capabilities=%s permissions=%d",
+                me.get("name"), config.superpos_hive_id,
+                config.superpos_capabilities, len(config.superpos_permissions),
+            )
+        else:
+            log.warning(
+                "Could not load /agents/me — falling back to env-configured "
+                "hive_id=%s, capabilities=%s",
+                config.superpos_hive_id, config.superpos_capabilities,
+            )
     else:
         log.info("Superpos integration disabled (missing config)")
 
@@ -171,6 +237,7 @@ async def main() -> None:
     ]
     if superpos:
         tasks.append(run_superpos_poller(superpos, executor, config))
+        tasks.append(_warn_missing_permissions(gateway, config))
 
     # Graceful shutdown on SIGTERM/SIGINT
     loop = asyncio.get_running_loop()

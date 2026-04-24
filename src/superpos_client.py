@@ -223,6 +223,20 @@ class SuperposClient:
         """Update agent status (online/busy/idle/offline/error)."""
         await self._request("PATCH", "/api/v1/agents/status", json={"status": status})
 
+    async def fetch_me(self) -> dict[str, Any] | None:
+        """Fetch the agent's server-side profile: hive_id, capabilities, permissions, etc.
+
+        Returns None on failure so the caller can fall back to env-configured
+        values — the agent must still start even if /me is unreachable.
+        """
+        try:
+            resp = await self._request("GET", "/api/v1/agents/me")
+            body = resp.json()
+            return body.get("data", body) if isinstance(body, dict) else None
+        except Exception:
+            log.warning("Failed to fetch /agents/me", exc_info=True)
+            return None
+
     # ── Persona ───────────────────────────────────────────────────────
 
     async def get_persona_assembled(self) -> str | None:
