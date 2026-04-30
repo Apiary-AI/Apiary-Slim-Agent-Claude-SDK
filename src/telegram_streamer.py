@@ -132,7 +132,10 @@ class TelegramStreamer:
     _FINISH_DRAIN_TIMEOUT = 30.0  # bounded wait for final drain
     _ERROR_SEND_TIMEOUT = 5.0
 
-    def __init__(self, gateway: TelegramGateway, chat_id: int | str) -> None:
+    def __init__(self, gateway: TelegramGateway | None, chat_id: int | str) -> None:
+        # gateway may be None when the agent runs Telegram-less (Superpos-only).
+        # Every public method becomes a no-op in that mode so callers don't
+        # need branching logic everywhere.
         self._gateway = gateway
         self._chat_id = chat_id
         self._messages: list[int] = []  # sent message IDs
@@ -153,6 +156,8 @@ class TelegramStreamer:
         self._flusher: asyncio.Task | None = None
 
     async def start(self) -> None:
+        if not self._gateway:
+            return
         self._current_msg_id = None
         self._buffer = ""
         self._last_edit = time.monotonic()
@@ -169,7 +174,7 @@ class TelegramStreamer:
 
     async def append(self, text: str) -> None:
         """Enqueue text for the flusher — never blocks on Telegram."""
-        if not text:
+        if not text or not self._gateway:
             return
         self._pending_text += redact(text)
         self._wake.set()
@@ -180,6 +185,8 @@ class TelegramStreamer:
         Only the latest pending notification is kept — if multiple tool
         calls fire before the flusher runs, older ones are collapsed.
         """
+        if not self._gateway:
+            return
         self._pending_tool = (tool_name, tool_input)
         self._wake.set()
 
@@ -190,6 +197,8 @@ class TelegramStreamer:
         seconds even if Telegram is unreachable — the flusher is
         cancelled on timeout so the caller never hangs.
         """
+        if not self._gateway:
+            return
         self._closing = True
         self._wake.set()
         flusher = self._flusher
@@ -343,6 +352,8 @@ class TelegramStreamer:
         Uses a short timeout so a wedged Telegram gateway can't stall the
         caller's error path.
         """
+        if not self._gateway:
+            return
         try:
             await asyncio.wait_for(
                 self._gateway.send_message(

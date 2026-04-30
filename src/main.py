@@ -94,7 +94,7 @@ _REQUIRED_PERMISSIONS = ("tasks:read", "tasks:claim", "tasks:update")
 _OPTIONAL_PERMISSIONS = ("tasks:create", "knowledge:write")
 
 
-async def _warn_missing_permissions(gateway: TelegramGateway, config: Config) -> None:
+async def _warn_missing_permissions(gateway: TelegramGateway | None, config: Config) -> None:
     """If the agent's /me profile lacks critical permissions, log and notify.
 
     Runs as a one-shot coroutine alongside gateway.run() so the send_message
@@ -114,7 +114,7 @@ async def _warn_missing_permissions(gateway: TelegramGateway, config: Config) ->
 
     if not missing_required and not missing_optional:
         return
-    if not config.telegram_chat_id:
+    if gateway is None or not config.telegram_chat_id:
         return
 
     lines = ["⚠️ Agent started with missing permissions:"]
@@ -132,7 +132,7 @@ async def _warn_missing_permissions(gateway: TelegramGateway, config: Config) ->
 
 
 async def _monitor_disk(
-    gateway: TelegramGateway,
+    gateway: TelegramGateway | None,
     config: Config,
     *,
     path: str = "/home/agent/.claude",
@@ -163,7 +163,7 @@ async def _monitor_disk(
                     "Disk nearly full: %.0f%% used (%.1fGB free of %.1fGB) at %s",
                     usage * 100, free_gb, total_gb, path,
                 )
-                if config.telegram_chat_id:
+                if gateway is not None and config.telegram_chat_id:
                     msg = (
                         f"⚠️ Agent disk at {usage:.0%} "
                         f"({free_gb:.1f}GB free of {total_gb:.1f}GB).\n"
@@ -177,7 +177,7 @@ async def _monitor_disk(
                 alerted = True
             elif usage < clear_threshold and alerted:
                 log.info("Disk usage recovered: %.0f%%", usage * 100)
-                if config.telegram_chat_id:
+                if gateway is not None and config.telegram_chat_id:
                     try:
                         await gateway.send_message(
                             config.telegram_chat_id,
@@ -261,14 +261,14 @@ async def main() -> None:
     else:
         log.info("Superpos integration disabled (missing config)")
 
-    if not config.telegram_enabled:
-        log.error("TELEGRAM_BOT_TOKEN is required")
-        sys.exit(1)
-
-    # Telegram app + centralized gateway
-    bot_app = build_telegram_app(config)
-    bot = bot_app.bot
-    gateway = TelegramGateway(bot)
+    # Telegram app + centralized gateway (optional)
+    bot_app = None
+    gateway: TelegramGateway | None = None
+    if config.telegram_enabled:
+        bot_app = build_telegram_app(config)
+        gateway = TelegramGateway(bot_app.bot)
+    else:
+        log.info("Telegram disabled (no TELEGRAM_BOT_TOKEN)")
 
     # Fetch persona at startup
     persona: str | None = None
@@ -292,30 +292,35 @@ async def main() -> None:
              config.claude_max_parallel, config.claude_worktree_isolation)
 
     # Build task list
-    tasks = [
-        executor.run(),
-        run_telegram_bot(bot_app, executor, config, runtime),
-        gateway.run(),
-        _monitor_disk(gateway, config),
-    ]
+    tasks = [executor.run(), _monitor_disk(gateway, config)]
+    if bot_app and gateway:
+        tasks.append(run_telegram_bot(bot_app, executor, config, runtime))
+        tasks.append(gateway.run())
     if superpos:
         tasks.append(run_superpos_poller(superpos, executor, config))
         tasks.append(_warn_missing_permissions(gateway, config))
+
+    # An agent with neither Telegram nor Superpos has no way to receive
+    # work — bail loudly instead of running an idle loop forever.
+    if not bot_app and not superpos:
+        log.error("Neither Telegram nor Superpos is configured — nothing to do")
+        sys.exit(1)
 
     # Graceful shutdown on SIGTERM/SIGINT
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, lambda: _shutdown(loop))
 
-    # Auto-cleanup stale session data on startup
-    from .telegram_bot import _cleanup_stale_sessions
-    counts = _cleanup_stale_sessions(max_age_hours=48)
-    if counts["projects"] or counts["session_env"]:
-        freed_mb = counts["bytes_freed"] / (1024 * 1024)
-        log.info(
-            "Startup cleanup: removed %d sessions, %d env snapshots (%.1fMB freed)",
-            counts["projects"], counts["session_env"], freed_mb,
-        )
+    # Auto-cleanup stale session data on startup (telegram-side housekeeping)
+    if config.telegram_enabled:
+        from .telegram_bot import _cleanup_stale_sessions
+        counts = _cleanup_stale_sessions(max_age_hours=48)
+        if counts["projects"] or counts["session_env"]:
+            freed_mb = counts["bytes_freed"] / (1024 * 1024)
+            log.info(
+                "Startup cleanup: removed %d sessions, %d env snapshots (%.1fMB freed)",
+                counts["projects"], counts["session_env"], freed_mb,
+            )
 
     log.info("Starting %d tasks", len(tasks))
     try:

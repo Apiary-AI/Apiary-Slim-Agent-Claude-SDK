@@ -94,7 +94,7 @@ class ClaudeExecutor:
         config: Config,
         runtime: RuntimeConfig,
         superpos: SuperposClient | None,
-        gateway: TelegramGateway,
+        gateway: TelegramGateway | None,
         persona: str | None = None,
     ) -> None:
         self._config = config
