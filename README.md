@@ -78,6 +78,29 @@ If you prefer API key auth, skip step 3, set `ANTHROPIC_API_KEY` in `.env`, and 
 docker run --env-file .env superpos-claude-agent
 ```
 
+### Alternative: MiniMax (Anthropic-compatible endpoint)
+
+[MiniMax](https://platform.minimax.io/docs/guides/text-ai-coding-tools) exposes an Anthropic-compatible API, so the bundled `claude` CLI can route through it natively — no code changes, no fork. Useful as a cheaper backend.
+
+Skip OAuth, leave `ANTHROPIC_API_KEY` blank, and put these in your `.env` instead:
+
+```bash
+ANTHROPIC_BASE_URL=https://api.minimax.io/anthropic   # or .minimaxi.com for CN
+ANTHROPIC_AUTH_TOKEN=your-minimax-key
+CLAUDE_MODEL=MiniMax-M2.7
+ANTHROPIC_DEFAULT_SONNET_MODEL=MiniMax-M2.7
+ANTHROPIC_DEFAULT_OPUS_MODEL=MiniMax-M2.7
+ANTHROPIC_DEFAULT_HAIKU_MODEL=MiniMax-M2.7
+```
+
+Then run as normal:
+
+```bash
+docker run --env-file .env superpos-claude-agent
+```
+
+The `claude` CLI honors `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` and the model-override vars. To switch back to Anthropic, clear those four vars and restore your normal Anthropic auth.
+
 ## Multi-agent setup (Docker Compose)
 
 Run multiple independent agents, each with its own Telegram bot and Superpos registration.
@@ -183,6 +206,6 @@ tests/
 
 - Send any text message to your Telegram bot — Claude processes it and streams the response back
 - `/status` — check queue depth
-- `/model [<id>|list]` — show or change the Claude model. Any `claude-*` id is accepted; `/model list` prints known ids. Persists across restarts.
+- `/model [<id>|list]` — show or change the model. Any provider model id is accepted (e.g. `claude-opus-4-6`, `MiniMax-M2.7`); `/model list` prints known ids. Persists across restarts.
 - `/effort [low|medium|high|max]` — show or change reasoning effort. Persists across restarts.
 - Superpos tasks are automatically polled, claimed, executed, and completed
