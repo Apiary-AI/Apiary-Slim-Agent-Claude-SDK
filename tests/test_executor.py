@@ -514,3 +514,246 @@ async def test_execute_inner_injects_worktree_hint_for_superpos_without_branch(
     assert captured_appends[0] is not None
     assert "Worktree Isolation" in captured_appends[0]
     assert "origin/main" in captured_appends[0]
+
+
+# --- ProcessError retry with session resume ---
+
+async def test_execute_inner_resumes_session_after_cli_crash(
+    executor, mock_superpos, mock_config
+):
+    """When the Claude CLI subprocess crashes mid-task, the executor must
+    retry with --resume <session_id> so prior side effects (commits, PR
+    comments) aren't duplicated.
+
+    The SDK's _read_messages task swallows the underlying ProcessError and
+    re-raises it as a plain Exception via an in-band error queue message
+    (query.py:491), so the agent's catch block sees `Exception`, not
+    `ProcessError`. This test mirrors that real production path.
+    """
+    from claude_code_sdk.types import ResultMessage
+
+    mock_config.claude_worktree_isolation = False
+    mock_config.claude_working_dir = "/workspace"
+
+    req = ExecutionRequest(
+        prompt="do work", chat_id="123", source="superpos",
+        superpos_task_id="task-crash",
+    )
+
+    captured_resumes = []
+    original_build = executor._build_options
+
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+        captured_resumes.append(resume_session)
+        return original_build(
+            resume_session=resume_session, cwd=cwd,
+            system_prompt_append=system_prompt_append,
+        )
+
+    result_msg = ResultMessage(
+        subtype="success", duration_ms=100, duration_api_ms=80,
+        is_error=False, num_turns=1, session_id="sess-abc",
+    )
+
+    async def crash_then_succeed():
+        # First call: yield session_id then crash with the same message
+        # the SDK actually surfaces (plain Exception, not ProcessError).
+        yield result_msg
+        raise Exception(
+            "Command failed with exit code 1 (exit code: 1)\n"
+            "Error output: Check stderr output for details"
+        )
+
+    async def succeed():
+        return
+        yield  # noqa — make it an async generator
+
+    call_count = {"n": 0}
+
+    def query_side_effect(*args, **kwargs):
+        call_count["n"] += 1
+        return crash_then_succeed() if call_count["n"] == 1 else succeed()
+
+    with patch("src.claude_executor.is_git_repo", return_value=False), \
+         patch.object(executor, "_build_options", side_effect=capture_build), \
+         patch("src.claude_executor.query", side_effect=query_side_effect), \
+         patch("src.claude_executor.asyncio.sleep", new_callable=AsyncMock), \
+         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=3)
+
+    # First attempt without resume, second attempt resumes the captured session
+    assert captured_resumes == [None, "sess-abc"]
+    # Task should have been completed (after successful retry), not failed
+    assert mock_superpos.complete_task.await_count == 1
+    assert mock_superpos.fail_task.await_count == 0
+
+
+async def test_execute_inner_no_resume_when_crash_before_first_session_id(
+    executor, mock_superpos, mock_config
+):
+    """A CLI crash before any ResultMessage carries no session_id, so we
+    cannot resume — the executor must mark the task failed instead of
+    looping."""
+    mock_config.claude_worktree_isolation = False
+    mock_config.claude_working_dir = "/workspace"
+
+    req = ExecutionRequest(
+        prompt="do work", chat_id="123", source="superpos",
+        superpos_task_id="task-early-crash",
+    )
+
+    async def crash_immediately():
+        raise Exception(
+            "Command failed with exit code 1 (exit code: 1)\n"
+            "Error output: Check stderr output for details"
+        )
+        yield  # noqa — make it an async generator
+
+    with patch("src.claude_executor.is_git_repo", return_value=False), \
+         patch("src.claude_executor.query", side_effect=lambda *a, **kw: crash_immediately()), \
+         patch("src.claude_executor.asyncio.sleep", new_callable=AsyncMock), \
+         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=3)
+
+    assert mock_superpos.fail_task.await_count == 1
+    assert mock_superpos.complete_task.await_count == 0
+
+
+def test_read_captured_stderr_returns_tail():
+    """The stderr-capture helper must tail large files to max_bytes."""
+    import tempfile
+    from src.claude_executor import _read_captured_stderr
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+        # 5KB of payload — bigger than the default 4KB tail
+        f.write("HEAD\n" + ("x" * 5000) + "\nTAIL_MARKER")
+        path = f.name
+    try:
+        out = _read_captured_stderr(path, max_bytes=4096)
+        assert "TAIL_MARKER" in out
+        assert "(truncated)" in out
+        assert "HEAD" not in out  # truncated away
+    finally:
+        import os
+        os.unlink(path)
+
+
+def test_read_captured_stderr_handles_missing_or_empty():
+    from src.claude_executor import _read_captured_stderr
+    assert _read_captured_stderr(None) == ""
+    assert _read_captured_stderr("/nonexistent/path/xyz.log") == ""
+
+
+async def test_execute_inner_includes_captured_stderr_in_fail_summary(
+    executor, mock_superpos, mock_config
+):
+    """When the open_process patch captured CLI stderr, the fail_task
+    summary must include the tail so the operator can diagnose root cause
+    without trawling docker logs."""
+    import tempfile
+    from src.claude_executor import _stderr_capture_var
+
+    mock_config.claude_worktree_isolation = False
+    mock_config.claude_working_dir = "/workspace"
+
+    # Pre-populate a tempfile as if the CLI had crashed with this stderr
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+        f.write("FATAL: out of memory\nclaude: aborted\n")
+        stderr_path = f.name
+
+    req = ExecutionRequest(
+        prompt="do work", chat_id="123", source="superpos",
+        superpos_task_id="task-with-stderr",
+    )
+
+    async def crash_after_populating_capture():
+        # Simulate what the real anyio.open_process patch does: stash the
+        # captured stderr path on the contextvar's capture dict, then let
+        # the SDK raise the wrapped Exception.
+        capture = _stderr_capture_var.get()
+        if capture is not None:
+            capture["path"] = stderr_path
+            capture["pid"] = 12345
+        raise Exception(
+            "Command failed with exit code 1 (exit code: 1)\n"
+            "Error output: Check stderr output for details"
+        )
+        yield  # noqa
+
+    try:
+        with patch("src.claude_executor.is_git_repo", return_value=False), \
+             patch("src.claude_executor.query", side_effect=lambda *a, **kw: crash_after_populating_capture()), \
+             patch("src.claude_executor.asyncio.sleep", new_callable=AsyncMock), \
+             patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+            streamer = MockStreamer.return_value
+            streamer.start = AsyncMock()
+            streamer.finish = AsyncMock()
+            streamer.append = AsyncMock()
+            streamer.error = AsyncMock()
+            streamer.send_tool_notification = AsyncMock()
+            await executor._execute_inner(req, streamer, retries=1)
+    finally:
+        import os
+        if os.path.exists(stderr_path):
+            os.unlink(stderr_path)
+
+    # fail_task summary should carry the captured stderr tail
+    assert mock_superpos.fail_task.await_count == 1
+    summary = mock_superpos.fail_task.await_args.kwargs["summary"]
+    assert "cli_stderr" in summary
+    assert "out of memory" in summary["cli_stderr"]
+
+    # Telegram error message should include the actual stderr, not the
+    # generic "check docker logs" placeholder.
+    sent = streamer.error.await_args.args[0]
+    assert "out of memory" in sent
+
+
+async def test_execute_inner_process_error_failure_includes_docker_logs_hint(
+    executor, mock_superpos, mock_config
+):
+    """When a CLI crash is unrecoverable AND no stderr was captured, the
+    streamer error message must point the operator at docker logs so they
+    can diagnose externally."""
+    mock_config.claude_worktree_isolation = False
+    mock_config.claude_working_dir = "/workspace"
+
+    req = ExecutionRequest(
+        prompt="do work", chat_id="123", source="superpos",
+        superpos_task_id="task-crash-final",
+    )
+
+    async def crash_immediately():
+        raise Exception(
+            "Command failed with exit code 1 (exit code: 1)\n"
+            "Error output: Check stderr output for details"
+        )
+        yield  # noqa
+
+    with patch("src.claude_executor.is_git_repo", return_value=False), \
+         patch("src.claude_executor.query", side_effect=lambda *a, **kw: crash_immediately()), \
+         patch("src.claude_executor.asyncio.sleep", new_callable=AsyncMock), \
+         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=1)
+
+    assert streamer.error.await_count == 1
+    sent = streamer.error.await_args.args[0]
+    assert "docker logs" in sent
