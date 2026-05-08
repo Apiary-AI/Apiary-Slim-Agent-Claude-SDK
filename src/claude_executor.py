@@ -650,17 +650,10 @@ class ClaudeExecutor:
         # after a crash — Claude already has full context from the session.
         effective_prompt = prompt_text
 
-        # Stderr-capture slots from each attempt, cleaned up before return.
-        captures_to_cleanup: list[dict] = []
-        capture_token = None
-
         for attempt in range(1, retries + 1):
             # Each attempt gets its own capture slot — populated by our anyio
             # open_process patch when the SDK spawns the `claude` CLI.
             capture: dict = {}
-            captures_to_cleanup.append(capture)
-            if capture_token is not None:
-                _stderr_capture_var.reset(capture_token)
             capture_token = _stderr_capture_var.set(capture)
             try:
                 options = self._build_options(
@@ -672,8 +665,18 @@ class ClaudeExecutor:
                     prompt=effective_prompt,
                     options=options,
                 ):
-                    # Capture session_id from result
-                    if isinstance(message, ResultMessage) and hasattr(message, "session_id"):
+                    # Capture session_id from init (fires on every run) and
+                    # result (terminal, success only). Init is what survives
+                    # a CLI crash mid-stream — ResultMessage doesn't fire if
+                    # the subprocess dies before completing, so relying on it
+                    # alone leaves crash-retry without a session to resume.
+                    if isinstance(message, SystemMessage) and message.subtype == "init":
+                        sid = message.data.get("session_id")
+                        if sid:
+                            last_session_id = sid
+                            if req.source == "telegram":
+                                self._sessions.set(req.chat_id, sid)
+                    elif isinstance(message, ResultMessage) and hasattr(message, "session_id"):
                         sid = message.session_id
                         if sid:
                             last_session_id = sid
@@ -709,9 +712,6 @@ class ClaudeExecutor:
                             "Failed to complete superpos task %s — claim may have expired",
                             req.superpos_task_id, exc_info=True,
                         )
-                _stderr_capture_var.reset(capture_token)
-                for _c in captures_to_cleanup:
-                    _cleanup_captured_stderr(_c.get("path"))
                 return
 
             except (ClaudeSDKError, Exception) as e:
@@ -867,10 +867,18 @@ class ClaudeExecutor:
                         )
                     except Exception:
                         log.warning("Failed to mark superpos task %s as failed", req.superpos_task_id)
-                _stderr_capture_var.reset(capture_token)
-                for _c in captures_to_cleanup:
-                    _cleanup_captured_stderr(_c.get("path"))
                 return
+
+            finally:
+                # Always-run cleanup. CancelledError (BaseException) bypasses
+                # the except clause above, so without finally the delete=False
+                # tempfiles leak — claim-expiry and timeout cancellation in a
+                # long-running worker would accumulate orphaned files in /tmp.
+                try:
+                    _stderr_capture_var.reset(capture_token)
+                except (ValueError, LookupError):
+                    pass
+                _cleanup_captured_stderr(capture.get("path"))
 
     @staticmethod
     def _extract_text(message: Message) -> str:

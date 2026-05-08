@@ -757,3 +757,128 @@ async def test_execute_inner_process_error_failure_includes_docker_logs_hint(
     assert streamer.error.await_count == 1
     sent = streamer.error.await_args.args[0]
     assert "docker logs" in sent
+
+
+async def test_execute_inner_resumes_session_from_init_message(
+    executor, mock_superpos, mock_config
+):
+    """Production crash path: the CLI emits a SystemMessage(subtype="init")
+    carrying session_id at the start of every run, then crashes mid-stream
+    before any ResultMessage. The executor must capture session_id from init
+    — relying on the terminal ResultMessage alone leaves crash-retry without
+    a session to resume in the exact failure mode this code is meant to fix.
+    """
+    from claude_code_sdk.types import SystemMessage
+
+    mock_config.claude_worktree_isolation = False
+    mock_config.claude_working_dir = "/workspace"
+
+    req = ExecutionRequest(
+        prompt="do work", chat_id="123", source="superpos",
+        superpos_task_id="task-init-crash",
+    )
+
+    captured_resumes = []
+    original_build = executor._build_options
+
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+        captured_resumes.append(resume_session)
+        return original_build(
+            resume_session=resume_session, cwd=cwd,
+            system_prompt_append=system_prompt_append,
+        )
+
+    init_msg = SystemMessage(
+        subtype="init",
+        data={"session_id": "sess-from-init", "type": "system", "subtype": "init"},
+    )
+
+    async def crash_after_init():
+        yield init_msg
+        raise Exception(
+            "Command failed with exit code 1 (exit code: 1)\n"
+            "Error output: Check stderr output for details"
+        )
+
+    async def succeed():
+        return
+        yield  # noqa — make it an async generator
+
+    call_count = {"n": 0}
+
+    def query_side_effect(*args, **kwargs):
+        call_count["n"] += 1
+        return crash_after_init() if call_count["n"] == 1 else succeed()
+
+    with patch("src.claude_executor.is_git_repo", return_value=False), \
+         patch.object(executor, "_build_options", side_effect=capture_build), \
+         patch("src.claude_executor.query", side_effect=query_side_effect), \
+         patch("src.claude_executor.asyncio.sleep", new_callable=AsyncMock), \
+         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=3)
+
+    assert captured_resumes == [None, "sess-from-init"]
+    assert mock_superpos.complete_task.await_count == 1
+    assert mock_superpos.fail_task.await_count == 0
+
+
+async def test_execute_inner_cleans_up_stderr_tempfile_on_cancellation(
+    executor, mock_superpos, mock_config
+):
+    """Claim-expiry and task-timeout cancel _execute_inner via CancelledError,
+    which is a BaseException — `except (ClaudeSDKError, Exception)` doesn't
+    catch it. Without try/finally cleanup the delete=False stderr tempfile
+    leaks on every cancellation; in a long-running worker handling many tasks
+    this exhausts /tmp.
+    """
+    import os
+    import tempfile
+    from src.claude_executor import _stderr_capture_var
+
+    mock_config.claude_worktree_isolation = False
+    mock_config.claude_working_dir = "/workspace"
+
+    req = ExecutionRequest(
+        prompt="do work", chat_id="123", source="superpos",
+        superpos_task_id="task-cancelled",
+    )
+
+    created_path = {"value": None}
+
+    async def populate_capture_then_cancel():
+        # Simulate the open_process patch: stash a real tempfile path on the
+        # capture dict, then raise CancelledError mid-stream.
+        capture = _stderr_capture_var.get()
+        f = tempfile.NamedTemporaryFile(
+            mode="w", prefix="claude-stderr-test-", suffix=".log", delete=False,
+        )
+        f.write("simulated cli stderr\n")
+        f.close()
+        if capture is not None:
+            capture["path"] = f.name
+        created_path["value"] = f.name
+        raise asyncio.CancelledError()
+        yield  # noqa — keeps this an async generator
+
+    with patch("src.claude_executor.is_git_repo", return_value=False), \
+         patch("src.claude_executor.query", side_effect=lambda *a, **kw: populate_capture_then_cancel()), \
+         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        with pytest.raises(asyncio.CancelledError):
+            await executor._execute_inner(req, streamer, retries=1)
+
+    assert created_path["value"] is not None
+    assert not os.path.exists(created_path["value"]), (
+        f"stderr tempfile leaked on CancelledError: {created_path['value']}"
+    )
