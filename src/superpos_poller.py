@@ -111,7 +111,7 @@ async def run_superpos_poller(
                 server_platform_version = data.get("platform_context_version")
                 if changed or (server_version is not None and server_version != persona_version):
                     new_persona = await superpos.get_persona_assembled()
-                    executor.update_persona(new_persona)
+                    executor.update_persona(new_persona, version=server_version)
                     persona_version = server_version
                     if server_platform_version is not None:
                         platform_context_version = server_platform_version

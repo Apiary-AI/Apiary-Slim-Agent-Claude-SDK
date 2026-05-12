@@ -102,6 +102,7 @@ class ClaudeExecutor:
         self._superpos = superpos
         self._gateway = gateway
         self._persona = persona
+        self._persona_version: int | None = None
         self._sessions = SessionStore()
         self.queue: asyncio.Queue[ExecutionRequest] = asyncio.Queue()
         self._in_flight_superpos_tasks: set[str] = set()
@@ -109,9 +110,25 @@ class ClaudeExecutor:
         self._worktree_locks: dict[str, asyncio.Lock] = {}
         self._active_count: int = 0
 
-    def update_persona(self, prompt: str | None) -> None:
-        """Update the persona used for future executions."""
+    def update_persona(self, prompt: str | None, version: int | None = None) -> None:
+        """Update the persona used for future executions.
+
+        When ``version`` is provided and is newer than the previously tracked
+        version, the next message in each chat will start a fresh session
+        instead of resuming. This prevents Claude from inheriting an old
+        identity (or other persona-baked context) from conversation history
+        written under the previous persona.
+        """
         self._persona = prompt
+        prev_version = self._persona_version
+        if version is not None:
+            self._persona_version = version
+            if prev_version is not None and version > prev_version:
+                log.info(
+                    "Persona version bumped %s -> %s; sessions started under "
+                    "older persona will be invalidated on next use",
+                    prev_version, version,
+                )
 
     @property
     def pending(self) -> int:
@@ -547,7 +564,25 @@ class ClaudeExecutor:
         # Telegram messages resume the chat session; Superpos tasks run fresh
         resume_id = None
         if req.source == "telegram":
-            resume_id = self._sessions.get(req.chat_id)
+            stored = self._sessions.get_with_version(req.chat_id)
+            if stored is not None:
+                resume_id, stored_version = stored
+                # Lazy invalidation: if the persona has been updated since this
+                # session started, drop the resume. Conversation history under
+                # the old persona would otherwise override the new identity /
+                # behavior (Claude tends to stay consistent with prior turns).
+                if (
+                    self._persona_version is not None
+                    and stored_version is not None
+                    and stored_version < self._persona_version
+                ):
+                    log.info(
+                        "Dropping resume for chat %s: session persona v%s < "
+                        "current v%s — starting fresh",
+                        req.chat_id, stored_version, self._persona_version,
+                    )
+                    self._sessions.clear(req.chat_id)
+                    resume_id = None
 
         # Prepend image references so Claude reads them via the Read tool
         prompt_text = req.prompt
@@ -580,7 +615,9 @@ class ClaudeExecutor:
                     if isinstance(message, ResultMessage) and hasattr(message, "session_id"):
                         sid = message.session_id
                         if sid and req.source == "telegram":
-                            self._sessions.set(req.chat_id, sid)
+                            self._sessions.set_with_version(
+                                req.chat_id, sid, self._persona_version,
+                            )
 
                     text = self._extract_text(message)
                     if text:

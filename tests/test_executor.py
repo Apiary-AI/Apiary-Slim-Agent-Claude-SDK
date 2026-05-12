@@ -29,6 +29,31 @@ def test_remove_nonexistent_is_safe(executor):
     executor.remove_superpos_task("nonexistent")  # must not raise
 
 
+# --- Persona versioning ---
+
+def test_update_persona_tracks_version(executor):
+    executor.update_persona("first persona", version=1)
+    assert executor._persona == "first persona"
+    assert executor._persona_version == 1
+
+
+def test_update_persona_without_version_keeps_prior_version(executor):
+    executor.update_persona("first", version=2)
+    executor.update_persona("second", version=None)  # no version provided
+    assert executor._persona == "second"
+    assert executor._persona_version == 2  # unchanged
+
+
+def test_update_persona_bump_logs_invalidation_intent(executor, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="src.claude_executor")
+    executor.update_persona("v1", version=1)
+    executor.update_persona("v2", version=2)
+    assert any(
+        "Persona version bumped 1 -> 2" in r.message for r in caplog.records
+    )
+
+
 # --- _report_progress: 409 sets event, other errors don't ---
 
 async def test_report_progress_409_sets_event(executor, mock_superpos):
