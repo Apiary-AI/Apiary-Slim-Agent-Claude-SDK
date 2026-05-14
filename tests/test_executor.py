@@ -54,6 +54,102 @@ def test_update_persona_bump_logs_invalidation_intent(executor, caplog):
     )
 
 
+async def test_unversioned_session_invalidated_once_persona_version_known(
+    executor, mock_config
+):
+    """Codex P2 fix: a session saved before `_persona_version` was populated
+    has `persona_version=None` in the store. Once a persona version becomes
+    known, that session must be invalidated on next use — otherwise the
+    startup race (Telegram polling accepts a message before the Superpos
+    version poller has populated `_persona_version`) permanently exempts
+    those chats from invalidation.
+    """
+    mock_config.claude_worktree_isolation = False
+    mock_config.claude_working_dir = "/workspace"
+
+    # Simulate the race: session stored while _persona_version was None
+    executor._persona_version = None
+    executor._sessions.set_with_version("chat-race", "sess-stale", None)
+
+    # Now the version becomes known (Superpos poller ran)
+    executor._persona_version = 5
+
+    req = ExecutionRequest(prompt="hello", chat_id="chat-race", source="telegram")
+
+    captured_resumes: list[str | None] = []
+    original_build = executor._build_options
+
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+        captured_resumes.append(resume_session)
+        return original_build(
+            resume_session=resume_session, cwd=cwd,
+            system_prompt_append=system_prompt_append,
+        )
+
+    async def succeed():
+        return
+        yield  # noqa
+
+    with patch("src.claude_executor.is_git_repo", return_value=False), \
+         patch.object(executor, "_build_options", side_effect=capture_build), \
+         patch("src.claude_executor.query", side_effect=lambda *a, **kw: succeed()), \
+         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=1)
+
+    # The stale unversioned session must not be resumed
+    assert captured_resumes == [None]
+    # And it must be cleared from the store
+    assert executor._sessions.get_with_version("chat-race") is None
+
+
+async def test_unversioned_session_kept_when_persona_version_not_known(
+    executor, mock_config
+):
+    """Inverse of above: if `_persona_version` is still None, an unversioned
+    session is not invalidated — there's no basis for comparison yet."""
+    mock_config.claude_worktree_isolation = False
+    mock_config.claude_working_dir = "/workspace"
+
+    executor._persona_version = None
+    executor._sessions.set_with_version("chat-q", "sess-q", None)
+
+    req = ExecutionRequest(prompt="hello", chat_id="chat-q", source="telegram")
+
+    captured_resumes: list[str | None] = []
+    original_build = executor._build_options
+
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+        captured_resumes.append(resume_session)
+        return original_build(
+            resume_session=resume_session, cwd=cwd,
+            system_prompt_append=system_prompt_append,
+        )
+
+    async def succeed():
+        return
+        yield  # noqa
+
+    with patch("src.claude_executor.is_git_repo", return_value=False), \
+         patch.object(executor, "_build_options", side_effect=capture_build), \
+         patch("src.claude_executor.query", side_effect=lambda *a, **kw: succeed()), \
+         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=1)
+
+    assert captured_resumes == ["sess-q"]
+
+
 # --- _report_progress: 409 sets event, other errors don't ---
 
 async def test_report_progress_409_sets_event(executor, mock_superpos):

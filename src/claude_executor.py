@@ -655,15 +655,23 @@ class ClaudeExecutor:
                 # session started, drop the resume. Conversation history under
                 # the old persona would otherwise override the new identity /
                 # behavior (Claude tends to stay consistent with prior turns).
-                if (
-                    self._persona_version is not None
-                    and stored_version is not None
-                    and stored_version < self._persona_version
+                #
+                # `stored_version is None` is treated as "older than any known
+                # version" — this handles the startup race where Telegram
+                # polling can write a session before the Superpos version
+                # poller has populated `_persona_version`. Without this, those
+                # sessions are saved as version=None and permanently exempt
+                # from invalidation on later persona bumps.
+                if self._persona_version is not None and (
+                    stored_version is None
+                    or stored_version < self._persona_version
                 ):
                     log.info(
                         "Dropping resume for chat %s: session persona v%s < "
                         "current v%s — starting fresh",
-                        req.chat_id, stored_version, self._persona_version,
+                        req.chat_id,
+                        "?" if stored_version is None else stored_version,
+                        self._persona_version,
                     )
                     self._sessions.clear(req.chat_id)
                     resume_id = None
