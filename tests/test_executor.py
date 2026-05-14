@@ -882,3 +882,144 @@ async def test_execute_inner_cleans_up_stderr_tempfile_on_cancellation(
     assert not os.path.exists(created_path["value"]), (
         f"stderr tempfile leaked on CancelledError: {created_path['value']}"
     )
+
+
+# --- Recent-tasks bridge from Superpos → Telegram ---
+
+async def test_telegram_request_sees_recent_superpos_task_in_system_prompt(
+    executor, mock_superpos, mock_config
+):
+    """A Telegram message that arrives after a Superpos task completed in the
+    same chat must see the task's summary appended to the system prompt, so
+    the user can ask follow-up questions about notifications they saw."""
+    from src.recent_tasks import TaskSummary
+
+    mock_config.claude_worktree_isolation = False
+    mock_config.claude_working_dir = "/workspace"
+
+    # Pre-populate the recent-tasks log as if a Superpos task had just run
+    executor._recent_tasks.record(
+        "chat-77",
+        TaskSummary(
+            task_id="sp-task-99",
+            description="Deploy frontend to staging",
+            outcome="failed",
+            detail="kubectl timeout after 60s",
+        ),
+    )
+
+    req = ExecutionRequest(
+        prompt="what went wrong with the deploy?",
+        chat_id="chat-77",
+        source="telegram",
+    )
+
+    captured_appends: list[str | None] = []
+    original_build = executor._build_options
+
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+        captured_appends.append(system_prompt_append)
+        return original_build(
+            resume_session=resume_session, cwd=cwd,
+            system_prompt_append=system_prompt_append,
+        )
+
+    async def succeed():
+        return
+        yield  # noqa
+
+    with patch("src.claude_executor.is_git_repo", return_value=False), \
+         patch.object(executor, "_build_options", side_effect=capture_build), \
+         patch("src.claude_executor.query", side_effect=lambda *a, **kw: succeed()), \
+         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=1)
+
+    assert captured_appends, "_build_options should have been called"
+    appended = captured_appends[0]
+    assert appended is not None
+    assert "sp-task-99" in appended
+    assert "Deploy frontend to staging" in appended
+    assert "kubectl timeout" in appended
+    assert "failed" in appended
+
+
+async def test_superpos_task_completion_records_summary(
+    executor, mock_superpos, mock_config
+):
+    """A successfully completed Superpos task must land in the recent-tasks
+    log so the next Telegram message in the same chat picks it up."""
+    from claude_code_sdk.types import AssistantMessage, TextBlock, ResultMessage
+
+    mock_config.claude_worktree_isolation = False
+    mock_config.claude_working_dir = "/workspace"
+
+    req = ExecutionRequest(
+        prompt="build the report", chat_id="chat-77", source="superpos",
+        superpos_task_id="sp-task-record",
+    )
+
+    async def stream_then_finish():
+        yield AssistantMessage(content=[TextBlock(text="Report generated.")], model="m")
+        yield ResultMessage(
+            subtype="success", duration_ms=100, duration_api_ms=80,
+            is_error=False, num_turns=1, session_id="sess-x",
+        )
+
+    with patch("src.claude_executor.is_git_repo", return_value=False), \
+         patch("src.claude_executor.query", side_effect=lambda *a, **kw: stream_then_finish()), \
+         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=1)
+
+    rendered = executor._recent_tasks.render("chat-77")
+    assert rendered is not None
+    assert "sp-task-record" in rendered
+    assert "succeeded" in rendered
+    assert "build the report" in rendered
+
+
+async def test_superpos_task_failure_records_summary(
+    executor, mock_superpos, mock_config
+):
+    """Failures must also land in the recent-tasks log — the user often
+    asks follow-up questions about what went wrong."""
+    mock_config.claude_worktree_isolation = False
+    mock_config.claude_working_dir = "/workspace"
+
+    req = ExecutionRequest(
+        prompt="risky operation", chat_id="chat-77", source="superpos",
+        superpos_task_id="sp-task-fail",
+    )
+
+    async def fail_immediately():
+        raise Exception("simulated failure")
+        yield  # noqa
+
+    with patch("src.claude_executor.is_git_repo", return_value=False), \
+         patch("src.claude_executor.query", side_effect=lambda *a, **kw: fail_immediately()), \
+         patch("src.claude_executor.asyncio.sleep", new_callable=AsyncMock), \
+         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=1)
+
+    rendered = executor._recent_tasks.render("chat-77")
+    assert rendered is not None
+    assert "sp-task-fail" in rendered
+    assert "failed" in rendered
+    assert "simulated failure" in rendered

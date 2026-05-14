@@ -144,6 +144,7 @@ from .superpos_client import SuperposClient
 from .config import Config
 from .module_loader import collect_mcp_servers, discover_modules
 from .runtime_config import RuntimeConfig
+from .recent_tasks import RecentTasksLog, TaskSummary
 from .session_store import SessionStore
 from .telegram_gateway import TelegramGateway
 from .telegram_streamer import TelegramStreamer
@@ -181,6 +182,7 @@ class ClaudeExecutor:
         self._gateway = gateway
         self._persona = persona
         self._sessions = SessionStore()
+        self._recent_tasks = RecentTasksLog(max_per_chat=5)
         self.queue: asyncio.Queue[ExecutionRequest] = asyncio.Queue()
         self._in_flight_superpos_tasks: set[str] = set()
         self._semaphore = asyncio.Semaphore(config.claude_max_parallel)
@@ -622,10 +624,20 @@ class ClaudeExecutor:
                     "For conversational replies or read-only tasks, skip this entirely."
                 )
 
-        # Telegram messages resume the chat session; Superpos tasks run fresh
+        # Telegram messages resume the chat session; Superpos tasks run fresh.
+        # For Telegram, also prime the session with summaries of recent
+        # Superpos tasks the user saw notifications about in this chat —
+        # those tasks ran in isolated sessions, so the conversation has no
+        # memory of them otherwise.
         resume_id = None
         if req.source == "telegram":
             resume_id = self._sessions.get(req.chat_id)
+            recent = self._recent_tasks.render(req.chat_id)
+            if recent:
+                system_prompt_append = (
+                    f"{system_prompt_append}\n\n{recent}"
+                    if system_prompt_append else recent
+                )
 
         # Prepend image references so Claude reads them via the Read tool
         prompt_text = req.prompt
@@ -712,6 +724,18 @@ class ClaudeExecutor:
                             "Failed to complete superpos task %s — claim may have expired",
                             req.superpos_task_id, exc_info=True,
                         )
+                    # Record regardless of complete_task outcome — the work
+                    # ran, the user saw the streamed output, and a future
+                    # Telegram follow-up should still have the context.
+                    self._recent_tasks.record(
+                        req.chat_id,
+                        TaskSummary(
+                            task_id=req.superpos_task_id,
+                            description=req.prompt[:200],
+                            outcome="succeeded",
+                            detail=full_text[:500] if full_text else "",
+                        ),
+                    )
                 return
 
             except (ClaudeSDKError, Exception) as e:
@@ -867,6 +891,15 @@ class ClaudeExecutor:
                         )
                     except Exception:
                         log.warning("Failed to mark superpos task %s as failed", req.superpos_task_id)
+                    self._recent_tasks.record(
+                        req.chat_id,
+                        TaskSummary(
+                            task_id=req.superpos_task_id,
+                            description=req.prompt[:200],
+                            outcome="failed",
+                            detail=err_str[:500],
+                        ),
+                    )
                 return
 
             finally:
