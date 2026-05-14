@@ -200,7 +200,7 @@ async def run_telegram_bot(
             listing = "\n".join(f"- `{m}`" for m in RuntimeConfig.KNOWN_MODELS)
             await update.message.reply_text(
                 f"Known models:\n{listing}\n\n"
-                f"Any `claude-*` id is accepted — known list is a hint.",
+                f"Any provider model id is accepted — known list is a hint.",
                 parse_mode="Markdown",
             )
             return
