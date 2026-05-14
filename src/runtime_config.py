@@ -29,9 +29,10 @@ class RuntimeConfig:
         "claude-sonnet-4-6",
         "claude-sonnet-4-5",
         "claude-haiku-4-5",
+        "MiniMax-M2.7",
     )
     EFFORT_LEVELS = ("low", "medium", "high", "max")
-    MODEL_RE = re.compile(r"^claude-[a-z0-9][a-z0-9-]*$")
+    MODEL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9._-]{0,63}$")
 
     def __init__(self, model: str, effort: str) -> None:
         self.model = model
@@ -61,7 +62,7 @@ class RuntimeConfig:
 
     def set_model(self, model: str) -> None:
         if not self.MODEL_RE.match(model):
-            raise ValueError(f"Not a valid Claude model id: {model!r}")
+            raise ValueError(f"Not a valid model id: {model!r}")
         self.model = model
         self._save()
 
