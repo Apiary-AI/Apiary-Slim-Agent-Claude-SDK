@@ -47,3 +47,15 @@ def test_corrupt_json_starts_fresh(tmp_path):
     path.write_text("not valid json{{{")
     store = SessionStore(str(path))
     assert store.get("chat1") is None
+
+
+def test_active_session_ids_returns_all_values(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.json"))
+    store.set("chat1", "sess-a")
+    store.set("chat2", "sess-b")
+    assert store.active_session_ids() == {"sess-a", "sess-b"}
+
+
+def test_active_session_ids_empty_when_no_entries(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.json"))
+    assert store.active_session_ids() == set()
