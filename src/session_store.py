@@ -109,3 +109,15 @@ class SessionStore:
         if to_drop:
             self._save()
         return len(to_drop)
+
+    def active_session_ids(self) -> set[str]:
+        """Session IDs currently mapped to a chat — must be preserved by
+        disk-cleanup tooling so the next user message can resume them.
+        Without this, startup cleanup happily deletes the session jsonl/dir
+        for a chat that's idle but still meant to resume, and the next
+        message silently starts a fresh Claude session."""
+        return {
+            sid
+            for entry in self._data.values()
+            if (sid := entry.get("session_id"))
+        }

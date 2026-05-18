@@ -311,15 +311,20 @@ async def main() -> None:
     for sig in (signal.SIGTERM, signal.SIGINT):
         loop.add_signal_handler(sig, lambda: _shutdown(loop))
 
-    # Auto-cleanup stale session data on startup (telegram-side housekeeping)
+    # Auto-cleanup stale session data on startup (telegram-side housekeeping).
+    # Preserve any session_id still referenced by SessionStore — those are
+    # the resume targets for currently-mapped chats, and deleting their
+    # transcripts would make the next user message silently start fresh.
     if config.telegram_enabled:
         from .telegram_bot import _cleanup_stale_sessions
-        counts = _cleanup_stale_sessions(max_age_hours=48)
+        preserve = executor._sessions.active_session_ids()
+        counts = _cleanup_stale_sessions(max_age_hours=48, preserve_session_ids=preserve)
         if counts["projects"] or counts["session_env"]:
             freed_mb = counts["bytes_freed"] / (1024 * 1024)
             log.info(
-                "Startup cleanup: removed %d sessions, %d env snapshots (%.1fMB freed)",
-                counts["projects"], counts["session_env"], freed_mb,
+                "Startup cleanup: removed %d sessions, %d env snapshots "
+                "(%.1fMB freed; preserved %d active session(s))",
+                counts["projects"], counts["session_env"], freed_mb, len(preserve),
             )
 
     log.info("Starting %d tasks", len(tasks))

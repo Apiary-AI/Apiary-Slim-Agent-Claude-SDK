@@ -98,3 +98,24 @@ def test_version_persists_across_instances(tmp_path):
     store1.set_with_version("chat1", "session-abc", 2)
     store2 = SessionStore(path)
     assert store2.get_with_version("chat1") == ("session-abc", 2)
+
+
+def test_active_session_ids_returns_all_values(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.json"))
+    store.set("chat1", "sess-a")
+    store.set("chat2", "sess-b")
+    assert store.active_session_ids() == {"sess-a", "sess-b"}
+
+
+def test_active_session_ids_empty_when_no_entries(tmp_path):
+    store = SessionStore(str(tmp_path / "sessions.json"))
+    assert store.active_session_ids() == set()
+
+
+def test_active_session_ids_works_with_versioned_entries(tmp_path):
+    """After PR #3's storage migration, set_with_version() stores dict entries.
+    The set extracts session_id from each, dropping any malformed/empty values."""
+    store = SessionStore(str(tmp_path / "sessions.json"))
+    store.set_with_version("chat-v", "sess-versioned", 5)
+    store.set("chat-u", "sess-unversioned")  # legacy path → persona_version=None
+    assert store.active_session_ids() == {"sess-versioned", "sess-unversioned"}

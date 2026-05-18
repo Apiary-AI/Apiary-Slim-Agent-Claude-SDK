@@ -55,14 +55,29 @@ async def _resolve_pr_branch(pr_number: int, repo_dir: str) -> str | None:
     return None
 
 
-def _cleanup_stale_sessions(max_age_hours: int = 24) -> dict[str, int]:
-    """Remove old Claude session data to reclaim disk space."""
+def _cleanup_stale_sessions(
+    max_age_hours: int = 24,
+    preserve_session_ids: set[str] | None = None,
+) -> dict[str, int]:
+    """Remove old Claude session data to reclaim disk space.
+
+    ``preserve_session_ids`` — session IDs that must NOT be deleted regardless
+    of age. The SessionStore's active mappings (chat_id → session_id) belong
+    here: if the user has been idle for >max_age_hours, the resume target
+    would otherwise be deleted and the next message silently starts a fresh
+    Claude session (perceived as "agent lost the conversation on restart").
+    """
     import shutil
     import time
 
+    preserve = preserve_session_ids or set()
     counts = {"projects": 0, "session_env": 0, "bytes_freed": 0}
     cutoff = time.time() - (max_age_hours * 3600)
     claude_dir = os.path.join(os.environ.get("HOME", "/tmp"), ".claude")
+
+    def _session_id_from_name(name: str) -> str:
+        # Both `<sid>` (dir) and `<sid>.jsonl` (transcript) live in projects/.
+        return name[:-6] if name.endswith(".jsonl") else name
 
     # Clean old project sessions
     projects_dir = os.path.join(claude_dir, "projects", "-workspace")
@@ -70,6 +85,8 @@ def _cleanup_stale_sessions(max_age_hours: int = 24) -> dict[str, int]:
         for name in os.listdir(projects_dir):
             path = os.path.join(projects_dir, name)
             if not os.path.isdir(path):
+                continue
+            if _session_id_from_name(name) in preserve:
                 continue
             try:
                 mtime = os.path.getmtime(path)
@@ -91,6 +108,8 @@ def _cleanup_stale_sessions(max_age_hours: int = 24) -> dict[str, int]:
         for name in os.listdir(session_env_dir):
             path = os.path.join(session_env_dir, name)
             if not os.path.isdir(path):
+                continue
+            if _session_id_from_name(name) in preserve:
                 continue
             try:
                 mtime = os.path.getmtime(path)
@@ -176,7 +195,8 @@ async def run_telegram_bot(
     async def cmd_cleanup(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not update.effective_user or not is_allowed(update.effective_user.id):
             return
-        counts = await asyncio.to_thread(_cleanup_stale_sessions, 24)
+        preserve = executor._sessions.active_session_ids()
+        counts = await asyncio.to_thread(_cleanup_stale_sessions, 24, preserve)
         freed_mb = counts["bytes_freed"] / (1024 * 1024)
         await update.message.reply_text(
             f"🧹 Cleaned up:\n"
