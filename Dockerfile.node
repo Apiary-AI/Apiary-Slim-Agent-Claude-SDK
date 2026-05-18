@@ -1,0 +1,29 @@
+# Dockerfile.node — extends the base agent with a Node.js test toolchain.
+# Node 22 itself is already in the base image; this layer enables
+# pnpm/yarn via corepack and adds the system deps needed to compile
+# native npm modules (better-sqlite3, sharp, node-gyp targets, etc.).
+#
+# Build:
+#   docker build -t slim-agent-claude-node -f Dockerfile.node .
+
+FROM slim-apiary-agent-base
+
+USER root
+
+# build-essential + python3 + pkg-config let node-gyp build native modules;
+# without them `npm install` silently falls back to no-native-bindings or
+# fails outright on packages like better-sqlite3.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# corepack ships with Node 22; enable it so pnpm/yarn are resolvable from
+# project package.json `packageManager` fields without an extra install step.
+RUN corepack enable && \
+    corepack prepare pnpm@latest --activate && \
+    corepack prepare yarn@stable --activate
+
+USER agent
