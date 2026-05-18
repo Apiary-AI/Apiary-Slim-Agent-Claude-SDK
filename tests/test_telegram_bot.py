@@ -207,3 +207,92 @@ async def test_resolve_pr_branch_gh_fails(mock_subprocess):
     branch = await _resolve_pr_branch(999, "/workspace/repo")
 
     assert branch is None
+
+
+# --- Cleanup preserves active sessions ---
+
+def test_cleanup_preserves_active_session_directory(tmp_path, monkeypatch):
+    """Startup cleanup must skip session directories whose ID is currently
+    mapped in SessionStore — otherwise the user's resume target gets deleted
+    and the next message silently starts fresh."""
+    import os
+    import time
+    from src.telegram_bot import _cleanup_stale_sessions
+
+    fake_home = tmp_path / "home"
+    projects = fake_home / ".claude" / "projects" / "-workspace"
+    projects.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    # An active session — referenced by SessionStore
+    active_dir = projects / "sess-active-12345"
+    active_dir.mkdir()
+    (active_dir / "transcript.jsonl").write_text("data")
+    old = time.time() - (72 * 3600)
+    os.utime(active_dir, (old, old))
+
+    # A stale session — not referenced
+    stale_dir = projects / "sess-stale-99999"
+    stale_dir.mkdir()
+    (stale_dir / "transcript.jsonl").write_text("data")
+    os.utime(stale_dir, (old, old))
+
+    counts = _cleanup_stale_sessions(
+        max_age_hours=48, preserve_session_ids={"sess-active-12345"},
+    )
+
+    assert active_dir.exists(), "Active session must not be deleted"
+    assert not stale_dir.exists(), "Stale session should have been removed"
+    assert counts["projects"] == 1
+
+
+def test_cleanup_preserves_active_jsonl_named_dir(tmp_path, monkeypatch):
+    """Session id derived from a `<sid>.jsonl` filename must also be matched
+    against the preserve set — but the file form isn't deleted by this
+    cleanup anyway (only directories). Verify the preserve filter doesn't
+    break the directory walk when a `.jsonl` sibling is present."""
+    import os
+    import time
+    from src.telegram_bot import _cleanup_stale_sessions
+
+    fake_home = tmp_path / "home"
+    projects = fake_home / ".claude" / "projects" / "-workspace"
+    projects.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    sid = "sess-with-both"
+    (projects / f"{sid}.jsonl").write_text("transcript")
+    d = projects / sid
+    d.mkdir()
+    (d / "state.json").write_text("state")
+    old = time.time() - (72 * 3600)
+    os.utime(d, (old, old))
+
+    counts = _cleanup_stale_sessions(
+        max_age_hours=48, preserve_session_ids={sid},
+    )
+
+    assert d.exists()
+    assert counts["projects"] == 0
+
+
+def test_cleanup_without_preserve_set_still_deletes_old(tmp_path, monkeypatch):
+    """Default behavior (no preserve set passed) is unchanged from before."""
+    import os
+    import time
+    from src.telegram_bot import _cleanup_stale_sessions
+
+    fake_home = tmp_path / "home"
+    projects = fake_home / ".claude" / "projects" / "-workspace"
+    projects.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    d = projects / "sess-x"
+    d.mkdir()
+    (d / "transcript.jsonl").write_text("data")
+    old = time.time() - (72 * 3600)
+    os.utime(d, (old, old))
+
+    counts = _cleanup_stale_sessions(max_age_hours=48)
+    assert not d.exists()
+    assert counts["projects"] == 1
