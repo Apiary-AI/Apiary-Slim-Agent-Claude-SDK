@@ -1,0 +1,31 @@
+# Dockerfile.playwright — extends the base agent with Playwright + Chromium.
+# Use when the agent needs to drive a real browser: end-to-end tests,
+# screenshots, scraping behind JS, etc. Playwright speaks Chrome DevTools
+# Protocol under the hood, so anything you could do with raw CDP is
+# reachable through page.context() / CDPSession when needed.
+#
+# Build:
+#   docker build -t slim-agent-claude-playwright -f Dockerfile.playwright .
+
+FROM slim-apiary-agent-base
+
+USER root
+
+# Browsers live in a shared path so root can install them (apt needs root)
+# but the `agent` user can still read+execute them at runtime.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
+
+# Install the Playwright npm package globally so the `playwright` CLI is on
+# PATH for the agent. The CLI is used in two phases:
+#   1. `install-deps chromium` — apt-installs the headless Chromium libs
+#      (libnss3, libatk1.0-0, fonts-liberation, …). Must run as root.
+#   2. `install chromium` — downloads the matched Chromium build into
+#      PLAYWRIGHT_BROWSERS_PATH. Run as `agent` so file ownership is right.
+RUN mkdir -p "$PLAYWRIGHT_BROWSERS_PATH" && \
+    chown -R agent:agent "$PLAYWRIGHT_BROWSERS_PATH" && \
+    npm install -g playwright@latest && \
+    npx playwright install-deps chromium && \
+    rm -rf /var/lib/apt/lists/*
+
+USER agent
+RUN npx playwright install chromium

@@ -70,6 +70,45 @@ caffeinate -is docker run --env-file .env -v claude_auth:/home/agent/.claude sup
 
 `-i` prevents idle sleep, `-s` prevents system sleep (keeps the machine awake even with the lid closed on AC power). `caffeinate` exits automatically when the Docker container stops.
 
+### Stack variants
+
+The base `Dockerfile` ships Node 22, Python 3, git, `gh`, and the `claude` CLI — enough for most code-review and writing tasks. For tasks that need to actually *run* a project's tests or drive a browser, three pre-built sibling Dockerfiles extend the base with extra tooling:
+
+| File | Adds | When to use |
+|---|---|---|
+| `Dockerfile.php` | PHP 8.4 (via sury repo) + Composer + Laravel-relevant extensions (mbstring, xml, curl, sqlite/mysql/pgsql, bcmath, gd, zip, intl) | Running Pint, PHPUnit, Pest, Artisan, PHPStan inside the container |
+| `Dockerfile.node` | corepack-enabled pnpm + yarn, plus build-essential / pkg-config / python3 for native modules (better-sqlite3, sharp, node-gyp targets) | Tasks that need pnpm/yarn or that compile native npm modules during `npm install` |
+| `Dockerfile.playwright` | Playwright + Chromium with headless system deps, browsers installed to `/opt/playwright-browsers` so the non-root `agent` user can read them | End-to-end browser tests, screenshots, scraping behind JS. Playwright exposes the full Chrome DevTools Protocol via `CDPSession` when you need to go lower-level. |
+
+Each variant does `FROM slim-apiary-agent-base`, so first tag the base accordingly, then build the variant you want:
+
+```bash
+# 1. Build (or rebuild) the base with the tag the variants expect
+docker build -t slim-apiary-agent-base -f Dockerfile .
+
+# 2. Build the variant
+docker build -t slim-agent-claude-php        -f Dockerfile.php        .
+docker build -t slim-agent-claude-node       -f Dockerfile.node       .
+docker build -t slim-agent-claude-playwright -f Dockerfile.playwright .
+```
+
+To use one in `docker-compose.yml`, point the `dockerfile:` field at the variant:
+
+```yaml
+services:
+  agent1:
+    build:
+      context: .
+      dockerfile: Dockerfile.playwright   # or .php / .node
+    container_name: agent1
+    restart: unless-stopped
+    env_file: .env.agent1
+    volumes:
+      - claude_auth_1:/home/agent/.claude
+```
+
+If you need two stacks together (e.g. JS + browser), the cleanest path is to create a chained `Dockerfile.node-playwright` that does `FROM slim-agent-claude-node` and then adds the Playwright layers — there's no inherent conflict.
+
 ### Alternative: API key auth
 
 If you prefer API key auth, skip step 3, set `ANTHROPIC_API_KEY` in `.env`, and run without the volume:
