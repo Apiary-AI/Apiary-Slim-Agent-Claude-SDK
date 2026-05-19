@@ -353,7 +353,13 @@ class ClaudeExecutor(Executor):
                 except OSError:
                     pass
 
-        session_env_dir = os.path.join(claude_dir, "session_env")
+        # Claude CLI writes per-session env snapshots to `session-env`
+        # (hyphenated).  The pre-port code scanned `session_env` (underscore)
+        # which never matched the real directory — so those snapshots have
+        # been accumulating untouched in every long-running deployment.
+        # The `session_env` key in the returned `counts` dict is unchanged;
+        # it's the contract with core's startup-cleanup log line.
+        session_env_dir = os.path.join(claude_dir, "session-env")
         if os.path.isdir(session_env_dir):
             for name in os.listdir(session_env_dir):
                 path = os.path.join(session_env_dir, name)

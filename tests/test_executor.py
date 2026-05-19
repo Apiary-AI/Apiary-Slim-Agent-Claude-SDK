@@ -1102,3 +1102,43 @@ async def test_preflight_no_offline_call_when_no_superpos(
         await executor.preflight()
 
     mock_exit.assert_called_once_with(1)
+
+
+# --- Cleanup paths ---
+
+def test_cleanup_stale_sessions_uses_hyphenated_session_env_path(
+    executor, tmp_path, monkeypatch,
+):
+    """Claude writes per-session env snapshots to `~/.claude/session-env`
+    (hyphenated). The earlier `session_env` (underscore) path was a typo
+    that silently never matched, so snapshots accumulated indefinitely.
+    Lock in the right name so we can't regress.
+    """
+    import os
+    import time
+
+    fake_home = tmp_path
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    # Stale snapshot under the CORRECT (hyphenated) path
+    real_dir = fake_home / ".claude" / "session-env" / "sess-old"
+    real_dir.mkdir(parents=True)
+    (real_dir / "snapshot.json").write_text('{"k": "v"}')
+    old = time.time() - (48 * 3600)
+    os.utime(real_dir, (old, old))
+
+    # Decoy snapshot under the BROKEN (underscore) path — must be untouched
+    decoy_dir = fake_home / ".claude" / "session_env" / "sess-decoy"
+    decoy_dir.mkdir(parents=True)
+    (decoy_dir / "snapshot.json").write_text('{"k": "v"}')
+    os.utime(decoy_dir, (old, old))
+
+    counts = executor.cleanup_stale_sessions(max_age_hours=24)
+
+    assert counts["session_env"] == 1, (
+        f"expected exactly one snapshot cleaned, got {counts}"
+    )
+    assert not real_dir.exists(), "real session-env snapshot should be deleted"
+    assert decoy_dir.exists(), (
+        "underscore-path decoy must NOT be touched (would be a typo regression)"
+    )
