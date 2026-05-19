@@ -1142,3 +1142,265 @@ def test_cleanup_stale_sessions_uses_hyphenated_session_env_path(
     assert decoy_dir.exists(), (
         "underscore-path decoy must NOT be touched (would be a typo regression)"
     )
+
+
+# --- Persona version tracking & lazy session invalidation ---
+
+def test_update_persona_tracks_version(executor):
+    executor.update_persona("first persona", version=1)
+    assert executor._persona == "first persona"
+    assert executor._persona_version == 1
+
+
+def test_update_persona_without_version_keeps_prior_version(executor):
+    """A subsequent update_persona(prompt, version=None) refreshes the
+    prompt but does NOT erase the previously-known version — the poller
+    sometimes pushes a refreshed prompt with no version (e.g. when only
+    platform_context changed) and we need the persona-version comparison
+    on the next resume to keep working."""
+    executor.update_persona("first", version=2)
+    executor.update_persona("second", version=None)
+    assert executor._persona == "second"
+    assert executor._persona_version == 2
+
+
+def test_update_persona_bump_logs_invalidation_intent(executor, caplog):
+    import logging
+    caplog.set_level(logging.INFO, logger="slim_agent_claude.claude_executor")
+    executor.update_persona("v1", version=1)
+    executor.update_persona("v2", version=2)
+    assert any(
+        "Persona version bumped 1 -> 2" in r.message for r in caplog.records
+    )
+
+
+def test_update_persona_first_set_does_not_log_bump(executor, caplog):
+    """First-time set of version (None → N) is just initialisation,
+    not a bump — no chat sessions exist yet under any earlier persona,
+    so logging "invalidated on next use" would be noise."""
+    import logging
+    caplog.set_level(logging.INFO, logger="slim_agent_claude.claude_executor")
+    executor.update_persona("v1", version=1)
+    assert not any("Persona version bumped" in r.message for r in caplog.records)
+
+
+async def test_resume_dropped_when_stored_version_older_than_current(
+    executor, mock_config,
+):
+    """The core invariant: a session started under persona v1 must NOT
+    be resumed once the executor is on v2.  Otherwise the LLM inherits
+    its old identity from the resumed transcript."""
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
+
+    executor._persona_version = 5
+    executor._sessions.set_with_version("chat-old", "sess-old", 1)
+
+    req = ExecutionRequest(prompt="hello", chat_id="chat-old", source="telegram")
+
+    captured_resumes: list[str | None] = []
+    original_build = executor._build_options
+
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+        captured_resumes.append(resume_session)
+        return original_build(
+            resume_session=resume_session, cwd=cwd,
+            system_prompt_append=system_prompt_append,
+        )
+
+    async def succeed():
+        return
+        yield  # noqa
+
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=False), \
+         patch.object(executor, "_build_options", side_effect=capture_build), \
+         patch("slim_agent_claude.claude_executor.query", side_effect=lambda *a, **kw: succeed()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=1)
+
+    assert captured_resumes == [None], (
+        "stale-persona session must not be resumed"
+    )
+    assert executor._sessions.get_with_version("chat-old") is None, (
+        "stale session must be cleared from the store"
+    )
+
+
+async def test_resume_kept_when_versions_match(executor, mock_config):
+    """A session started under the current persona must still resume."""
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
+
+    executor._persona_version = 3
+    executor._sessions.set_with_version("chat-current", "sess-current", 3)
+
+    req = ExecutionRequest(
+        prompt="follow-up", chat_id="chat-current", source="telegram",
+    )
+
+    captured_resumes: list[str | None] = []
+    original_build = executor._build_options
+
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+        captured_resumes.append(resume_session)
+        return original_build(
+            resume_session=resume_session, cwd=cwd,
+            system_prompt_append=system_prompt_append,
+        )
+
+    async def succeed():
+        return
+        yield  # noqa
+
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=False), \
+         patch.object(executor, "_build_options", side_effect=capture_build), \
+         patch("slim_agent_claude.claude_executor.query", side_effect=lambda *a, **kw: succeed()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=1)
+
+    assert captured_resumes == ["sess-current"]
+
+
+async def test_unversioned_session_invalidated_once_persona_version_known(
+    executor, mock_config,
+):
+    """Startup race: Telegram polling can write a session before the
+    Superpos persona-version poller has populated `_persona_version`,
+    so the session is saved with persona_version=None.  Once a version
+    becomes known, that None must be treated as "older than current"
+    and invalidated — otherwise those chats are permanently exempt from
+    persona refreshes.
+    """
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
+
+    # The race: session stored while _persona_version was None
+    executor._persona_version = None
+    executor._sessions.set_with_version("chat-race", "sess-stale", None)
+
+    # Superpos poller has since run
+    executor._persona_version = 5
+
+    req = ExecutionRequest(prompt="hello", chat_id="chat-race", source="telegram")
+
+    captured_resumes: list[str | None] = []
+    original_build = executor._build_options
+
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+        captured_resumes.append(resume_session)
+        return original_build(
+            resume_session=resume_session, cwd=cwd,
+            system_prompt_append=system_prompt_append,
+        )
+
+    async def succeed():
+        return
+        yield  # noqa
+
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=False), \
+         patch.object(executor, "_build_options", side_effect=capture_build), \
+         patch("slim_agent_claude.claude_executor.query", side_effect=lambda *a, **kw: succeed()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=1)
+
+    assert captured_resumes == [None]
+    assert executor._sessions.get_with_version("chat-race") is None
+
+
+async def test_unversioned_session_kept_when_persona_version_not_known(
+    executor, mock_config,
+):
+    """Inverse of the race fix: when `_persona_version` is still None,
+    an unversioned stored session has no basis for comparison and must
+    be resumed.  This is the early-startup state before the first
+    persona-version poll completes."""
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
+
+    executor._persona_version = None
+    executor._sessions.set_with_version("chat-q", "sess-q", None)
+
+    req = ExecutionRequest(prompt="hello", chat_id="chat-q", source="telegram")
+
+    captured_resumes: list[str | None] = []
+    original_build = executor._build_options
+
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+        captured_resumes.append(resume_session)
+        return original_build(
+            resume_session=resume_session, cwd=cwd,
+            system_prompt_append=system_prompt_append,
+        )
+
+    async def succeed():
+        return
+        yield  # noqa
+
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=False), \
+         patch.object(executor, "_build_options", side_effect=capture_build), \
+         patch("slim_agent_claude.claude_executor.query", side_effect=lambda *a, **kw: succeed()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=1)
+
+    assert captured_resumes == ["sess-q"]
+
+
+async def test_new_session_id_stored_with_current_persona_version(
+    executor, mock_config,
+):
+    """After a successful run, the session_id should be saved with the
+    *current* `_persona_version` so the next message can compare against
+    a future persona bump."""
+    from claude_code_sdk.types import SystemMessage
+
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
+
+    executor._persona_version = 7
+
+    req = ExecutionRequest(prompt="hello", chat_id="chat-new", source="telegram")
+
+    init_msg = SystemMessage(
+        subtype="init",
+        data={"session_id": "sess-fresh", "type": "system", "subtype": "init"},
+    )
+
+    async def stream_init_then_finish():
+        yield init_msg
+
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=False), \
+         patch("slim_agent_claude.claude_executor.query", side_effect=lambda *a, **kw: stream_init_then_finish()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=1)
+
+    assert executor._sessions.get_with_version("chat-new") == ("sess-fresh", 7)

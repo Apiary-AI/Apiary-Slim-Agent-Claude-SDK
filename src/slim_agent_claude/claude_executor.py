@@ -229,6 +229,7 @@ class ClaudeExecutor(Executor):
         self._superpos = superpos
         self._gateway = gateway
         self._persona = persona
+        self._persona_version: int | None = None
         self._sessions = SessionStore(
             path=os.path.join(config.home_dir, "session_store.json"),
         )
@@ -246,10 +247,24 @@ class ClaudeExecutor(Executor):
     def update_persona(self, prompt: str | None, version: int | None = None) -> None:
         """Replace the persona used for subsequent executions.
 
-        ``version`` is accepted for interface parity but Claude doesn't
-        track per-persona versions — the in-memory string is the source.
+        When ``version`` is provided and is newer than the previously
+        tracked version, the next message in each chat will start a fresh
+        session instead of resuming.  Otherwise the LLM inherits its
+        previous identity / context from conversation history written
+        under the old persona — Claude tends to stay consistent with
+        prior turns, so a new ``--append-system-prompt`` alone can't
+        overcome an old self-introduction in the resume transcript.
         """
         self._persona = prompt
+        prev_version = self._persona_version
+        if version is not None:
+            self._persona_version = version
+            if prev_version is not None and version > prev_version:
+                log.info(
+                    "Persona version bumped %s -> %s; sessions started under "
+                    "older persona will be invalidated on next use",
+                    prev_version, version,
+                )
 
     def clear_session(self, chat_id: int | str) -> None:
         self._sessions.clear(chat_id)
@@ -318,12 +333,7 @@ class ClaudeExecutor(Executor):
         """
         counts = {"projects": 0, "session_env": 0, "bytes_freed": 0}
         cutoff = time.time() - (max_age_hours * 3600)
-        # SessionStore exposes get/set/clear but no iteration helper; reach
-        # into the private map for now.  TODO: add `active_session_ids()` to
-        # core's SessionStore so this can use a public API.
-        preserve: set[str] = {
-            sid for sid in getattr(self._sessions, "_data", {}).values() if sid
-        }
+        preserve: set[str] = self._sessions.active_session_ids()
 
         claude_dir = os.path.join(os.environ.get("HOME", "/tmp"), ".claude")
 
@@ -777,7 +787,34 @@ class ClaudeExecutor(Executor):
 
         resume_id = None
         if req.source == "telegram":
-            resume_id = self._sessions.get(req.chat_id)
+            stored = self._sessions.get_with_version(req.chat_id)
+            if stored is not None:
+                resume_id, stored_version = stored
+                # Lazy persona invalidation: if the persona has been updated
+                # since this session started, drop the resume.  Conversation
+                # history under the old persona would otherwise override the
+                # new identity/behavior — Claude stays consistent with prior
+                # turns, so the new --append-system-prompt alone can't undo
+                # an old self-introduction in the resume transcript.
+                #
+                # `stored_version is None` covers the startup race where
+                # Telegram polling can write a session before the Superpos
+                # version poller has populated `_persona_version`.  Without
+                # this, those sessions would be permanently exempt from
+                # invalidation on later persona bumps.
+                if self._persona_version is not None and (
+                    stored_version is None
+                    or stored_version < self._persona_version
+                ):
+                    log.info(
+                        "Dropping resume for chat %s: session persona v%s < "
+                        "current v%s — starting fresh",
+                        req.chat_id,
+                        "?" if stored_version is None else stored_version,
+                        self._persona_version,
+                    )
+                    self._sessions.clear(req.chat_id)
+                    resume_id = None
             recent = self._recent_tasks.render(req.chat_id)
             if recent:
                 system_prompt_append = (
@@ -823,13 +860,17 @@ class ClaudeExecutor(Executor):
                         if sid:
                             last_session_id = sid
                             if req.source == "telegram":
-                                self._sessions.set(req.chat_id, sid)
+                                self._sessions.set_with_version(
+                                    req.chat_id, sid, self._persona_version,
+                                )
                     elif isinstance(message, ResultMessage) and hasattr(message, "session_id"):
                         sid = message.session_id
                         if sid:
                             last_session_id = sid
                             if req.source == "telegram":
-                                self._sessions.set(req.chat_id, sid)
+                                self._sessions.set_with_version(
+                                    req.chat_id, sid, self._persona_version,
+                                )
 
                     text = self._extract_text(message)
                     if text:
