@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slim-agent-claude"
+version = "0.1.0"
+description = "Superpos slim agent backed by Anthropic's Claude Agent SDK."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Superpos" }]
+dependencies = [
+    "slim-agent-core @ git+https://github.com/Superpos-AI/superpos-agent-core.git@main",
+    "claude-code-sdk>=0.0.25",
+    "python-telegram-bot>=21.0",
+    "httpx>=0.27.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# Local dev convenience: if you have a sibling slim-agent-core checkout,
+# uncomment this block to install from the local path instead of GitHub.
+# [tool.uv.sources]
+# slim-agent-core = { path = "../slim-agent-core" }

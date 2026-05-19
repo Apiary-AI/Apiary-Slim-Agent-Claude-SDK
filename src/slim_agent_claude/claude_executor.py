@@ -1,4 +1,11 @@
-"""Queue-based worker that invokes Claude Agent SDK and routes output."""
+"""Queue-based worker that invokes Claude Agent SDK and routes output.
+
+This is Claude's concrete :class:`slim_agent_core.Executor` subclass.  Core
+modules (``superpos_poller``, ``telegram_bot``, ``run_agent``) drive every
+agent through the abstract Executor surface; the Claude-specific bits live
+here: SDK patches, persona-as-system-prompt wiring, session resume, cleanup
+of ``~/.claude/projects/`` artifacts.
+"""
 
 from __future__ import annotations
 
@@ -6,9 +13,10 @@ import asyncio
 import contextvars
 import logging
 import os
+import shutil
 import sys
+import tempfile as _tempfile
 import time
-from dataclasses import dataclass
 
 import anyio
 import httpx
@@ -18,9 +26,37 @@ from claude_code_sdk._internal import client as _sdk_client
 from claude_code_sdk._internal import message_parser
 from claude_code_sdk.types import AssistantMessage, ResultMessage, SystemMessage
 
-# Patch parse_message to handle unknown message types (e.g. rate_limit_event)
-# instead of crashing the stream. Must patch in both modules since client.py
-# imports it directly.
+from slim_agent_core import (
+    ExecutionRequest,
+    Executor,
+    RecentTasksLog,
+    SessionStore,
+    SuperposClient,
+    TaskSummary,
+    TelegramGateway,
+    TelegramStreamer,
+    collect_mcp_servers,
+    discover_modules,
+    ensure_worktree,
+    is_git_repo,
+    worktree_path,
+)
+
+from .config import ClaudeConfig
+from .runtime_config import ClaudeRuntimeConfig
+
+log = logging.getLogger(__name__)
+
+
+# ── SDK patches ───────────────────────────────────────────────────────────
+#
+# These monkey-patches keep the Claude CLI bridge usable in our container:
+#   1. parse_message — tolerate unknown event types instead of crashing.
+#   2. _build_command — pass append_system_prompt via a file when it would
+#      otherwise blow ARG_MAX (persona can exceed 128KB).
+#   3. anyio.open_process — capture stderr to a tempfile so a CLI crash
+#      gives us a real error message instead of "exit code N (no stderr)".
+
 _original_parse = message_parser.parse_message
 
 
@@ -34,28 +70,21 @@ def _patched_parse(data: dict) -> Message:
 message_parser.parse_message = _patched_parse
 _sdk_client.parse_message = _patched_parse
 
-# Patch _build_command to use --append-system-prompt-file instead of
-# --append-system-prompt.  The persona can be >128KB which exceeds the
-# effective ARG_MAX in some container environments, causing E7.
-import tempfile as _tempfile
 
 _original_build_command = _sdk_client.SubprocessCLITransport._build_command
 
 
 def _patched_build_command(self: _sdk_client.SubprocessCLITransport) -> list[str]:
-    # Temporarily clear append_system_prompt so the original doesn't add it
     saved = self._options.append_system_prompt
     self._options.append_system_prompt = None
     cmd = _original_build_command(self)
     self._options.append_system_prompt = saved
 
     if saved:
-        # Write to a temp file that persists for the subprocess lifetime
         f = _tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
         f.write(saved)
         f.close()
         cmd.extend(["--append-system-prompt-file", f.name])
-        # Store ref so we can clean up later (best-effort)
         if not hasattr(self, "_prompt_tempfiles"):
             self._prompt_tempfiles = []
         self._prompt_tempfiles.append(f.name)
@@ -65,14 +94,7 @@ def _patched_build_command(self: _sdk_client.SubprocessCLITransport) -> list[str
 
 _sdk_client.SubprocessCLITransport._build_command = _patched_build_command
 
-# Patch anyio.open_process so the Claude CLI subprocess's stderr is captured
-# to a tempfile we can read on crash. Without this, ProcessError surfaces as
-# "Command failed with exit code N — Check stderr output for details" with
-# no actual stderr — the SDK only attaches stderr if --debug-to-stderr is on,
-# which would also flood the log with verbose CLI debug output.
-#
-# We use a contextvar so each query() call gets its own capture slot — safe
-# under claude_max_parallel > 1 where multiple subprocesses run in parallel.
+
 _stderr_capture_var: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "claude_cli_stderr_capture", default=None,
 )
@@ -97,7 +119,6 @@ async def _patched_open_process(*args, **kwargs):
         except OSError:
             pass
         raise
-    # The subprocess holds a dup of the fd; closing our handle is safe.
     f.close()
     capture["path"] = f.name
     capture["pid"] = proc.pid
@@ -108,11 +129,6 @@ anyio.open_process = _patched_open_process
 
 
 def _read_captured_stderr(path: str | None, max_bytes: int = 4096) -> str:
-    """Read the tail of a captured stderr file, truncated to max_bytes.
-
-    Returns an empty string if the path is None, the file is missing, or the
-    file is empty. Always best-effort — never raises.
-    """
     if not path:
         return ""
     try:
@@ -140,91 +156,210 @@ def _cleanup_captured_stderr(path: str | None) -> None:
         pass
 
 
-from .superpos_client import SuperposClient
-from .config import Config
-from .module_loader import collect_mcp_servers, discover_modules
-from .runtime_config import RuntimeConfig
-from .recent_tasks import RecentTasksLog, TaskSummary
-from .session_store import SessionStore
-from .telegram_gateway import TelegramGateway
-from .telegram_streamer import TelegramStreamer
-from .worktree_manager import ensure_worktree, is_git_repo, worktree_path
+# ── Auth-failure help text ────────────────────────────────────────────────
 
-log = logging.getLogger(__name__)
+_AUTH_HELP_OAUTH_EXPIRED = """
+╔══════════════════════════════════════════════════════════════╗
+║       Claude OAuth session expired — cannot start           ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  Your OAuth session has fully expired. Re-authenticate:      ║
+║                                                              ║
+║    docker run -it \\                                         ║
+║      -v claude_auth:/home/agent/.claude \\                   ║
+║      --entrypoint claude superpos-claude-agent               ║
+║                                                              ║
+║  Open the printed URL in your browser and log in.            ║
+║  Then restart the agent (keep the -v flag).                  ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+"""
+
+_AUTH_HELP_INVALID_KEY = """
+╔══════════════════════════════════════════════════════════════╗
+║         Claude authentication failed — cannot start         ║
+╠══════════════════════════════════════════════════════════════╣
+║                                                              ║
+║  Option 1 — OAuth (Claude Pro/Max subscription):            ║
+║                                                              ║
+║    docker run -it \\                                         ║
+║      -v claude_auth:/home/agent/.claude \\                   ║
+║      --entrypoint claude superpos-claude-agent               ║
+║                                                              ║
+║    Open the printed URL in your browser and log in.          ║
+║    Then run the agent with the same -v flag.                 ║
+║                                                              ║
+║  Option 2 — API key:                                         ║
+║                                                              ║
+║    Set ANTHROPIC_API_KEY=sk-ant-... in your .env file.       ║
+║                                                              ║
+╚══════════════════════════════════════════════════════════════╝
+"""
 
 
-@dataclass
-class ExecutionRequest:
-    prompt: str
-    chat_id: int | str
-    source: str  # "telegram" | "superpos"
-    superpos_task_id: str | None = None
-    branch: str | None = None
-    image_paths: list[str] | None = None
+def _auth_error_message(err: str) -> str | None:
+    if "OAuth token has expired" in err or ("oauth" in err.lower() and "expired" in err.lower()):
+        return _AUTH_HELP_OAUTH_EXPIRED
+    if "authentication_error" in err or "Invalid authentication credentials" in err:
+        return _AUTH_HELP_INVALID_KEY
+    return None
 
 
-_modules = discover_modules()
-_mcp = collect_mcp_servers(_modules)
+# ── Executor ──────────────────────────────────────────────────────────────
 
 
-class ClaudeExecutor:
+class ClaudeExecutor(Executor):
+    """Concrete executor that drives Anthropic's Claude Agent SDK."""
+
+    # SDK passes prompt + system prompt as CLI args; the combined size must
+    # fit under Linux ARG_MAX (~2MB).  Stay well clear of the ceiling.
+    _MAX_CLI_BUDGET = 1_500_000  # 1.5MB
+
     def __init__(
         self,
-        config: Config,
-        runtime: RuntimeConfig,
+        config: ClaudeConfig,
+        runtime: ClaudeRuntimeConfig,
         superpos: SuperposClient | None,
         gateway: TelegramGateway | None,
         persona: str | None = None,
     ) -> None:
+        super().__init__(max_parallel=config.executor_max_parallel)
         self._config = config
         self._runtime = runtime
         self._superpos = superpos
         self._gateway = gateway
         self._persona = persona
-        self._sessions = SessionStore()
+        self._sessions = SessionStore(
+            path=os.path.join(config.home_dir, "session_store.json"),
+        )
         self._recent_tasks = RecentTasksLog(max_per_chat=5)
-        self.queue: asyncio.Queue[ExecutionRequest] = asyncio.Queue()
-        self._in_flight_superpos_tasks: set[str] = set()
-        self._semaphore = asyncio.Semaphore(config.claude_max_parallel)
+        self._semaphore = asyncio.Semaphore(config.executor_max_parallel)
         self._worktree_locks: dict[str, asyncio.Lock] = {}
-        self._active_count: int = 0
 
-    def update_persona(self, prompt: str | None) -> None:
-        """Update the persona used for future executions."""
+        modules = discover_modules(config.modules_dir)
+        self._mcp = collect_mcp_servers(modules)
+        if self._mcp:
+            log.info("Loaded %d MCP server(s) from %s", len(self._mcp), config.modules_dir)
+
+    # ── Abstract method impls ────────────────────────────────────────────
+
+    def update_persona(self, prompt: str | None, version: int | None = None) -> None:
+        """Replace the persona used for subsequent executions.
+
+        ``version`` is accepted for interface parity but Claude doesn't
+        track per-persona versions — the in-memory string is the source.
+        """
         self._persona = prompt
 
-    @property
-    def pending(self) -> int:
-        return self.queue.qsize()
-
-    @property
-    def is_busy(self) -> bool:
-        """True if any task is currently executing."""
-        return self._active_count > 0
-
-    @property
-    def has_free_slots(self) -> bool:
-        """True if the executor can accept more concurrent tasks.
-
-        Uses the in-flight task set (populated at claim time, cleared after
-        execution) to accurately count tasks that are queued, waiting for
-        the semaphore, OR actively executing.  ``queue.qsize()`` and
-        ``_active_count`` both miss the semaphore-waiting gap.
-        """
-        return len(self._in_flight_superpos_tasks) < self._config.claude_max_parallel
-
-    def add_superpos_task(self, task_id: str) -> None:
-        self._in_flight_superpos_tasks.add(task_id)
-
-    def remove_superpos_task(self, task_id: str) -> None:
-        self._in_flight_superpos_tasks.discard(task_id)
-
-    def has_superpos_task(self, task_id: str) -> bool:
-        return task_id in self._in_flight_superpos_tasks
-
     def clear_session(self, chat_id: int | str) -> None:
-        """Clear the stored session for a chat, starting fresh next message."""
         self._sessions.clear(chat_id)
+
+    async def run(self) -> None:
+        log.info(
+            "Claude executor started (max_parallel=%d)",
+            self._config.executor_max_parallel,
+        )
+        while True:
+            req = await self.queue.get()
+            asyncio.create_task(self._run_one(req))
+
+    # ── Optional hooks ───────────────────────────────────────────────────
+
+    async def preflight(self) -> None:
+        """Verify Claude credentials by making a minimal SDK call."""
+        log.info("Verifying Claude authentication...")
+        try:
+            async for _ in query(
+                prompt="hi",
+                options=ClaudeCodeOptions(max_turns=1, permission_mode="default"),
+            ):
+                pass  # consume all messages — breaking early corrupts anyio cancel scopes
+            log.info("Claude authentication OK")
+        except (ClaudeSDKError, Exception) as e:
+            msg = _auth_error_message(str(e))
+            if msg:
+                print(msg, file=sys.stderr)
+                sys.exit(1)
+            raise
+
+    def cleanup_stale_sessions(self, max_age_hours: int = 24) -> dict[str, int]:
+        """Remove old Claude session data while preserving active resumes.
+
+        ``SessionStore`` persists chat_id → session_id, and the executor
+        passes that id as ``--resume`` on the next Telegram message.  If a
+        chat has been idle for longer than ``max_age_hours`` its session
+        directory under ``~/.claude/projects/`` would otherwise be deleted,
+        the next ``--resume`` would silently fall through to a fresh
+        session, and the user would experience "agent lost the
+        conversation on restart".  We preserve every id still mapped.
+        """
+        counts = {"projects": 0, "session_env": 0, "bytes_freed": 0}
+        cutoff = time.time() - (max_age_hours * 3600)
+        # SessionStore exposes get/set/clear but no iteration helper; reach
+        # into the private map for now.  TODO: add `active_session_ids()` to
+        # core's SessionStore so this can use a public API.
+        preserve: set[str] = {
+            sid for sid in getattr(self._sessions, "_data", {}).values() if sid
+        }
+
+        claude_dir = os.path.join(os.environ.get("HOME", "/tmp"), ".claude")
+
+        def _session_id_from_name(name: str) -> str:
+            # Both `<sid>` (dir) and `<sid>.jsonl` (transcript) live in projects/.
+            return name[:-6] if name.endswith(".jsonl") else name
+
+        projects_dir = os.path.join(claude_dir, "projects", "-workspace")
+        if os.path.isdir(projects_dir):
+            for name in os.listdir(projects_dir):
+                path = os.path.join(projects_dir, name)
+                if not os.path.isdir(path):
+                    continue
+                if _session_id_from_name(name) in preserve:
+                    continue
+                try:
+                    mtime = os.path.getmtime(path)
+                    if mtime < cutoff:
+                        size = sum(
+                            os.path.getsize(os.path.join(dp, f))
+                            for dp, _, fns in os.walk(path)
+                            for f in fns
+                        )
+                        shutil.rmtree(path)
+                        counts["projects"] += 1
+                        counts["bytes_freed"] += size
+                except OSError:
+                    pass
+
+        session_env_dir = os.path.join(claude_dir, "session_env")
+        if os.path.isdir(session_env_dir):
+            for name in os.listdir(session_env_dir):
+                path = os.path.join(session_env_dir, name)
+                if not os.path.isdir(path):
+                    continue
+                if _session_id_from_name(name) in preserve:
+                    continue
+                try:
+                    mtime = os.path.getmtime(path)
+                    if mtime < cutoff:
+                        size = sum(
+                            os.path.getsize(os.path.join(dp, f))
+                            for dp, _, fns in os.walk(path)
+                            for f in fns
+                        )
+                        shutil.rmtree(path)
+                        counts["session_env"] += 1
+                        counts["bytes_freed"] += size
+                except OSError:
+                    pass
+
+        if preserve:
+            log.info(
+                "cleanup_stale_sessions: preserved %d active session(s)",
+                len(preserve),
+            )
+        return counts
+
+    # ── Worktree slot management ─────────────────────────────────────────
 
     def _get_worktree_lock(self, slot: str) -> asyncio.Lock:
         if slot not in self._worktree_locks:
@@ -234,25 +369,18 @@ class ClaudeExecutor:
     def _resolve_slot(self, req: ExecutionRequest) -> str:
         if (
             req.branch
-            and self._config.claude_worktree_isolation
-            and is_git_repo(self._config.claude_working_dir)
+            and self._config.executor_worktree_isolation
+            and is_git_repo(self._config.executor_working_dir)
         ):
-            return worktree_path(self._config.claude_working_dir, req.branch)
+            return worktree_path(self._config.executor_working_dir, req.branch)
         return "__main__"
 
-    async def run(self) -> None:
-        """Infinite loop: pull requests from queue, dispatch concurrent workers."""
-        log.info("Claude executor started (max_parallel=%d)", self._config.claude_max_parallel)
-        while True:
-            req = await self.queue.get()
-            asyncio.create_task(self._run_one(req))
+    # ── Main consumer loop ───────────────────────────────────────────────
 
     async def _run_one(self, req: ExecutionRequest) -> None:
         claim_expired = asyncio.Event()
         progress_task: asyncio.Task | None = None
 
-        # Start heartbeat IMMEDIATELY — before semaphore/worktree waits.
-        # This keeps the server-side claim alive while queued.
         if req.source == "superpos" and req.superpos_task_id and self._superpos:
             progress_task = asyncio.create_task(
                 self._report_progress(req.superpos_task_id, claim_expired)
@@ -261,13 +389,15 @@ class ClaudeExecutor:
         try:
             async with self._semaphore:
                 if claim_expired.is_set():
-                    log.warning("Claim expired while waiting for semaphore: %s", req.superpos_task_id)
+                    log.warning(
+                        "Claim expired while waiting for semaphore: %s",
+                        req.superpos_task_id,
+                    )
                     return
 
                 slot = self._resolve_slot(req)
                 wt_lock = self._get_worktree_lock(slot)
 
-                # Wait for worktree lock OR claim expiry — whichever comes first
                 lock_acquired = False
                 try:
                     lock_task = asyncio.create_task(wt_lock.acquire())
@@ -284,10 +414,12 @@ class ClaudeExecutor:
                             pass
 
                     if claim_expired.is_set():
-                        # Release lock if we got it while also expiring
                         if lock_task in done and lock_task.result():
                             wt_lock.release()
-                        log.warning("Claim expired while waiting for worktree lock: %s", req.superpos_task_id)
+                        log.warning(
+                            "Claim expired while waiting for worktree lock: %s",
+                            req.superpos_task_id,
+                        )
                         return
 
                     lock_acquired = True
@@ -315,9 +447,8 @@ class ClaudeExecutor:
             self.queue.task_done()
 
     async def _report_progress(
-        self, task_id: str, claim_expired: asyncio.Event, interval: int = 30
+        self, task_id: str, claim_expired: asyncio.Event, interval: int = 30,
     ) -> None:
-        """Send periodic progress updates to keep the Superpos task alive."""
         progress = 5
         while True:
             await asyncio.sleep(interval)
@@ -326,7 +457,9 @@ class ClaudeExecutor:
                 await self._superpos.update_progress(task_id, progress)
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 409:
-                    log.warning("Claim expired for task %s (409); aborting execution", task_id)
+                    log.warning(
+                        "Claim expired for task %s (409); aborting execution", task_id,
+                    )
                     claim_expired.set()
                     return
                 log.debug("Progress update failed for task %s", task_id)
@@ -348,8 +481,6 @@ class ClaudeExecutor:
             await streamer.start()
         except Exception:
             log.debug("Streamer start failed (non-fatal)")
-        t0 = time.monotonic()
-        full_text = ""
 
         inner_task: asyncio.Task | None = None
         watcher_task: asyncio.Task | None = None
@@ -364,10 +495,10 @@ class ClaudeExecutor:
             if req.source == "superpos" and req.superpos_task_id:
                 watcher_task = asyncio.create_task(_watch_claim_expiry())
             try:
-                # Max execution timeout — safety net against zombie pipes
-                # where the Claude subprocess dies but grandchild processes
-                # keep stdout open, hanging the async-for loop forever.
-                max_timeout = self._config.claude_max_turns * 120  # ~2min per turn
+                # Safety net against zombie pipes where the Claude subprocess
+                # dies but grandchildren keep stdout open, hanging the
+                # async-for loop forever.
+                max_timeout = self._config.executor_max_turns * 120  # ~2min/turn
                 await asyncio.wait_for(inner_task, timeout=max_timeout)
             except asyncio.TimeoutError:
                 log.warning(
@@ -394,13 +525,10 @@ class ClaudeExecutor:
                     await watcher_task
                 except asyncio.CancelledError:
                     pass
-            # Always drain/close the streamer — idempotent, bounded by
-            # its own timeout so a wedged Telegram gateway can't hang us.
             try:
                 await streamer.finish()
             except Exception:
                 log.debug("Streamer finish failed (non-fatal)", exc_info=True)
-            # Clean up temp media files
             if req.image_paths:
                 for p in req.image_paths:
                     try:
@@ -413,6 +541,8 @@ class ClaudeExecutor:
                     await self._superpos.update_status("online")
                 except Exception:
                     log.debug("Failed to set agent status to online")
+
+    # ── Background tasks ─────────────────────────────────────────────────
 
     async def run_dream(self, task_id: str, prompt: str) -> None:
         """Backwards-compatible alias for dream tasks."""
@@ -430,7 +560,7 @@ class ClaudeExecutor:
         No streamer, no semaphore.  The inner ``query`` loop runs inside a
         child task so we can forcibly cancel it when the Superpos claim
         expires or the overall timeout fires — otherwise a silent Claude
-        subprocess hangs the reader forever (TASK-stuck-dream scenario).
+        subprocess hangs the reader forever.
         """
         label = task_type.replace("_", " ")
         log.info("%s task %s starting in background", label.capitalize(), task_id)
@@ -482,7 +612,8 @@ class ClaudeExecutor:
                 if claim_expired.is_set():
                     expired = True
                     log.warning(
-                        "%s task %s cancelled: claim expired", label.capitalize(), task_id,
+                        "%s task %s cancelled: claim expired",
+                        label.capitalize(), task_id,
                     )
                 else:
                     raise
@@ -494,7 +625,8 @@ class ClaudeExecutor:
                 if self._superpos and not claim_expired.is_set():
                     try:
                         await self._superpos.fail_task(
-                            task_id, f"{label.capitalize()} timed out after {timeout_seconds}s",
+                            task_id,
+                            f"{label.capitalize()} timed out after {timeout_seconds}s",
                         )
                     except Exception:
                         log.debug("Failed to mark timed-out task %s", task_id)
@@ -529,10 +661,7 @@ class ClaudeExecutor:
                 except asyncio.CancelledError:
                     pass
 
-    # The Claude SDK passes both the prompt (--print) and system prompt
-    # (--append-system-prompt) as CLI arguments.  Linux ARG_MAX is ~2MB,
-    # so the combined size must stay well under that.
-    _MAX_CLI_BUDGET = 1_500_000  # 1.5MB safe limit
+    # ── Options construction & inner execute ─────────────────────────────
 
     def _build_options(
         self,
@@ -540,16 +669,15 @@ class ClaudeExecutor:
         cwd: str | None = None,
         system_prompt_append: str | None = None,
     ) -> ClaudeCodeOptions:
-        """Build ClaudeCodeOptions, optionally resuming a session or overriding cwd."""
         opts: dict = {
             "model": self._runtime.model,
-            "max_turns": self._config.claude_max_turns,
+            "max_turns": self._config.executor_max_turns,
             "permission_mode": "bypassPermissions",
-            "cwd": cwd or self._config.claude_working_dir,
+            "cwd": cwd or self._config.executor_working_dir,
             "extra_args": {"effort": self._runtime.effort},
         }
-        if _mcp:
-            opts["mcp_servers"] = _mcp
+        if self._mcp:
+            opts["mcp_servers"] = self._mcp
         if resume_session:
             opts["resume"] = resume_session
         parts = []
@@ -564,7 +692,7 @@ class ClaudeExecutor:
                     "System prompt too large (%dKB), truncating to fit CLI limits",
                     len(system_prompt) // 1024,
                 )
-                system_prompt = system_prompt[:self._MAX_CLI_BUDGET]
+                system_prompt = system_prompt[: self._MAX_CLI_BUDGET]
             opts["append_system_prompt"] = system_prompt
         return ClaudeCodeOptions(**opts)
 
@@ -574,32 +702,26 @@ class ClaudeExecutor:
         t0 = time.monotonic()
         full_text = ""
 
-        # Resolve worktree cwd for tasks that carry an explicit branch
         cwd_override: str | None = None
         if (
             req.branch
-            and self._config.claude_worktree_isolation
-            and is_git_repo(self._config.claude_working_dir)
+            and self._config.executor_worktree_isolation
+            and is_git_repo(self._config.executor_working_dir)
         ):
             try:
                 cwd_override = await ensure_worktree(
-                    self._config.claude_working_dir, req.branch
+                    self._config.executor_working_dir, req.branch,
                 )
             except Exception:
                 log.warning(
                     "Failed to create worktree for branch %r; falling back to default cwd",
-                    req.branch,
-                    exc_info=True,
+                    req.branch, exc_info=True,
                 )
 
-        # Inject branching instructions for tasks without an explicit branch
         system_prompt_append: str | None = None
-        wt_base = self._config.claude_working_dir
-        if (
-            not req.branch
-            and is_git_repo(wt_base)
-        ):
-            if self._config.claude_worktree_isolation:
+        wt_base = self._config.executor_working_dir
+        if not req.branch and is_git_repo(wt_base):
+            if self._config.executor_worktree_isolation:
                 system_prompt_append = (
                     "## Worktree Isolation\n"
                     "When this task requires implementing code changes on a new branch:\n"
@@ -624,11 +746,6 @@ class ClaudeExecutor:
                     "For conversational replies or read-only tasks, skip this entirely."
                 )
 
-        # Telegram messages resume the chat session; Superpos tasks run fresh.
-        # For Telegram, also prime the session with summaries of recent
-        # Superpos tasks the user saw notifications about in this chat —
-        # those tasks ran in isolated sessions, so the conversation has no
-        # memory of them otherwise.
         resume_id = None
         if req.source == "telegram":
             resume_id = self._sessions.get(req.chat_id)
@@ -639,7 +756,6 @@ class ClaudeExecutor:
                     if system_prompt_append else recent
                 )
 
-        # Prepend image references so Claude reads them via the Read tool
         prompt_text = req.prompt
         if req.image_paths:
             image_refs = "\n".join(f"- {p}" for p in req.image_paths)
@@ -648,8 +764,6 @@ class ClaudeExecutor:
                 f"{image_refs}\n\n{prompt_text}"
             )
 
-        # Cap prompt size — the SDK passes it as a CLI arg (--print),
-        # which combined with --append-system-prompt must fit in ARG_MAX.
         prompt_budget = self._MAX_CLI_BUDGET - len(self._persona or "")
         if len(prompt_text) > prompt_budget:
             log.warning("Prompt too large (%dKB), truncating", len(prompt_text) // 1024)
@@ -658,13 +772,9 @@ class ClaudeExecutor:
         # Track the most recent session_id across attempts so a CLI crash
         # mid-task can be resumed (avoids duplicate side effects from retry).
         last_session_id: str | None = None
-        # The prompt may be swapped for a continuation message when resuming
-        # after a crash — Claude already has full context from the session.
         effective_prompt = prompt_text
 
         for attempt in range(1, retries + 1):
-            # Each attempt gets its own capture slot — populated by our anyio
-            # open_process patch when the SDK spawns the `claude` CLI.
             capture: dict = {}
             capture_token = _stderr_capture_var.set(capture)
             try:
@@ -673,14 +783,11 @@ class ClaudeExecutor:
                     cwd=cwd_override,
                     system_prompt_append=system_prompt_append,
                 )
-                async for message in query(
-                    prompt=effective_prompt,
-                    options=options,
-                ):
+                async for message in query(prompt=effective_prompt, options=options):
                     # Capture session_id from init (fires on every run) and
-                    # result (terminal, success only). Init is what survives
-                    # a CLI crash mid-stream — ResultMessage doesn't fire if
-                    # the subprocess dies before completing, so relying on it
+                    # result (terminal, success only).  Init survives a CLI
+                    # crash mid-stream — ResultMessage doesn't fire if the
+                    # subprocess dies before completing, so relying on it
                     # alone leaves crash-retry without a session to resume.
                     if isinstance(message, SystemMessage) and message.subtype == "init":
                         sid = message.data.get("session_id")
@@ -706,7 +813,6 @@ class ClaudeExecutor:
 
                 await streamer.finish()
 
-                # Complete Superpos task if applicable
                 if req.source == "superpos" and req.superpos_task_id and self._superpos:
                     result = full_text[-2000:] if len(full_text) > 2000 else full_text
                     elapsed = int(time.monotonic() - t0)
@@ -724,9 +830,6 @@ class ClaudeExecutor:
                             "Failed to complete superpos task %s — claim may have expired",
                             req.superpos_task_id, exc_info=True,
                         )
-                    # Record regardless of complete_task outcome — the work
-                    # ran, the user saw the streamed output, and a future
-                    # Telegram follow-up should still have the context.
                     self._recent_tasks.record(
                         req.chat_id,
                         TaskSummary(
@@ -740,9 +843,6 @@ class ClaudeExecutor:
 
             except (ClaudeSDKError, Exception) as e:
                 err_str = str(e)
-                # CLI's stderr (if captured) — diagnoses why the subprocess
-                # crashed (OOM, disk full, panic, etc.). Empty string if no
-                # capture happened (e.g. error before subprocess spawn).
                 captured_stderr = _read_captured_stderr(capture.get("path"))
                 is_rate_limit = "rate_limit" in err_str.lower()
                 is_oauth_expired = (
@@ -759,8 +859,7 @@ class ClaudeExecutor:
                     if is_oauth_expired:
                         log.critical(
                             "Claude OAuth session expired. "
-                            "Re-run the OAuth flow (see README step 3) then restart. "
-                            "Shutting down."
+                            "Re-run the OAuth flow then restart. Shutting down."
                         )
                     else:
                         log.critical(
@@ -769,8 +868,6 @@ class ClaudeExecutor:
                         )
                     sys.exit(1)
 
-                # Transient API errors (500, overloaded) are safe to retry
-                # even with output — Claude resumes the session.
                 is_api_500 = (
                     "internal server error" in err_str.lower()
                     or "api_error" in err_str.lower()
@@ -786,18 +883,8 @@ class ClaudeExecutor:
                     await asyncio.sleep(wait)
                     continue
 
-                # CLI subprocess crash (e.g. exit code 1, OOM kill, signal).
-                # If we have a session_id from a prior turn, resume it — Claude
-                # sees its own prior outputs and won't re-run completed tool calls,
-                # so this is safe even when full_text is non-empty.
-                #
-                # Two paths can surface a CLI crash:
-                #   1. ProcessError raised directly by transport.read_messages()
-                #   2. The SDK's _read_messages task swallows the ProcessError
-                #      and re-raises as a plain Exception via an in-band
-                #      {"type":"error"} queue message (query.py:491). In that
-                #      case isinstance(e, ProcessError) is False, so we also
-                #      match on the message string.
+                # CLI subprocess crash — resume the session so completed tool
+                # calls aren't re-run.
                 is_cli_crash = (
                     isinstance(e, ProcessError)
                     or "Command failed with exit code" in err_str
@@ -828,8 +915,6 @@ class ClaudeExecutor:
                     )
                     continue
 
-                # Don't retry if execution already produced output — side
-                # effects (GitHub comments, commits, etc.) cannot be undone.
                 if full_text.strip():
                     log.warning(
                         "Execution produced output but failed (attempt %d/%d); "
@@ -838,11 +923,13 @@ class ClaudeExecutor:
                     )
                 elif is_rate_limit and attempt < retries:
                     wait = 30 * attempt
-                    log.warning("Rate limited (attempt %d/%d), retrying in %ds", attempt, retries, wait)
+                    log.warning(
+                        "Rate limited (attempt %d/%d), retrying in %ds",
+                        attempt, retries, wait,
+                    )
                     await streamer.append(f"\n⏳ Rate limited, retrying in {wait}s...\n")
                     await asyncio.sleep(wait)
                     continue
-                # If resume failed (stale session), retry without resume
                 elif resume_id and attempt < retries:
                     log.warning("Session resume failed, retrying with fresh session")
                     self._sessions.clear(req.chat_id)
@@ -890,7 +977,10 @@ class ClaudeExecutor:
                             req.superpos_task_id, err_str, summary=summary,
                         )
                     except Exception:
-                        log.warning("Failed to mark superpos task %s as failed", req.superpos_task_id)
+                        log.warning(
+                            "Failed to mark superpos task %s as failed",
+                            req.superpos_task_id,
+                        )
                     self._recent_tasks.record(
                         req.chat_id,
                         TaskSummary(
@@ -903,22 +993,23 @@ class ClaudeExecutor:
                 return
 
             finally:
-                # Always-run cleanup. CancelledError (BaseException) bypasses
-                # the except clause above, so without finally the delete=False
-                # tempfiles leak — claim-expiry and timeout cancellation in a
-                # long-running worker would accumulate orphaned files in /tmp.
+                # CancelledError (BaseException) bypasses the except clause
+                # above, so without finally the delete=False tempfiles leak —
+                # claim-expiry/timeout cancellation would accumulate orphans.
                 try:
                     _stderr_capture_var.reset(capture_token)
                 except (ValueError, LookupError):
                     pass
                 _cleanup_captured_stderr(capture.get("path"))
 
+    # ── Message parsing ──────────────────────────────────────────────────
+
     @staticmethod
     def _extract_text(message: Message) -> str:
         """Extract assistant text from a Claude SDK message.
 
-        Only extract from AssistantMessage — ResultMessage contains
-        a duplicate of the already-streamed text.
+        Only extract from AssistantMessage — ResultMessage contains a
+        duplicate of the already-streamed text.
         """
         if isinstance(message, AssistantMessage):
             parts = []
@@ -930,7 +1021,6 @@ class ClaudeExecutor:
 
     @staticmethod
     def _extract_tool_use(message: Message) -> tuple[str, object] | None:
-        """Extract tool use info if present."""
         if isinstance(message, AssistantMessage):
             for block in message.content:
                 if hasattr(block, "name") and hasattr(block, "input"):
