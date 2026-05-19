@@ -1023,3 +1023,82 @@ async def test_superpos_task_failure_records_summary(
     assert "sp-task-fail" in rendered
     assert "failed" in rendered
     assert "simulated failure" in rendered
+
+
+# --- Preflight cleanup ---
+
+async def test_preflight_flips_offline_before_exit_on_auth_failure(
+    executor, mock_superpos,
+):
+    """Core's run_agent calls update_status('online') before executor.preflight(),
+    so a sys.exit(1) on bad credentials would otherwise leave the agent showing
+    as online in Superpos until heartbeat timeout. Verify preflight flips it
+    offline on its way out.
+    """
+    auth_error = Exception(
+        '{"type":"error","error":{"type":"authentication_error",'
+        '"message":"Invalid authentication credentials"}}'
+    )
+
+    async def _raise_auth_error():
+        raise auth_error
+        yield  # noqa — async generator marker
+
+    with patch(
+        "slim_agent_claude.claude_executor.query",
+        side_effect=lambda *a, **kw: _raise_auth_error(),
+    ), patch("sys.exit") as mock_exit:
+        await executor.preflight()
+
+    mock_exit.assert_called_once_with(1)
+    # Critical: offline status must be sent BEFORE the exit
+    mock_superpos.update_status.assert_awaited_with("offline")
+
+
+async def test_preflight_flips_offline_on_unknown_failure(
+    executor, mock_superpos,
+):
+    """The auth-message-pattern matcher only recognises a few known errors;
+    everything else re-raises so run_agent itself exits. The offline flip
+    must happen on this path too.
+    """
+    unknown_error = RuntimeError("something went sideways")
+
+    async def _raise_unknown():
+        raise unknown_error
+        yield  # noqa
+
+    with patch(
+        "slim_agent_claude.claude_executor.query",
+        side_effect=lambda *a, **kw: _raise_unknown(),
+    ):
+        with pytest.raises(RuntimeError):
+            await executor.preflight()
+
+    mock_superpos.update_status.assert_awaited_with("offline")
+
+
+async def test_preflight_no_offline_call_when_no_superpos(
+    mock_config, mock_runtime, mock_gateway,
+):
+    """When Superpos integration is disabled the executor has no client to
+    notify — preflight must still bail cleanly without raising AttributeError.
+    """
+    executor = ClaudeExecutor(mock_config, mock_runtime, None, mock_gateway)
+
+    auth_error = Exception(
+        '{"type":"error","error":{"type":"authentication_error",'
+        '"message":"Invalid authentication credentials"}}'
+    )
+
+    async def _raise_auth_error():
+        raise auth_error
+        yield  # noqa
+
+    with patch(
+        "slim_agent_claude.claude_executor.query",
+        side_effect=lambda *a, **kw: _raise_auth_error(),
+    ), patch("sys.exit") as mock_exit:
+        await executor.preflight()
+
+    mock_exit.assert_called_once_with(1)

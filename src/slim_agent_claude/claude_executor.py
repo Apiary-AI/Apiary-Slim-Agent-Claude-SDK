@@ -266,7 +266,15 @@ class ClaudeExecutor(Executor):
     # ── Optional hooks ───────────────────────────────────────────────────
 
     async def preflight(self) -> None:
-        """Verify Claude credentials by making a minimal SDK call."""
+        """Verify Claude credentials by making a minimal SDK call.
+
+        Core's ``run_agent`` marks the agent ``online`` in Superpos *before*
+        invoking preflight (see slim_agent_core.main.run_agent).  If we exit
+        here on bad Claude credentials, the asyncio.gather() finally that
+        flips status back to ``offline`` never runs, and Superpos keeps
+        advertising us as online until the heartbeat timeout fires.  Flip
+        offline ourselves on any preflight failure as a best-effort guard.
+        """
         log.info("Verifying Claude authentication...")
         try:
             async for _ in query(
@@ -276,11 +284,26 @@ class ClaudeExecutor(Executor):
                 pass  # consume all messages — breaking early corrupts anyio cancel scopes
             log.info("Claude authentication OK")
         except (ClaudeSDKError, Exception) as e:
+            await self._mark_offline_best_effort()
             msg = _auth_error_message(str(e))
             if msg:
                 print(msg, file=sys.stderr)
                 sys.exit(1)
-            raise
+            else:
+                raise
+
+    async def _mark_offline_best_effort(self) -> None:
+        """Flip Superpos status to ``offline`` ignoring any errors."""
+        if not self._superpos:
+            return
+        try:
+            await self._superpos.update_status("offline")
+            log.info("Agent status set to offline (preflight failure)")
+        except Exception:
+            log.debug(
+                "Failed to flip status offline during preflight cleanup",
+                exc_info=True,
+            )
 
     def cleanup_stale_sessions(self, max_age_hours: int = 24) -> dict[str, int]:
         """Remove old Claude session data while preserving active resumes.
