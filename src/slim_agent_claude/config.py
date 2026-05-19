@@ -15,7 +15,6 @@ class ClaudeConfig(BaseConfig):
     anthropic_api_key: str = ""
     claude_model: str = "claude-opus-4-6"
     claude_effort: str = "high"
-    claude_max_budget_usd: float = 5.0
 
     def __post_init__(self) -> None:
         if not self.executor_kind or self.executor_kind == "generic":
@@ -56,8 +55,5 @@ class ClaudeConfig(BaseConfig):
             anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
             claude_model=os.environ.get("CLAUDE_MODEL", "claude-opus-4-6"),
             claude_effort=os.environ.get("CLAUDE_EFFORT", "high"),
-            claude_max_budget_usd=float(
-                os.environ.get("CLAUDE_MAX_BUDGET_USD", "5.0")
-            ),
         )
         return cls(**base)
