@@ -1,20 +1,23 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from src.config import Config
-from src.claude_executor import ClaudeExecutor
-from src.runtime_config import RuntimeConfig
+from slim_agent_claude.config import ClaudeConfig as Config
+from slim_agent_claude.claude_executor import ClaudeExecutor
+from slim_agent_claude.runtime_config import ClaudeRuntimeConfig as RuntimeConfig
 
 
 @pytest.fixture
-def mock_config():
+def mock_config(tmp_path):
     cfg = MagicMock(spec=Config)
     cfg.claude_model = "claude-opus-4-5"
-    cfg.claude_max_turns = 5
-    cfg.claude_working_dir = "/tmp"
+    cfg.executor_max_turns = 5
+    cfg.executor_working_dir = "/tmp"
+    cfg.executor_worktree_isolation = False
     cfg.superpos_poll_interval = 1
     cfg.telegram_chat_id = "123"
-    cfg.claude_max_parallel = 3
+    cfg.executor_max_parallel = 3
+    cfg.home_dir = str(tmp_path)
+    cfg.modules_dir = str(tmp_path / "modules")
     return cfg
 
 
@@ -42,8 +45,12 @@ def mock_gateway():
 
 
 @pytest.fixture
-def mock_runtime():
-    return RuntimeConfig(model="claude-opus-4-5", effort="high")
+def mock_runtime(tmp_path):
+    return RuntimeConfig(
+        model="claude-opus-4-5",
+        effort="high",
+        path=str(tmp_path / "runtime_config.json"),
+    )
 
 
 @pytest.fixture

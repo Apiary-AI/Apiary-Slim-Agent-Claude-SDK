@@ -4,8 +4,8 @@ import httpx
 import pytest
 from unittest.mock import AsyncMock, Mock, patch
 
-from src.claude_executor import ClaudeExecutor, ExecutionRequest
-from src.config import Config
+from slim_agent_claude.claude_executor import ClaudeExecutor, ExecutionRequest
+from slim_agent_claude.config import ClaudeConfig as Config
 
 
 # --- Dedup method unit tests (pure sync logic) ---
@@ -83,7 +83,7 @@ async def test_execute_removes_task_after_claim_expiry(executor):
 
     with patch.object(executor, "_report_progress", fake_report_progress), \
          patch.object(executor, "_execute_inner", fake_execute_inner), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         MockStreamer.return_value.start = AsyncMock()
         # Put on queue so task_done() in _run_one works correctly
         await executor.queue.put(req)
@@ -96,13 +96,13 @@ async def test_execute_removes_task_after_claim_expiry(executor):
 # --- _build_options uses cwd override when provided ---
 
 def test_build_options_default_cwd(executor, mock_config):
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_working_dir = "/workspace"
     opts = executor._build_options()
     assert str(opts.cwd) == "/workspace"
 
 
 def test_build_options_cwd_override(executor, mock_config):
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_working_dir = "/workspace"
     opts = executor._build_options(cwd="/workspace/.worktrees/feature-x")
     assert str(opts.cwd) == "/workspace/.worktrees/feature-x"
 
@@ -134,8 +134,8 @@ def test_build_options_system_prompt_append_only(executor):
 async def test_execute_inner_calls_ensure_worktree_for_superpos_with_branch(
     executor, mock_superpos, mock_config
 ):
-    mock_config.claude_worktree_isolation = True
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = True
+    mock_config.executor_working_dir = "/workspace"
 
     req = ExecutionRequest(
         prompt="review PR", chat_id="123", source="superpos",
@@ -146,10 +146,10 @@ async def test_execute_inner_calls_ensure_worktree_for_superpos_with_branch(
         return
         yield  # makes it an async generator
 
-    with patch("src.claude_executor.is_git_repo", return_value=True), \
-         patch("src.claude_executor.ensure_worktree", new_callable=AsyncMock) as mock_ensure, \
-         patch("src.claude_executor.query", return_value=_empty()), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True), \
+         patch("slim_agent_claude.claude_executor.ensure_worktree", new_callable=AsyncMock) as mock_ensure, \
+         patch("slim_agent_claude.claude_executor.query", return_value=_empty()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         mock_ensure.return_value = "/workspace/.worktrees/feature-my-branch"
         streamer = MockStreamer.return_value
         streamer.finish = AsyncMock()
@@ -163,8 +163,8 @@ async def test_execute_inner_calls_ensure_worktree_for_superpos_with_branch(
 async def test_execute_inner_telegram_with_explicit_branch_creates_worktree(
     executor, mock_config
 ):
-    mock_config.claude_worktree_isolation = True
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = True
+    mock_config.executor_working_dir = "/workspace"
 
     req = ExecutionRequest(
         prompt="hello", chat_id="123", source="telegram", branch="feature/x",
@@ -174,10 +174,10 @@ async def test_execute_inner_telegram_with_explicit_branch_creates_worktree(
         return
         yield
 
-    with patch("src.claude_executor.is_git_repo", return_value=True), \
-         patch("src.claude_executor.ensure_worktree", new_callable=AsyncMock) as mock_ensure, \
-         patch("src.claude_executor.query", return_value=_empty()), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True), \
+         patch("slim_agent_claude.claude_executor.ensure_worktree", new_callable=AsyncMock) as mock_ensure, \
+         patch("slim_agent_claude.claude_executor.query", return_value=_empty()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         mock_ensure.return_value = "/workspace/.worktrees/feature-x"
         streamer = MockStreamer.return_value
         streamer.finish = AsyncMock()
@@ -189,8 +189,8 @@ async def test_execute_inner_telegram_with_explicit_branch_creates_worktree(
 # --- _execute_inner skips worktree when isolation disabled ---
 
 async def test_execute_inner_skips_worktree_when_isolation_disabled(executor, mock_config):
-    mock_config.claude_worktree_isolation = False
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
 
     req = ExecutionRequest(
         prompt="do it", chat_id="123", source="superpos",
@@ -201,10 +201,10 @@ async def test_execute_inner_skips_worktree_when_isolation_disabled(executor, mo
         return
         yield
 
-    with patch("src.claude_executor.is_git_repo", return_value=True), \
-         patch("src.claude_executor.ensure_worktree", new_callable=AsyncMock) as mock_ensure, \
-         patch("src.claude_executor.query", return_value=_empty()), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True), \
+         patch("slim_agent_claude.claude_executor.ensure_worktree", new_callable=AsyncMock) as mock_ensure, \
+         patch("slim_agent_claude.claude_executor.query", return_value=_empty()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         streamer = MockStreamer.return_value
         streamer.finish = AsyncMock()
         await executor._execute_inner(req, streamer, retries=1)
@@ -215,8 +215,8 @@ async def test_execute_inner_skips_worktree_when_isolation_disabled(executor, mo
 # --- _execute_inner falls back gracefully when ensure_worktree fails ---
 
 async def test_execute_inner_falls_back_when_worktree_fails(executor, mock_config):
-    mock_config.claude_worktree_isolation = True
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = True
+    mock_config.executor_working_dir = "/workspace"
 
     req = ExecutionRequest(
         prompt="do it", chat_id="123", source="superpos",
@@ -234,11 +234,11 @@ async def test_execute_inner_falls_back_when_worktree_fails(executor, mock_confi
         return
         yield
 
-    with patch("src.claude_executor.is_git_repo", return_value=True), \
-         patch("src.claude_executor.ensure_worktree", new_callable=AsyncMock) as mock_ensure, \
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True), \
+         patch("slim_agent_claude.claude_executor.ensure_worktree", new_callable=AsyncMock) as mock_ensure, \
          patch.object(executor, "_build_options", side_effect=capture_build), \
-         patch("src.claude_executor.query", return_value=_empty()), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+         patch("slim_agent_claude.claude_executor.query", return_value=_empty()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         mock_ensure.side_effect = RuntimeError("git error")
         streamer = MockStreamer.return_value
         streamer.finish = AsyncMock()
@@ -253,8 +253,8 @@ async def test_execute_inner_falls_back_when_worktree_fails(executor, mock_confi
 async def test_execute_inner_injects_worktree_hint_for_telegram_with_isolation(
     executor, mock_config
 ):
-    mock_config.claude_worktree_isolation = True
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = True
+    mock_config.executor_working_dir = "/workspace"
 
     req = ExecutionRequest(prompt="implement a feature", chat_id="123", source="telegram")
 
@@ -269,10 +269,10 @@ async def test_execute_inner_injects_worktree_hint_for_telegram_with_isolation(
         return
         yield
 
-    with patch("src.claude_executor.is_git_repo", return_value=True), \
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True), \
          patch.object(executor, "_build_options", side_effect=capture_build), \
-         patch("src.claude_executor.query", return_value=_empty()), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+         patch("slim_agent_claude.claude_executor.query", return_value=_empty()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         streamer = MockStreamer.return_value
         streamer.finish = AsyncMock()
         await executor._execute_inner(req, streamer, retries=1)
@@ -284,8 +284,8 @@ async def test_execute_inner_injects_worktree_hint_for_telegram_with_isolation(
 
 async def test_execute_inner_git_branching_hint_when_isolation_disabled(executor, mock_config):
     """When worktree isolation is off, agent still gets git branching instructions."""
-    mock_config.claude_worktree_isolation = False
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
 
     req = ExecutionRequest(prompt="implement a feature", chat_id="123", source="telegram")
 
@@ -300,10 +300,10 @@ async def test_execute_inner_git_branching_hint_when_isolation_disabled(executor
         return
         yield
 
-    with patch("src.claude_executor.is_git_repo", return_value=True), \
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True), \
          patch.object(executor, "_build_options", side_effect=capture_build), \
-         patch("src.claude_executor.query", return_value=_empty()), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+         patch("slim_agent_claude.claude_executor.query", return_value=_empty()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         streamer = MockStreamer.return_value
         streamer.finish = AsyncMock()
         await executor._execute_inner(req, streamer, retries=1)
@@ -314,7 +314,7 @@ async def test_execute_inner_git_branching_hint_when_isolation_disabled(executor
 
 
 async def test_execute_inner_exits_on_auth_error(executor, mock_config):
-    mock_config.claude_worktree_isolation = False
+    mock_config.executor_worktree_isolation = False
 
     req = ExecutionRequest(prompt="hello", chat_id="123", source="telegram")
 
@@ -322,8 +322,8 @@ async def test_execute_inner_exits_on_auth_error(executor, mock_config):
         '{"type":"error","error":{"type":"authentication_error","message":"Invalid authentication credentials"}}'
     )
 
-    with patch("src.claude_executor.query", side_effect=auth_error), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer, \
+    with patch("slim_agent_claude.claude_executor.query", side_effect=auth_error), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer, \
          patch("sys.exit") as mock_exit:
         streamer = MockStreamer.return_value
         streamer.finish = AsyncMock()
@@ -333,7 +333,7 @@ async def test_execute_inner_exits_on_auth_error(executor, mock_config):
 
 
 async def test_execute_inner_exits_on_oauth_expired(executor, mock_config):
-    mock_config.claude_worktree_isolation = False
+    mock_config.executor_worktree_isolation = False
 
     req = ExecutionRequest(prompt="hello", chat_id="123", source="telegram")
 
@@ -342,8 +342,8 @@ async def test_execute_inner_exits_on_oauth_expired(executor, mock_config):
         'Please obtain a new token or refresh your existing token."}}'
     )
 
-    with patch("src.claude_executor.query", side_effect=oauth_error), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer, \
+    with patch("slim_agent_claude.claude_executor.query", side_effect=oauth_error), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer, \
          patch("sys.exit") as mock_exit:
         streamer = MockStreamer.return_value
         streamer.finish = AsyncMock()
@@ -359,7 +359,7 @@ def test_has_free_slots_true_when_idle(executor):
 
 
 def test_has_free_slots_false_at_capacity(executor, mock_config):
-    for i in range(mock_config.claude_max_parallel):
+    for i in range(mock_config.executor_max_parallel):
         executor.add_superpos_task(f"task-{i}")
     assert not executor.has_free_slots
 
@@ -367,17 +367,17 @@ def test_has_free_slots_false_at_capacity(executor, mock_config):
 # --- _resolve_slot ---
 
 def test_resolve_slot_main_for_no_branch(executor, mock_config):
-    mock_config.claude_worktree_isolation = True
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = True
+    mock_config.executor_working_dir = "/workspace"
     req = ExecutionRequest(prompt="hi", chat_id="1", source="telegram")
     assert executor._resolve_slot(req) == "__main__"
 
 
 def test_resolve_slot_worktree_path_for_branch(executor, mock_config):
-    mock_config.claude_worktree_isolation = True
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = True
+    mock_config.executor_working_dir = "/workspace"
     req = ExecutionRequest(prompt="hi", chat_id="1", source="superpos", branch="feat/x")
-    with patch("src.claude_executor.is_git_repo", return_value=True):
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True):
         result = executor._resolve_slot(req)
     assert result == "/workspace/.worktrees/feat-x"
 
@@ -386,15 +386,15 @@ def test_resolve_slot_worktree_path_for_branch(executor, mock_config):
 
 async def test_status_busy_on_first_task_only(executor, mock_superpos, mock_config):
     """update_status('busy') is called once when two tasks run in parallel on different branches."""
-    mock_config.claude_worktree_isolation = True
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = True
+    mock_config.executor_working_dir = "/workspace"
 
     async def fake_execute_inner(req, streamer, retries):
         await asyncio.sleep(0.1)
 
     with patch.object(executor, "_execute_inner", fake_execute_inner), \
-         patch("src.claude_executor.is_git_repo", return_value=True), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+         patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         MockStreamer.return_value.start = AsyncMock()
         req1 = ExecutionRequest(prompt="a", chat_id="1", source="superpos", branch="branch-a")
         req2 = ExecutionRequest(prompt="b", chat_id="1", source="superpos", branch="branch-b")
@@ -415,15 +415,15 @@ async def test_status_busy_on_first_task_only(executor, mock_superpos, mock_conf
 
 async def test_status_online_when_all_done(executor, mock_superpos, mock_config):
     """update_status('online') is called only when the last task finishes."""
-    mock_config.claude_worktree_isolation = True
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = True
+    mock_config.executor_working_dir = "/workspace"
 
     async def fake_execute_inner(req, streamer, retries):
         await asyncio.sleep(0.1)
 
     with patch.object(executor, "_execute_inner", fake_execute_inner), \
-         patch("src.claude_executor.is_git_repo", return_value=True), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+         patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         MockStreamer.return_value.start = AsyncMock()
         req1 = ExecutionRequest(prompt="a", chat_id="1", source="superpos", branch="branch-a")
         req2 = ExecutionRequest(prompt="b", chat_id="1", source="superpos", branch="branch-b")
@@ -447,8 +447,8 @@ async def test_status_online_when_all_done(executor, mock_superpos, mock_config)
 
 async def test_same_branch_tasks_serialize(executor, mock_config):
     """Two tasks targeting the same branch must not overlap."""
-    mock_config.claude_worktree_isolation = True
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = True
+    mock_config.executor_working_dir = "/workspace"
 
     execution_log = []
 
@@ -458,8 +458,8 @@ async def test_same_branch_tasks_serialize(executor, mock_config):
         execution_log.append(f"end-{req.prompt}")
 
     with patch.object(executor, "_execute_inner", fake_execute_inner), \
-         patch("src.claude_executor.is_git_repo", return_value=True), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+         patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         MockStreamer.return_value.start = AsyncMock()
 
         req1 = ExecutionRequest(prompt="first", chat_id="1", source="superpos", branch="same-branch")
@@ -484,8 +484,8 @@ async def test_execute_inner_injects_worktree_hint_for_superpos_without_branch(
 ):
     """Superpos tasks without an explicit branch should get worktree instructions
     so Claude branches from origin/main instead of the current HEAD."""
-    mock_config.claude_worktree_isolation = True
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = True
+    mock_config.executor_working_dir = "/workspace"
 
     req = ExecutionRequest(
         prompt="do superpos task", chat_id="123", source="superpos",
@@ -503,10 +503,10 @@ async def test_execute_inner_injects_worktree_hint_for_superpos_without_branch(
         return
         yield
 
-    with patch("src.claude_executor.is_git_repo", return_value=True), \
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True), \
          patch.object(executor, "_build_options", side_effect=capture_build), \
-         patch("src.claude_executor.query", return_value=_empty()), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+         patch("slim_agent_claude.claude_executor.query", return_value=_empty()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         streamer = MockStreamer.return_value
         streamer.finish = AsyncMock()
         await executor._execute_inner(req, streamer, retries=1)
@@ -532,8 +532,8 @@ async def test_execute_inner_resumes_session_after_cli_crash(
     """
     from claude_code_sdk.types import ResultMessage
 
-    mock_config.claude_worktree_isolation = False
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
 
     req = ExecutionRequest(
         prompt="do work", chat_id="123", source="superpos",
@@ -574,11 +574,11 @@ async def test_execute_inner_resumes_session_after_cli_crash(
         call_count["n"] += 1
         return crash_then_succeed() if call_count["n"] == 1 else succeed()
 
-    with patch("src.claude_executor.is_git_repo", return_value=False), \
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=False), \
          patch.object(executor, "_build_options", side_effect=capture_build), \
-         patch("src.claude_executor.query", side_effect=query_side_effect), \
-         patch("src.claude_executor.asyncio.sleep", new_callable=AsyncMock), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+         patch("slim_agent_claude.claude_executor.query", side_effect=query_side_effect), \
+         patch("slim_agent_claude.claude_executor.asyncio.sleep", new_callable=AsyncMock), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         streamer = MockStreamer.return_value
         streamer.start = AsyncMock()
         streamer.finish = AsyncMock()
@@ -600,8 +600,8 @@ async def test_execute_inner_no_resume_when_crash_before_first_session_id(
     """A CLI crash before any ResultMessage carries no session_id, so we
     cannot resume — the executor must mark the task failed instead of
     looping."""
-    mock_config.claude_worktree_isolation = False
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
 
     req = ExecutionRequest(
         prompt="do work", chat_id="123", source="superpos",
@@ -615,10 +615,10 @@ async def test_execute_inner_no_resume_when_crash_before_first_session_id(
         )
         yield  # noqa — make it an async generator
 
-    with patch("src.claude_executor.is_git_repo", return_value=False), \
-         patch("src.claude_executor.query", side_effect=lambda *a, **kw: crash_immediately()), \
-         patch("src.claude_executor.asyncio.sleep", new_callable=AsyncMock), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=False), \
+         patch("slim_agent_claude.claude_executor.query", side_effect=lambda *a, **kw: crash_immediately()), \
+         patch("slim_agent_claude.claude_executor.asyncio.sleep", new_callable=AsyncMock), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         streamer = MockStreamer.return_value
         streamer.start = AsyncMock()
         streamer.finish = AsyncMock()
@@ -634,7 +634,7 @@ async def test_execute_inner_no_resume_when_crash_before_first_session_id(
 def test_read_captured_stderr_returns_tail():
     """The stderr-capture helper must tail large files to max_bytes."""
     import tempfile
-    from src.claude_executor import _read_captured_stderr
+    from slim_agent_claude.claude_executor import _read_captured_stderr
 
     with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
         # 5KB of payload — bigger than the default 4KB tail
@@ -651,7 +651,7 @@ def test_read_captured_stderr_returns_tail():
 
 
 def test_read_captured_stderr_handles_missing_or_empty():
-    from src.claude_executor import _read_captured_stderr
+    from slim_agent_claude.claude_executor import _read_captured_stderr
     assert _read_captured_stderr(None) == ""
     assert _read_captured_stderr("/nonexistent/path/xyz.log") == ""
 
@@ -663,10 +663,10 @@ async def test_execute_inner_includes_captured_stderr_in_fail_summary(
     summary must include the tail so the operator can diagnose root cause
     without trawling docker logs."""
     import tempfile
-    from src.claude_executor import _stderr_capture_var
+    from slim_agent_claude.claude_executor import _stderr_capture_var
 
-    mock_config.claude_worktree_isolation = False
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
 
     # Pre-populate a tempfile as if the CLI had crashed with this stderr
     with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
@@ -693,10 +693,10 @@ async def test_execute_inner_includes_captured_stderr_in_fail_summary(
         yield  # noqa
 
     try:
-        with patch("src.claude_executor.is_git_repo", return_value=False), \
-             patch("src.claude_executor.query", side_effect=lambda *a, **kw: crash_after_populating_capture()), \
-             patch("src.claude_executor.asyncio.sleep", new_callable=AsyncMock), \
-             patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+        with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=False), \
+             patch("slim_agent_claude.claude_executor.query", side_effect=lambda *a, **kw: crash_after_populating_capture()), \
+             patch("slim_agent_claude.claude_executor.asyncio.sleep", new_callable=AsyncMock), \
+             patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
             streamer = MockStreamer.return_value
             streamer.start = AsyncMock()
             streamer.finish = AsyncMock()
@@ -727,8 +727,8 @@ async def test_execute_inner_process_error_failure_includes_docker_logs_hint(
     """When a CLI crash is unrecoverable AND no stderr was captured, the
     streamer error message must point the operator at docker logs so they
     can diagnose externally."""
-    mock_config.claude_worktree_isolation = False
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
 
     req = ExecutionRequest(
         prompt="do work", chat_id="123", source="superpos",
@@ -742,10 +742,10 @@ async def test_execute_inner_process_error_failure_includes_docker_logs_hint(
         )
         yield  # noqa
 
-    with patch("src.claude_executor.is_git_repo", return_value=False), \
-         patch("src.claude_executor.query", side_effect=lambda *a, **kw: crash_immediately()), \
-         patch("src.claude_executor.asyncio.sleep", new_callable=AsyncMock), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=False), \
+         patch("slim_agent_claude.claude_executor.query", side_effect=lambda *a, **kw: crash_immediately()), \
+         patch("slim_agent_claude.claude_executor.asyncio.sleep", new_callable=AsyncMock), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         streamer = MockStreamer.return_value
         streamer.start = AsyncMock()
         streamer.finish = AsyncMock()
@@ -770,8 +770,8 @@ async def test_execute_inner_resumes_session_from_init_message(
     """
     from claude_code_sdk.types import SystemMessage
 
-    mock_config.claude_worktree_isolation = False
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
 
     req = ExecutionRequest(
         prompt="do work", chat_id="123", source="superpos",
@@ -810,11 +810,11 @@ async def test_execute_inner_resumes_session_from_init_message(
         call_count["n"] += 1
         return crash_after_init() if call_count["n"] == 1 else succeed()
 
-    with patch("src.claude_executor.is_git_repo", return_value=False), \
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=False), \
          patch.object(executor, "_build_options", side_effect=capture_build), \
-         patch("src.claude_executor.query", side_effect=query_side_effect), \
-         patch("src.claude_executor.asyncio.sleep", new_callable=AsyncMock), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+         patch("slim_agent_claude.claude_executor.query", side_effect=query_side_effect), \
+         patch("slim_agent_claude.claude_executor.asyncio.sleep", new_callable=AsyncMock), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         streamer = MockStreamer.return_value
         streamer.start = AsyncMock()
         streamer.finish = AsyncMock()
@@ -839,10 +839,10 @@ async def test_execute_inner_cleans_up_stderr_tempfile_on_cancellation(
     """
     import os
     import tempfile
-    from src.claude_executor import _stderr_capture_var
+    from slim_agent_claude.claude_executor import _stderr_capture_var
 
-    mock_config.claude_worktree_isolation = False
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
 
     req = ExecutionRequest(
         prompt="do work", chat_id="123", source="superpos",
@@ -866,9 +866,9 @@ async def test_execute_inner_cleans_up_stderr_tempfile_on_cancellation(
         raise asyncio.CancelledError()
         yield  # noqa — keeps this an async generator
 
-    with patch("src.claude_executor.is_git_repo", return_value=False), \
-         patch("src.claude_executor.query", side_effect=lambda *a, **kw: populate_capture_then_cancel()), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=False), \
+         patch("slim_agent_claude.claude_executor.query", side_effect=lambda *a, **kw: populate_capture_then_cancel()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         streamer = MockStreamer.return_value
         streamer.start = AsyncMock()
         streamer.finish = AsyncMock()
@@ -892,10 +892,10 @@ async def test_telegram_request_sees_recent_superpos_task_in_system_prompt(
     """A Telegram message that arrives after a Superpos task completed in the
     same chat must see the task's summary appended to the system prompt, so
     the user can ask follow-up questions about notifications they saw."""
-    from src.recent_tasks import TaskSummary
+    from superpos_agent_core import TaskSummary
 
-    mock_config.claude_worktree_isolation = False
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
 
     # Pre-populate the recent-tasks log as if a Superpos task had just run
     executor._recent_tasks.record(
@@ -928,10 +928,10 @@ async def test_telegram_request_sees_recent_superpos_task_in_system_prompt(
         return
         yield  # noqa
 
-    with patch("src.claude_executor.is_git_repo", return_value=False), \
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=False), \
          patch.object(executor, "_build_options", side_effect=capture_build), \
-         patch("src.claude_executor.query", side_effect=lambda *a, **kw: succeed()), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+         patch("slim_agent_claude.claude_executor.query", side_effect=lambda *a, **kw: succeed()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         streamer = MockStreamer.return_value
         streamer.start = AsyncMock()
         streamer.finish = AsyncMock()
@@ -956,8 +956,8 @@ async def test_superpos_task_completion_records_summary(
     log so the next Telegram message in the same chat picks it up."""
     from claude_code_sdk.types import AssistantMessage, TextBlock, ResultMessage
 
-    mock_config.claude_worktree_isolation = False
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
 
     req = ExecutionRequest(
         prompt="build the report", chat_id="chat-77", source="superpos",
@@ -971,9 +971,9 @@ async def test_superpos_task_completion_records_summary(
             is_error=False, num_turns=1, session_id="sess-x",
         )
 
-    with patch("src.claude_executor.is_git_repo", return_value=False), \
-         patch("src.claude_executor.query", side_effect=lambda *a, **kw: stream_then_finish()), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=False), \
+         patch("slim_agent_claude.claude_executor.query", side_effect=lambda *a, **kw: stream_then_finish()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         streamer = MockStreamer.return_value
         streamer.start = AsyncMock()
         streamer.finish = AsyncMock()
@@ -994,8 +994,8 @@ async def test_superpos_task_failure_records_summary(
 ):
     """Failures must also land in the recent-tasks log — the user often
     asks follow-up questions about what went wrong."""
-    mock_config.claude_worktree_isolation = False
-    mock_config.claude_working_dir = "/workspace"
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
 
     req = ExecutionRequest(
         prompt="risky operation", chat_id="chat-77", source="superpos",
@@ -1006,10 +1006,10 @@ async def test_superpos_task_failure_records_summary(
         raise Exception("simulated failure")
         yield  # noqa
 
-    with patch("src.claude_executor.is_git_repo", return_value=False), \
-         patch("src.claude_executor.query", side_effect=lambda *a, **kw: fail_immediately()), \
-         patch("src.claude_executor.asyncio.sleep", new_callable=AsyncMock), \
-         patch("src.claude_executor.TelegramStreamer") as MockStreamer:
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=False), \
+         patch("slim_agent_claude.claude_executor.query", side_effect=lambda *a, **kw: fail_immediately()), \
+         patch("slim_agent_claude.claude_executor.asyncio.sleep", new_callable=AsyncMock), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         streamer = MockStreamer.return_value
         streamer.start = AsyncMock()
         streamer.finish = AsyncMock()
@@ -1023,3 +1023,122 @@ async def test_superpos_task_failure_records_summary(
     assert "sp-task-fail" in rendered
     assert "failed" in rendered
     assert "simulated failure" in rendered
+
+
+# --- Preflight cleanup ---
+
+async def test_preflight_flips_offline_before_exit_on_auth_failure(
+    executor, mock_superpos,
+):
+    """Core's run_agent calls update_status('online') before executor.preflight(),
+    so a sys.exit(1) on bad credentials would otherwise leave the agent showing
+    as online in Superpos until heartbeat timeout. Verify preflight flips it
+    offline on its way out.
+    """
+    auth_error = Exception(
+        '{"type":"error","error":{"type":"authentication_error",'
+        '"message":"Invalid authentication credentials"}}'
+    )
+
+    async def _raise_auth_error():
+        raise auth_error
+        yield  # noqa — async generator marker
+
+    with patch(
+        "slim_agent_claude.claude_executor.query",
+        side_effect=lambda *a, **kw: _raise_auth_error(),
+    ), patch("sys.exit") as mock_exit:
+        await executor.preflight()
+
+    mock_exit.assert_called_once_with(1)
+    # Critical: offline status must be sent BEFORE the exit
+    mock_superpos.update_status.assert_awaited_with("offline")
+
+
+async def test_preflight_flips_offline_on_unknown_failure(
+    executor, mock_superpos,
+):
+    """The auth-message-pattern matcher only recognises a few known errors;
+    everything else re-raises so run_agent itself exits. The offline flip
+    must happen on this path too.
+    """
+    unknown_error = RuntimeError("something went sideways")
+
+    async def _raise_unknown():
+        raise unknown_error
+        yield  # noqa
+
+    with patch(
+        "slim_agent_claude.claude_executor.query",
+        side_effect=lambda *a, **kw: _raise_unknown(),
+    ):
+        with pytest.raises(RuntimeError):
+            await executor.preflight()
+
+    mock_superpos.update_status.assert_awaited_with("offline")
+
+
+async def test_preflight_no_offline_call_when_no_superpos(
+    mock_config, mock_runtime, mock_gateway,
+):
+    """When Superpos integration is disabled the executor has no client to
+    notify — preflight must still bail cleanly without raising AttributeError.
+    """
+    executor = ClaudeExecutor(mock_config, mock_runtime, None, mock_gateway)
+
+    auth_error = Exception(
+        '{"type":"error","error":{"type":"authentication_error",'
+        '"message":"Invalid authentication credentials"}}'
+    )
+
+    async def _raise_auth_error():
+        raise auth_error
+        yield  # noqa
+
+    with patch(
+        "slim_agent_claude.claude_executor.query",
+        side_effect=lambda *a, **kw: _raise_auth_error(),
+    ), patch("sys.exit") as mock_exit:
+        await executor.preflight()
+
+    mock_exit.assert_called_once_with(1)
+
+
+# --- Cleanup paths ---
+
+def test_cleanup_stale_sessions_uses_hyphenated_session_env_path(
+    executor, tmp_path, monkeypatch,
+):
+    """Claude writes per-session env snapshots to `~/.claude/session-env`
+    (hyphenated). The earlier `session_env` (underscore) path was a typo
+    that silently never matched, so snapshots accumulated indefinitely.
+    Lock in the right name so we can't regress.
+    """
+    import os
+    import time
+
+    fake_home = tmp_path
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    # Stale snapshot under the CORRECT (hyphenated) path
+    real_dir = fake_home / ".claude" / "session-env" / "sess-old"
+    real_dir.mkdir(parents=True)
+    (real_dir / "snapshot.json").write_text('{"k": "v"}')
+    old = time.time() - (48 * 3600)
+    os.utime(real_dir, (old, old))
+
+    # Decoy snapshot under the BROKEN (underscore) path — must be untouched
+    decoy_dir = fake_home / ".claude" / "session_env" / "sess-decoy"
+    decoy_dir.mkdir(parents=True)
+    (decoy_dir / "snapshot.json").write_text('{"k": "v"}')
+    os.utime(decoy_dir, (old, old))
+
+    counts = executor.cleanup_stale_sessions(max_age_hours=24)
+
+    assert counts["session_env"] == 1, (
+        f"expected exactly one snapshot cleaned, got {counts}"
+    )
+    assert not real_dir.exists(), "real session-env snapshot should be deleted"
+    assert decoy_dir.exists(), (
+        "underscore-path decoy must NOT be touched (would be a typo regression)"
+    )

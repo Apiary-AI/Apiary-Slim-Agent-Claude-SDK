@@ -35,6 +35,9 @@ if [ -n "$GITHUB_TOKEN" ]; then
 fi
 
 # Run module setup (install deps, update CLAUDE.md)
-python3 -m src.module_setup || echo "Warning: module setup failed"
+python3 -m superpos_agent_core.module_setup \
+    --modules-dir /workspace/.claude/modules \
+    --agents-md /workspace/CLAUDE.md \
+    || echo "Warning: module setup failed"
 
 exec "$@"

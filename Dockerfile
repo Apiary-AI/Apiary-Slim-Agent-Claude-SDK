@@ -16,6 +16,8 @@ RUN npm install -g @anthropic-ai/claude-code
 
 WORKDIR /app
 
+# slim-agent-core is pulled directly from GitHub via requirements.txt
+# (the `git+https://…` line), so no parent-directory build context required.
 COPY requirements.txt .
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
@@ -40,7 +42,7 @@ RUN useradd -m -s /bin/bash -u 1001 agent && \
     mkdir -p /home/agent/.claude && \
     chown -R agent:agent /workspace /home/agent/.claude
 
-ENV PYTHONPATH="/app"
+ENV PYTHONPATH="/app/src"
 ENV PYTHONUNBUFFERED=1
 ENV HOME="/home/agent"
 
@@ -53,4 +55,4 @@ WORKDIR /workspace
 # subprocesses left behind when a Claude run dies) — without it they
 # accumulate as zombies because Python doesn't reap reparented orphans.
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
-CMD ["python3", "-m", "src.main"]
+CMD ["python3", "-m", "slim_agent_claude"]
