@@ -1,6 +1,6 @@
 """Queue-based worker that invokes Claude Agent SDK and routes output.
 
-This is Claude's concrete :class:`slim_agent_core.Executor` subclass.  Core
+This is Claude's concrete :class:`superpos_agent_core.Executor` subclass.  Core
 modules (``superpos_poller``, ``telegram_bot``, ``run_agent``) drive every
 agent through the abstract Executor surface; the Claude-specific bits live
 here: SDK patches, persona-as-system-prompt wiring, session resume, cleanup
@@ -26,7 +26,7 @@ from claude_code_sdk._internal import client as _sdk_client
 from claude_code_sdk._internal import message_parser
 from claude_code_sdk.types import AssistantMessage, ResultMessage, SystemMessage
 
-from slim_agent_core import (
+from superpos_agent_core import (
     ExecutionRequest,
     Executor,
     RecentTasksLog,
@@ -269,7 +269,7 @@ class ClaudeExecutor(Executor):
         """Verify Claude credentials by making a minimal SDK call.
 
         Core's ``run_agent`` marks the agent ``online`` in Superpos *before*
-        invoking preflight (see slim_agent_core.main.run_agent).  If we exit
+        invoking preflight (see superpos_agent_core.main.run_agent).  If we exit
         here on bad Claude credentials, the asyncio.gather() finally that
         flips status back to ``offline`` never runs, and Superpos keeps
         advertising us as online until the heartbeat timeout fires.  Flip

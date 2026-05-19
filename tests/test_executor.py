@@ -892,7 +892,7 @@ async def test_telegram_request_sees_recent_superpos_task_in_system_prompt(
     """A Telegram message that arrives after a Superpos task completed in the
     same chat must see the task's summary appended to the system prompt, so
     the user can ask follow-up questions about notifications they saw."""
-    from slim_agent_core import TaskSummary
+    from superpos_agent_core import TaskSummary
 
     mock_config.executor_worktree_isolation = False
     mock_config.executor_working_dir = "/workspace"
