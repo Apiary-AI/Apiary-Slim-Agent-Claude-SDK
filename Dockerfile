@@ -42,7 +42,7 @@ RUN useradd -m -s /bin/bash -u 1001 agent && \
     mkdir -p /home/agent/.claude && \
     chown -R agent:agent /workspace /home/agent/.claude
 
-ENV PYTHONPATH="/app"
+ENV PYTHONPATH="/app/src"
 ENV PYTHONUNBUFFERED=1
 ENV HOME="/home/agent"
 
