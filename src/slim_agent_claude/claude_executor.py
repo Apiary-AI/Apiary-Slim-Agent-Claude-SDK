@@ -416,20 +416,105 @@ class ClaudeExecutor(Executor):
             self._worktree_locks[slot] = asyncio.Lock()
         return self._worktree_locks[slot]
 
-    def _resolve_slot(self, req: ExecutionRequest) -> str:
+    def _resolve_slot(self, branch: str | None) -> str:
+        """Return the worktree lock key for ``branch``.
+
+        Callers pass the *effective* branch — i.e. the branch the
+        execution will actually run on after any SessionStore-based
+        restoration — so the lock key matches the cwd used by
+        ``_execute_inner``.  Passing ``req.branch`` directly is unsafe
+        for resumed Telegram turns where the effective branch comes
+        from the stored session.
+        """
         if (
-            req.branch
+            branch
             and self._config.executor_worktree_isolation
             and is_git_repo(self._config.executor_working_dir)
         ):
-            return worktree_path(self._config.executor_working_dir, req.branch)
+            return worktree_path(self._config.executor_working_dir, branch)
         return "__main__"
+
+    # ── Resume target resolution ─────────────────────────────────────────
+
+    def _resolve_resume_target(
+        self, req: ExecutionRequest,
+    ) -> tuple[str | None, str | None]:
+        """Return ``(resume_id, effective_branch)`` for this request.
+
+        Reads the SessionStore for Telegram chats and applies two
+        policies:
+
+        * Persona invalidation — if the stored session was written under
+          an older persona version, drop the resume and clear the entry
+          so the next run starts fresh.
+        * Branch restoration — when the request has no explicit branch
+          (no ``--branch`` token, no PR ref in the text), inherit the
+          branch the session was started on so cwd matches the
+          original transcript at
+          ``~/.claude/projects/<encoded-cwd>/<sid>.jsonl``.
+
+        Called by ``_run_one`` *before* slot resolution so the worktree
+        lock key matches the cwd ``_execute_inner`` will actually use.
+        Non-Telegram sources (Superpos tasks) skip the SessionStore
+        entirely and pass ``req.branch`` through unchanged.
+
+        This call mutates the SessionStore when persona invalidation
+        triggers (clears the stale entry).  Call it exactly once per
+        request — ``_run_one`` does so and threads the result into
+        ``_execute`` / ``_execute_inner`` via ``pre_resolved``.
+        """
+        if req.source != "telegram":
+            return None, req.branch
+        stored = self._sessions.get_with_version(req.chat_id)
+        if stored is None:
+            return None, req.branch
+        resume_id, stored_version, stored_branch = stored
+        # Lazy persona invalidation: a session started under an older
+        # persona must not be resumed — Claude stays consistent with
+        # prior turns, so the new --append-system-prompt alone can't
+        # undo an old self-introduction in the resumed transcript.
+        # `stored_version is None` covers the startup race where
+        # Telegram polling can write a session before the Superpos
+        # version poller has populated `_persona_version`.
+        if self._persona_version is not None and (
+            stored_version is None
+            or stored_version < self._persona_version
+        ):
+            log.info(
+                "Dropping resume for chat %s: session persona v%s < "
+                "current v%s — starting fresh",
+                req.chat_id,
+                "?" if stored_version is None else stored_version,
+                self._persona_version,
+            )
+            self._sessions.clear(req.chat_id)
+            return None, req.branch
+        effective_branch = req.branch
+        if req.branch is None and stored_branch is not None:
+            log.info(
+                "Resuming session for chat %s on stored branch %r "
+                "(req.branch was None)",
+                req.chat_id, stored_branch,
+            )
+            effective_branch = stored_branch
+        return resume_id, effective_branch
 
     # ── Main consumer loop ───────────────────────────────────────────────
 
     async def _run_one(self, req: ExecutionRequest) -> None:
         claim_expired = asyncio.Event()
         progress_task: asyncio.Task | None = None
+
+        # Resolve resume target up front so the worktree lock key, the
+        # cwd built by ``_execute_inner``, and the SessionStore writes
+        # all agree on the same effective branch.  Without this, a
+        # resumed Telegram turn (whose effective branch comes from the
+        # stored session) would key the lock by ``req.branch`` — often
+        # ``None → "__main__"`` — while execution runs in the stored
+        # branch's worktree, letting two tasks targeting the same branch
+        # run concurrently against the same git tree.
+        pre_resolved = self._resolve_resume_target(req)
+        _, effective_branch = pre_resolved
 
         if req.source == "superpos" and req.superpos_task_id and self._superpos:
             progress_task = asyncio.create_task(
@@ -445,7 +530,7 @@ class ClaudeExecutor(Executor):
                     )
                     return
 
-                slot = self._resolve_slot(req)
+                slot = self._resolve_slot(effective_branch)
                 wt_lock = self._get_worktree_lock(slot)
 
                 lock_acquired = False
@@ -473,7 +558,7 @@ class ClaudeExecutor(Executor):
                         return
 
                     lock_acquired = True
-                    await self._execute(req, claim_expired)
+                    await self._execute(req, claim_expired, pre_resolved=pre_resolved)
                 finally:
                     if lock_acquired:
                         wt_lock.release()
@@ -517,8 +602,22 @@ class ClaudeExecutor(Executor):
                 log.debug("Progress update failed for task %s", task_id)
 
     async def _execute(
-        self, req: ExecutionRequest, claim_expired: asyncio.Event, retries: int = 3,
+        self,
+        req: ExecutionRequest,
+        claim_expired: asyncio.Event,
+        retries: int = 3,
+        *,
+        pre_resolved: tuple[str | None, str | None] | None = None,
     ) -> None:
+        """Run a single request to completion.
+
+        ``pre_resolved`` is the ``(resume_id, effective_branch)`` pair
+        already computed by ``_run_one``.  Threading it through avoids
+        a redundant SessionStore lookup in ``_execute_inner`` (and the
+        risk of repeating the persona-invalidation side effect).
+        Direct callers — e.g. unit tests — may omit it and let the
+        inner method fall back to ``_resolve_resume_target`` itself.
+        """
         self._active_count += 1
         if self._active_count == 1 and self._superpos:
             try:
@@ -541,7 +640,9 @@ class ClaudeExecutor(Executor):
                 inner_task.cancel()
 
         try:
-            inner_task = asyncio.create_task(self._execute_inner(req, streamer, retries))
+            inner_task = asyncio.create_task(
+                self._execute_inner(req, streamer, retries, pre_resolved=pre_resolved),
+            )
             # Register with the base class so the /stop Telegram command can
             # find and cancel this in-flight work via cancel_chat(chat_id).
             # Auto-untracks via done callback — no cleanup needed in finally.
@@ -751,65 +852,28 @@ class ClaudeExecutor(Executor):
         return ClaudeCodeOptions(**opts)
 
     async def _execute_inner(
-        self, req: ExecutionRequest, streamer: TelegramStreamer, retries: int,
+        self,
+        req: ExecutionRequest,
+        streamer: TelegramStreamer,
+        retries: int,
+        *,
+        pre_resolved: tuple[str | None, str | None] | None = None,
     ) -> None:
         t0 = time.monotonic()
         full_text = ""
 
-        # ── Resolve resume target and effective branch first ────────────
-        # The cwd and the branch-related system prompt both depend on the
-        # effective branch (request-supplied or restored from the stored
-        # session), so the SessionStore lookup must happen *before* we
-        # build the worktree or assemble the prompt.
-        resume_id: str | None = None
-        # Branch the upcoming execution should run on.  Defaults to
-        # req.branch; when we resume a session that was started on a
-        # worktree, we override with the stored branch so cwd matches
-        # the original transcript location.
-        effective_branch: str | None = req.branch
-        if req.source == "telegram":
-            stored = self._sessions.get_with_version(req.chat_id)
-            if stored is not None:
-                resume_id, stored_version, stored_branch = stored
-                # Lazy persona invalidation: if the persona has been updated
-                # since this session started, drop the resume.  Conversation
-                # history under the old persona would otherwise override the
-                # new identity/behavior — Claude stays consistent with prior
-                # turns, so the new --append-system-prompt alone can't undo
-                # an old self-introduction in the resume transcript.
-                #
-                # `stored_version is None` covers the startup race where
-                # Telegram polling can write a session before the Superpos
-                # version poller has populated `_persona_version`.  Without
-                # this, those sessions would be permanently exempt from
-                # invalidation on later persona bumps.
-                if self._persona_version is not None and (
-                    stored_version is None
-                    or stored_version < self._persona_version
-                ):
-                    log.info(
-                        "Dropping resume for chat %s: session persona v%s < "
-                        "current v%s — starting fresh",
-                        req.chat_id,
-                        "?" if stored_version is None else stored_version,
-                        self._persona_version,
-                    )
-                    self._sessions.clear(req.chat_id)
-                    resume_id = None
-                elif req.branch is None and stored_branch is not None:
-                    # Follow-up message without an explicit branch signal —
-                    # restore the cwd the session was started on so Claude
-                    # CLI can find the transcript under
-                    # ~/.claude/projects/<cwd-encoded>/<sid>.jsonl.
-                    # Without this, the resume silently starts fresh
-                    # because Claude looks for the transcript under the
-                    # default cwd's project dir and doesn't find it.
-                    log.info(
-                        "Resuming session for chat %s on stored branch %r "
-                        "(req.branch was None)",
-                        req.chat_id, stored_branch,
-                    )
-                    effective_branch = stored_branch
+        # ``_run_one`` resolves the resume target before slot/lock
+        # acquisition so the lock key matches the cwd we use here.
+        # When called via that path ``pre_resolved`` carries the
+        # result; direct callers (unit tests, future entrypoints) fall
+        # back to the helper.  Calling the helper twice for one
+        # request is safe — persona invalidation already cleared the
+        # entry on the first call — but it's redundant work, so
+        # prefer pre_resolved.
+        if pre_resolved is not None:
+            resume_id, effective_branch = pre_resolved
+        else:
+            resume_id, effective_branch = self._resolve_resume_target(req)
 
         cwd_override: str | None = None
         if (

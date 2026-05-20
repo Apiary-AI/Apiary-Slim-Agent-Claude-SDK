@@ -74,7 +74,7 @@ async def test_execute_removes_task_after_claim_expiry(executor):
     async def fake_report_progress(task_id, claim_expired, interval=30):
         claim_expired.set()
 
-    async def fake_execute_inner(req, streamer, retries):
+    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None):
         await asyncio.sleep(10)  # blocks until cancelled
 
     req = ExecutionRequest(
@@ -365,20 +365,20 @@ def test_has_free_slots_false_at_capacity(executor, mock_config):
 
 
 # --- _resolve_slot ---
+# Signature takes the *effective* branch (post-SessionStore restoration),
+# not the raw request, so the lock key matches the cwd _execute_inner uses.
 
 def test_resolve_slot_main_for_no_branch(executor, mock_config):
     mock_config.executor_worktree_isolation = True
     mock_config.executor_working_dir = "/workspace"
-    req = ExecutionRequest(prompt="hi", chat_id="1", source="telegram")
-    assert executor._resolve_slot(req) == "__main__"
+    assert executor._resolve_slot(None) == "__main__"
 
 
 def test_resolve_slot_worktree_path_for_branch(executor, mock_config):
     mock_config.executor_worktree_isolation = True
     mock_config.executor_working_dir = "/workspace"
-    req = ExecutionRequest(prompt="hi", chat_id="1", source="superpos", branch="feat/x")
     with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True):
-        result = executor._resolve_slot(req)
+        result = executor._resolve_slot("feat/x")
     assert result == "/workspace/.worktrees/feat-x"
 
 
@@ -389,7 +389,7 @@ async def test_status_busy_on_first_task_only(executor, mock_superpos, mock_conf
     mock_config.executor_worktree_isolation = True
     mock_config.executor_working_dir = "/workspace"
 
-    async def fake_execute_inner(req, streamer, retries):
+    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None):
         await asyncio.sleep(0.1)
 
     with patch.object(executor, "_execute_inner", fake_execute_inner), \
@@ -418,7 +418,7 @@ async def test_status_online_when_all_done(executor, mock_superpos, mock_config)
     mock_config.executor_worktree_isolation = True
     mock_config.executor_working_dir = "/workspace"
 
-    async def fake_execute_inner(req, streamer, retries):
+    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None):
         await asyncio.sleep(0.1)
 
     with patch.object(executor, "_execute_inner", fake_execute_inner), \
@@ -452,7 +452,7 @@ async def test_same_branch_tasks_serialize(executor, mock_config):
 
     execution_log = []
 
-    async def fake_execute_inner(req, streamer, retries):
+    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None):
         execution_log.append(f"start-{req.prompt}")
         await asyncio.sleep(0.05)
         execution_log.append(f"end-{req.prompt}")
@@ -1703,4 +1703,171 @@ def test_cleanup_stale_sessions_walks_worktree_project_dirs(
     assert active_main.exists()
     assert active_wt.exists(), (
         "active worktree session must be preserved across project dirs"
+    )
+
+
+# --- _resolve_resume_target (Codex fix: lock key follows effective branch) ──
+#
+# The earlier draft of this PR resolved the effective branch only inside
+# _execute_inner, *after* _run_one had already acquired the per-worktree
+# lock via _resolve_slot(req).  For a resumed Telegram turn with
+# req.branch=None but a stored branch, the lock was keyed by "__main__"
+# while execution ran in the stored branch's worktree — letting a
+# concurrent Superpos task on the same branch trample the git tree.
+# These tests pin the invariant: the effective branch drives both the
+# lock key and the cwd.
+
+def test_resolve_resume_target_superpos_passes_through_req_branch(executor):
+    """Superpos requests skip the SessionStore — branch comes from the
+    task payload, never from a chat-scoped session."""
+    req = ExecutionRequest(
+        prompt="do", chat_id="chat-1", source="superpos",
+        superpos_task_id="t1", branch="feat/sp",
+    )
+    assert executor._resolve_resume_target(req) == (None, "feat/sp")
+
+
+def test_resolve_resume_target_telegram_no_session_returns_req_branch(executor):
+    req = ExecutionRequest(prompt="hi", chat_id="chat-1", source="telegram")
+    assert executor._resolve_resume_target(req) == (None, None)
+
+
+def test_resolve_resume_target_telegram_restores_stored_branch(executor):
+    executor._persona_version = 3
+    executor._sessions.set_with_version(
+        "chat-1", "sess-pr607", 3, branch="feat/issues",
+    )
+    req = ExecutionRequest(prompt="Go", chat_id="chat-1", source="telegram")
+    assert executor._resolve_resume_target(req) == ("sess-pr607", "feat/issues")
+
+
+def test_resolve_resume_target_explicit_branch_wins_over_stored(executor):
+    executor._persona_version = 3
+    executor._sessions.set_with_version(
+        "chat-1", "sess-old", 3, branch="feat/old",
+    )
+    req = ExecutionRequest(
+        prompt="switch", chat_id="chat-1", source="telegram", branch="feat/new",
+    )
+    assert executor._resolve_resume_target(req) == ("sess-old", "feat/new")
+
+
+def test_resolve_resume_target_drops_resume_on_persona_bump(executor):
+    """Stale-persona session is cleared as a side effect — caller gets
+    no resume and the entry no longer exists in the store."""
+    executor._persona_version = 5
+    executor._sessions.set_with_version(
+        "chat-1", "sess-stale", 1, branch="feat/x",
+    )
+    req = ExecutionRequest(prompt="hi", chat_id="chat-1", source="telegram")
+    assert executor._resolve_resume_target(req) == (None, None)
+    assert executor._sessions.get_with_version("chat-1") is None
+
+
+async def test_run_one_keys_worktree_lock_by_effective_branch(
+    executor, mock_config,
+):
+    """The fix Codex flagged: a Telegram follow-up with req.branch=None
+    that resumes on a stored branch must acquire the per-branch lock,
+    not "__main__".  Two such turns targeting the same stored branch
+    have to serialise on the worktree lock — otherwise a concurrent
+    Superpos task on the same branch tramples the git tree.
+    """
+    mock_config.executor_worktree_isolation = True
+    mock_config.executor_working_dir = "/workspace"
+
+    executor._persona_version = 1
+    executor._sessions.set_with_version(
+        "chat-1", "sess-1", 1, branch="feat/shared",
+    )
+
+    captured_slots: list[str] = []
+    real_get_lock = executor._get_worktree_lock
+
+    def trace_lock(slot: str):
+        captured_slots.append(slot)
+        return real_get_lock(slot)
+
+    async def fake_execute(req, claim_expired, retries=3, *, pre_resolved=None):
+        # Pre-resolved must carry the restored branch so cwd matches lock.
+        assert pre_resolved == ("sess-1", "feat/shared")
+        await asyncio.sleep(0)
+
+    req = ExecutionRequest(
+        prompt="Go", chat_id="chat-1", source="telegram",  # no branch
+    )
+
+    with patch.object(executor, "_get_worktree_lock", side_effect=trace_lock), \
+         patch.object(executor, "_execute", side_effect=fake_execute), \
+         patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True):
+        await executor.queue.put(req)
+        await executor.queue.get()  # mirror what run() would do
+        await executor._run_one(req)
+
+    assert captured_slots == ["/workspace/.worktrees/feat-shared"], (
+        f"lock must be keyed by restored branch, not __main__: got {captured_slots}"
+    )
+
+
+async def test_resumed_telegram_serialises_with_explicit_branch_on_same_branch(
+    executor, mock_config,
+):
+    """End-to-end concurrency guard: a resumed Telegram turn (branch
+    restored from SessionStore) and a Superpos task with the same
+    explicit branch share a worktree lock — they must NOT overlap.
+    Pre-fix: lock would be "__main__" for the Telegram turn, the
+    Superpos task would take the branch slot, and both ran at once.
+    """
+    mock_config.executor_worktree_isolation = True
+    mock_config.executor_working_dir = "/workspace"
+    mock_config.executor_max_parallel = 2  # let both into the semaphore
+
+    executor._persona_version = 1
+    executor._sessions.set_with_version(
+        "chat-tg", "sess-r", 1, branch="feat/shared",
+    )
+    # The semaphore bound is read at __init__; rebuild it to match.
+    executor._semaphore = asyncio.Semaphore(2)
+
+    log_events: list[str] = []
+
+    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None):
+        log_events.append(f"start-{req.chat_id}")
+        await asyncio.sleep(0.05)
+        log_events.append(f"end-{req.chat_id}")
+
+    req_tg = ExecutionRequest(
+        prompt="Go", chat_id="chat-tg", source="telegram",  # no branch
+    )
+    req_sp = ExecutionRequest(
+        prompt="cron", chat_id="chat-sp", source="superpos",
+        superpos_task_id="sp-1", branch="feat/shared",
+    )
+
+    with patch.object(executor, "_execute_inner", fake_execute_inner), \
+         patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        MockStreamer.return_value.start = AsyncMock()
+        await executor.queue.put(req_tg)
+        await executor.queue.put(req_sp)
+
+        run_task = asyncio.create_task(executor.run())
+        await asyncio.sleep(0.25)
+        run_task.cancel()
+        try:
+            await run_task
+        except asyncio.CancelledError:
+            pass
+
+    # Both ran (start + end recorded for each)
+    assert {"start-chat-tg", "end-chat-tg", "start-chat-sp", "end-chat-sp"} <= set(log_events)
+    # And they did NOT overlap — the earlier task ends before the later starts.
+    starts = [i for i, e in enumerate(log_events) if e.startswith("start-")]
+    first_end_idx = next(
+        i for i, e in enumerate(log_events) if e.startswith("end-")
+    )
+    second_start_idx = starts[1]
+    assert first_end_idx < second_start_idx, (
+        f"resumed Telegram turn and Superpos task on same branch overlapped: "
+        f"{log_events}"
     )
