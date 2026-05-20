@@ -1403,7 +1403,7 @@ async def test_new_session_id_stored_with_current_persona_version(
         streamer.send_tool_notification = AsyncMock()
         await executor._execute_inner(req, streamer, retries=1)
 
-    assert executor._sessions.get_with_version("chat-new") == ("sess-fresh", 7)
+    assert executor._sessions.get_with_version("chat-new") == ("sess-fresh", 7, None)
 
 
 # --- /stop wiring ---------------------------------------------------------
@@ -1461,3 +1461,246 @@ async def test_execute_tracks_chat_task_for_stop(executor, mock_config):
 
     # Auto-untrack via done callback
     assert "chat-stop" not in executor._chat_tasks
+
+
+# --- Branch-pinning on session resume ────────────────────────────────────
+#
+# Bug being fixed: Telegram's branch resolution runs against each message
+# independently.  Message 1 ("look at PR #607") sets req.branch via the
+# PR-ref regex and the session is started under the worktree cwd.
+# Message 2 ("Go") has no PR ref, so req.branch is None, the executor
+# falls back to the default cwd, and Claude CLI can't find the transcript
+# at ~/.claude/projects/<default-cwd-encoded>/<sid>.jsonl — it silently
+# starts a fresh conversation, the agent loses prior context, and the
+# user-visible symptom is "you said 'Go' but I have no idea what we
+# were doing".  Pinning the branch on the SessionStore entry restores
+# the cwd on resume and the transcript loads.
+
+async def test_resume_restores_stored_branch_when_request_has_none(
+    executor, mock_config,
+):
+    """Follow-up Telegram message without an explicit branch must resume
+    on the branch stored alongside the session id so Claude CLI looks
+    in the right project dir."""
+    mock_config.executor_worktree_isolation = True
+    mock_config.executor_working_dir = "/workspace"
+
+    executor._persona_version = 3
+    executor._sessions.set_with_version(
+        "chat-1", "sess-pr607", 3, branch="feat/issues-phase-1",
+    )
+
+    req = ExecutionRequest(
+        prompt="Go", chat_id="chat-1", source="telegram",  # no branch
+    )
+
+    async def succeed():
+        return
+        yield  # noqa
+
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True), \
+         patch("slim_agent_claude.claude_executor.ensure_worktree", new_callable=AsyncMock) as mock_ensure, \
+         patch("slim_agent_claude.claude_executor.query", side_effect=lambda *a, **kw: succeed()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        mock_ensure.return_value = "/workspace/.worktrees/feat-issues-phase-1"
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=1)
+
+    mock_ensure.assert_called_once_with("/workspace", "feat/issues-phase-1")
+
+
+async def test_resume_keeps_explicit_branch_over_stored_one(
+    executor, mock_config,
+):
+    """When the user explicitly switches branches (--branch or PR ref),
+    the request branch wins — the user is deliberately moving context."""
+    mock_config.executor_worktree_isolation = True
+    mock_config.executor_working_dir = "/workspace"
+
+    executor._persona_version = 3
+    executor._sessions.set_with_version(
+        "chat-1", "sess-old-branch", 3, branch="feat/old",
+    )
+
+    req = ExecutionRequest(
+        prompt="now look at this", chat_id="chat-1", source="telegram",
+        branch="feat/new",
+    )
+
+    async def succeed():
+        return
+        yield  # noqa
+
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True), \
+         patch("slim_agent_claude.claude_executor.ensure_worktree", new_callable=AsyncMock) as mock_ensure, \
+         patch("slim_agent_claude.claude_executor.query", side_effect=lambda *a, **kw: succeed()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        mock_ensure.return_value = "/workspace/.worktrees/feat-new"
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=1)
+
+    mock_ensure.assert_called_once_with("/workspace", "feat/new")
+
+
+async def test_session_save_records_effective_branch(
+    executor, mock_config,
+):
+    """The branch saved alongside a new session id must be the *effective*
+    branch — the one execution actually ran on — not the raw req.branch.
+    Otherwise a resume that fell back to a stored branch would overwrite
+    the entry with branch=None and the next message would lose context
+    again."""
+    from claude_code_sdk.types import SystemMessage
+
+    mock_config.executor_worktree_isolation = True
+    mock_config.executor_working_dir = "/workspace"
+
+    executor._persona_version = 4
+    executor._sessions.set_with_version(
+        "chat-1", "sess-prev", 4, branch="feat/keep-me",
+    )
+
+    req = ExecutionRequest(
+        prompt="continue", chat_id="chat-1", source="telegram",  # no branch
+    )
+
+    init_msg = SystemMessage(
+        subtype="init",
+        data={"session_id": "sess-next", "type": "system", "subtype": "init"},
+    )
+
+    async def stream_init():
+        yield init_msg
+
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True), \
+         patch("slim_agent_claude.claude_executor.ensure_worktree", new_callable=AsyncMock) as mock_ensure, \
+         patch("slim_agent_claude.claude_executor.query", side_effect=lambda *a, **kw: stream_init()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        mock_ensure.return_value = "/workspace/.worktrees/feat-keep-me"
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=1)
+
+    assert executor._sessions.get_with_version("chat-1") == (
+        "sess-next", 4, "feat/keep-me",
+    ), "effective branch must persist across the resume → re-save cycle"
+
+
+async def test_resume_falls_back_to_default_when_stored_branch_is_none(
+    executor, mock_config,
+):
+    """Pre-fix entries (and entries from sessions started without a
+    branch) have branch=None — those must continue to use the default
+    cwd, matching the historical behavior before this field existed."""
+    mock_config.executor_worktree_isolation = True
+    mock_config.executor_working_dir = "/workspace"
+
+    executor._persona_version = 2
+    executor._sessions.set_with_version("chat-1", "sess-no-branch", 2)
+    # branch defaults to None — no worktree expected
+
+    req = ExecutionRequest(
+        prompt="hi", chat_id="chat-1", source="telegram",
+    )
+
+    async def succeed():
+        return
+        yield  # noqa
+
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True), \
+         patch("slim_agent_claude.claude_executor.ensure_worktree", new_callable=AsyncMock) as mock_ensure, \
+         patch("slim_agent_claude.claude_executor.query", side_effect=lambda *a, **kw: succeed()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=1)
+
+    mock_ensure.assert_not_called()
+
+
+# --- cleanup_stale_sessions walks every project subdir ─────────────────
+
+def test_cleanup_stale_sessions_walks_worktree_project_dirs(
+    executor, tmp_path, monkeypatch,
+):
+    """Worktree-scoped sessions live under their own
+    `projects/<encoded-worktree-cwd>/` dir.  The earlier code only walked
+    `projects/-workspace`, so stale worktree sessions accumulated
+    forever.  Verify the new walker visits every project subdir and
+    still respects the preserve-set across them.
+    """
+    import os
+    import time
+
+    fake_home = tmp_path
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    projects = fake_home / ".claude" / "projects"
+    old = time.time() - (48 * 3600)
+
+    # Main workspace: one stale, one active
+    main = projects / "-workspace"
+    main.mkdir(parents=True)
+    stale_main = main / "sess-stale-main"
+    stale_main.mkdir()
+    (stale_main / "transcript.jsonl").write_text("...")
+    os.utime(stale_main, (old, old))
+
+    active_main = main / "sess-active-main"
+    active_main.mkdir()
+    (active_main / "transcript.jsonl").write_text("...")
+    os.utime(active_main, (old, old))
+
+    # Worktree project: one stale (should be deleted)
+    worktree = projects / "-workspace--worktrees-feat-foo"
+    worktree.mkdir(parents=True)
+    stale_wt = worktree / "sess-stale-wt"
+    stale_wt.mkdir()
+    (stale_wt / "transcript.jsonl").write_text("...")
+    os.utime(stale_wt, (old, old))
+
+    # Worktree project: one active (must be preserved)
+    active_wt = worktree / "sess-active-wt"
+    active_wt.mkdir()
+    (active_wt / "transcript.jsonl").write_text("...")
+    os.utime(active_wt, (old, old))
+
+    # Two sessions registered in the store — these must survive cleanup
+    executor._sessions.set_with_version(
+        "chat-main", "sess-active-main", 1, branch=None,
+    )
+    executor._sessions.set_with_version(
+        "chat-wt", "sess-active-wt", 1, branch="feat/foo",
+    )
+
+    counts = executor.cleanup_stale_sessions(max_age_hours=24)
+
+    assert counts["projects"] == 2, (
+        f"expected to clean stale-main + stale-wt = 2, got {counts}"
+    )
+    assert not stale_main.exists()
+    assert not stale_wt.exists(), (
+        "worktree-scoped stale session must be reaped — was untouched before fix"
+    )
+    assert active_main.exists()
+    assert active_wt.exists(), (
+        "active worktree session must be preserved across project dirs"
+    )

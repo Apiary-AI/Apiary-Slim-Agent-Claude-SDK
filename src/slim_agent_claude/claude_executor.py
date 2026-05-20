@@ -330,6 +330,13 @@ class ClaudeExecutor(Executor):
         the next ``--resume`` would silently fall through to a fresh
         session, and the user would experience "agent lost the
         conversation on restart".  We preserve every id still mapped.
+
+        Worktree-scoped sessions live under their own
+        ``projects/<encoded-cwd>/`` dir (one per branch), so we scan every
+        subdirectory of ``projects/`` rather than only the main workspace
+        project.  Otherwise idle worktree sessions accumulate unbounded
+        and active ones risk deletion if the agent later runs on a
+        different branch.
         """
         counts = {"projects": 0, "session_env": 0, "bytes_freed": 0}
         cutoff = time.time() - (max_age_hours * 3600)
@@ -341,27 +348,31 @@ class ClaudeExecutor(Executor):
             # Both `<sid>` (dir) and `<sid>.jsonl` (transcript) live in projects/.
             return name[:-6] if name.endswith(".jsonl") else name
 
-        projects_dir = os.path.join(claude_dir, "projects", "-workspace")
-        if os.path.isdir(projects_dir):
-            for name in os.listdir(projects_dir):
-                path = os.path.join(projects_dir, name)
-                if not os.path.isdir(path):
+        projects_root = os.path.join(claude_dir, "projects")
+        if os.path.isdir(projects_root):
+            for project_name in os.listdir(projects_root):
+                projects_dir = os.path.join(projects_root, project_name)
+                if not os.path.isdir(projects_dir):
                     continue
-                if _session_id_from_name(name) in preserve:
-                    continue
-                try:
-                    mtime = os.path.getmtime(path)
-                    if mtime < cutoff:
-                        size = sum(
-                            os.path.getsize(os.path.join(dp, f))
-                            for dp, _, fns in os.walk(path)
-                            for f in fns
-                        )
-                        shutil.rmtree(path)
-                        counts["projects"] += 1
-                        counts["bytes_freed"] += size
-                except OSError:
-                    pass
+                for name in os.listdir(projects_dir):
+                    path = os.path.join(projects_dir, name)
+                    if not os.path.isdir(path):
+                        continue
+                    if _session_id_from_name(name) in preserve:
+                        continue
+                    try:
+                        mtime = os.path.getmtime(path)
+                        if mtime < cutoff:
+                            size = sum(
+                                os.path.getsize(os.path.join(dp, f))
+                                for dp, _, fns in os.walk(path)
+                                for f in fns
+                            )
+                            shutil.rmtree(path)
+                            counts["projects"] += 1
+                            counts["bytes_freed"] += size
+                    except OSError:
+                        pass
 
         # Claude CLI writes per-session env snapshots to `session-env`
         # (hyphenated).  The pre-port code scanned `session_env` (underscore)
@@ -745,55 +756,21 @@ class ClaudeExecutor(Executor):
         t0 = time.monotonic()
         full_text = ""
 
-        cwd_override: str | None = None
-        if (
-            req.branch
-            and self._config.executor_worktree_isolation
-            and is_git_repo(self._config.executor_working_dir)
-        ):
-            try:
-                cwd_override = await ensure_worktree(
-                    self._config.executor_working_dir, req.branch,
-                )
-            except Exception:
-                log.warning(
-                    "Failed to create worktree for branch %r; falling back to default cwd",
-                    req.branch, exc_info=True,
-                )
-
-        system_prompt_append: str | None = None
-        wt_base = self._config.executor_working_dir
-        if not req.branch and is_git_repo(wt_base):
-            if self._config.executor_worktree_isolation:
-                system_prompt_append = (
-                    "## Worktree Isolation\n"
-                    "When this task requires implementing code changes on a new branch:\n"
-                    f"1. First run `git -C {wt_base} fetch origin` to get latest refs.\n"
-                    f"2. Choose a branch name, then: `git worktree add {wt_base}/.worktrees/<branch> -b <branch> origin/main`\n"
-                    f"3. Do all file edits and git operations inside `{wt_base}/.worktrees/<branch>`\n"
-                    "4. Commit, push the branch, and open a PR from the worktree.\n"
-                    "IMPORTANT: Always branch from origin/main to avoid inheriting unrelated in-progress work.\n"
-                    "NEVER create branches from the current HEAD of the main workspace — it may be on an unmerged feature branch.\n"
-                    "For conversational replies or read-only tasks, skip this entirely."
-                )
-            else:
-                system_prompt_append = (
-                    "## Git Branching\n"
-                    "When this task requires implementing code changes:\n"
-                    f"1. First run `git -C {wt_base} fetch origin` to get latest refs.\n"
-                    f"2. ALWAYS create your branch from origin/main:\n"
-                    f"   `git -C {wt_base} checkout -b <branch-name> origin/main`\n"
-                    "3. Do your work, commit, push, and open a PR.\n"
-                    "CRITICAL: NEVER branch from the current HEAD — it may be on an unmerged "
-                    "feature branch from a previous task. Always use origin/main as the base.\n"
-                    "For conversational replies or read-only tasks, skip this entirely."
-                )
-
-        resume_id = None
+        # ── Resolve resume target and effective branch first ────────────
+        # The cwd and the branch-related system prompt both depend on the
+        # effective branch (request-supplied or restored from the stored
+        # session), so the SessionStore lookup must happen *before* we
+        # build the worktree or assemble the prompt.
+        resume_id: str | None = None
+        # Branch the upcoming execution should run on.  Defaults to
+        # req.branch; when we resume a session that was started on a
+        # worktree, we override with the stored branch so cwd matches
+        # the original transcript location.
+        effective_branch: str | None = req.branch
         if req.source == "telegram":
             stored = self._sessions.get_with_version(req.chat_id)
             if stored is not None:
-                resume_id, stored_version = stored
+                resume_id, stored_version, stored_branch = stored
                 # Lazy persona invalidation: if the persona has been updated
                 # since this session started, drop the resume.  Conversation
                 # history under the old persona would otherwise override the
@@ -819,6 +796,66 @@ class ClaudeExecutor(Executor):
                     )
                     self._sessions.clear(req.chat_id)
                     resume_id = None
+                elif req.branch is None and stored_branch is not None:
+                    # Follow-up message without an explicit branch signal —
+                    # restore the cwd the session was started on so Claude
+                    # CLI can find the transcript under
+                    # ~/.claude/projects/<cwd-encoded>/<sid>.jsonl.
+                    # Without this, the resume silently starts fresh
+                    # because Claude looks for the transcript under the
+                    # default cwd's project dir and doesn't find it.
+                    log.info(
+                        "Resuming session for chat %s on stored branch %r "
+                        "(req.branch was None)",
+                        req.chat_id, stored_branch,
+                    )
+                    effective_branch = stored_branch
+
+        cwd_override: str | None = None
+        if (
+            effective_branch
+            and self._config.executor_worktree_isolation
+            and is_git_repo(self._config.executor_working_dir)
+        ):
+            try:
+                cwd_override = await ensure_worktree(
+                    self._config.executor_working_dir, effective_branch,
+                )
+            except Exception:
+                log.warning(
+                    "Failed to create worktree for branch %r; falling back to default cwd",
+                    effective_branch, exc_info=True,
+                )
+
+        system_prompt_append: str | None = None
+        wt_base = self._config.executor_working_dir
+        if not effective_branch and is_git_repo(wt_base):
+            if self._config.executor_worktree_isolation:
+                system_prompt_append = (
+                    "## Worktree Isolation\n"
+                    "When this task requires implementing code changes on a new branch:\n"
+                    f"1. First run `git -C {wt_base} fetch origin` to get latest refs.\n"
+                    f"2. Choose a branch name, then: `git worktree add {wt_base}/.worktrees/<branch> -b <branch> origin/main`\n"
+                    f"3. Do all file edits and git operations inside `{wt_base}/.worktrees/<branch>`\n"
+                    "4. Commit, push the branch, and open a PR from the worktree.\n"
+                    "IMPORTANT: Always branch from origin/main to avoid inheriting unrelated in-progress work.\n"
+                    "NEVER create branches from the current HEAD of the main workspace — it may be on an unmerged feature branch.\n"
+                    "For conversational replies or read-only tasks, skip this entirely."
+                )
+            else:
+                system_prompt_append = (
+                    "## Git Branching\n"
+                    "When this task requires implementing code changes:\n"
+                    f"1. First run `git -C {wt_base} fetch origin` to get latest refs.\n"
+                    f"2. ALWAYS create your branch from origin/main:\n"
+                    f"   `git -C {wt_base} checkout -b <branch-name> origin/main`\n"
+                    "3. Do your work, commit, push, and open a PR.\n"
+                    "CRITICAL: NEVER branch from the current HEAD — it may be on an unmerged "
+                    "feature branch from a previous task. Always use origin/main as the base.\n"
+                    "For conversational replies or read-only tasks, skip this entirely."
+                )
+
+        if req.source == "telegram":
             recent = self._recent_tasks.render(req.chat_id)
             if recent:
                 system_prompt_append = (
@@ -866,6 +903,7 @@ class ClaudeExecutor(Executor):
                             if req.source == "telegram":
                                 self._sessions.set_with_version(
                                     req.chat_id, sid, self._persona_version,
+                                    branch=effective_branch,
                                 )
                     elif isinstance(message, ResultMessage) and hasattr(message, "session_id"):
                         sid = message.session_id
@@ -874,6 +912,7 @@ class ClaudeExecutor(Executor):
                             if req.source == "telegram":
                                 self._sessions.set_with_version(
                                     req.chat_id, sid, self._persona_version,
+                                    branch=effective_branch,
                                 )
 
                     text = self._extract_text(message)
