@@ -48,6 +48,12 @@ from .runtime_config import ClaudeRuntimeConfig
 log = logging.getLogger(__name__)
 
 
+# Per-chat SessionStore writes happen at most twice per execution (init +
+# result), so 5 iterations gives ample headroom over the realistic worst
+# case while still bailing on a runaway loop.
+_MAX_SLOT_RESOLVE_ATTEMPTS = 5
+
+
 # ── SDK patches ───────────────────────────────────────────────────────────
 #
 # These monkey-patches keep the Claude CLI bridge usable in our container:
@@ -528,6 +534,33 @@ class ClaudeExecutor(Executor):
 
     # ── Main consumer loop ───────────────────────────────────────────────
 
+    async def _acquire_lock_with_expiry(
+        self, lock: asyncio.Lock, claim_expired: asyncio.Event,
+    ) -> bool:
+        """Acquire ``lock`` or bail when ``claim_expired`` fires.
+
+        Returns ``True`` when the caller now holds the lock.  If
+        ``claim_expired`` won the race, the lock is released (if it
+        had also acquired) and ``False`` is returned.
+        """
+        lock_task = asyncio.create_task(lock.acquire())
+        expire_task = asyncio.create_task(claim_expired.wait())
+        done, pending = await asyncio.wait(
+            [lock_task, expire_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for p in pending:
+            p.cancel()
+            try:
+                await p
+            except asyncio.CancelledError:
+                pass
+        if claim_expired.is_set():
+            if lock_task in done and lock_task.result():
+                lock.release()
+            return False
+        return True
+
     async def _run_one(self, req: ExecutionRequest) -> None:
         claim_expired = asyncio.Event()
         progress_task: asyncio.Task | None = None
@@ -556,42 +589,65 @@ class ClaudeExecutor(Executor):
                     )
                     return
 
-                slot = self._resolve_slot(slot_branch)
-                wt_lock = self._get_worktree_lock(slot)
-
+                # Acquire the worktree lock, then re-resolve under it.
+                # If a same-chat task wrote SessionStore during the
+                # wait, the post-lock effective branch may not match
+                # the peeked slot — execution would then run in branch
+                # Y while serialized on branch X's lock, defeating the
+                # per-worktree mutex.  Release and retry on the
+                # canonical slot.  Converges in ≤2 iterations in
+                # practice (one wait, one resolve, maybe one swap).
+                wt_lock: asyncio.Lock | None = None
                 lock_acquired = False
+                pre_resolved: tuple[str | None, str | None] | None = None
                 try:
-                    lock_task = asyncio.create_task(wt_lock.acquire())
-                    expire_task = asyncio.create_task(claim_expired.wait())
-                    done, pending = await asyncio.wait(
-                        [lock_task, expire_task],
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for p in pending:
-                        p.cancel()
-                        try:
-                            await p
-                        except asyncio.CancelledError:
-                            pass
+                    for attempt in range(_MAX_SLOT_RESOLVE_ATTEMPTS):
+                        slot = self._resolve_slot(slot_branch)
+                        wt_lock = self._get_worktree_lock(slot)
+                        if not await self._acquire_lock_with_expiry(
+                            wt_lock, claim_expired,
+                        ):
+                            log.warning(
+                                "Claim expired while waiting for worktree lock: %s",
+                                req.superpos_task_id,
+                            )
+                            return
 
-                    if claim_expired.is_set():
-                        if lock_task in done and lock_task.result():
-                            wt_lock.release()
+                        pre_resolved = self._resolve_resume_target(req)
+                        _, effective_branch = pre_resolved
+                        if self._resolve_slot(effective_branch) == slot:
+                            lock_acquired = True
+                            break
+
+                        # Effective branch diverged from the slot we
+                        # locked — a same-chat task updated
+                        # SessionStore mid-wait.  Release and reacquire
+                        # on the now-canonical slot so execution and
+                        # serialization agree.
+                        log.info(
+                            "Worktree slot %r diverged from resolved branch %r; "
+                            "swapping lock (attempt %d)",
+                            slot, effective_branch, attempt + 1,
+                        )
+                        wt_lock.release()
+                        wt_lock = None
+                        slot_branch = effective_branch
+                    else:
+                        # Loop exhausted — SessionStore churn for this
+                        # chat is keeping the slot moving.  Bail rather
+                        # than spin: another concurrent same-chat task
+                        # holds the canonical slot, and forcing through
+                        # would defeat the serialization guarantee.
                         log.warning(
-                            "Claim expired while waiting for worktree lock: %s",
-                            req.superpos_task_id,
+                            "Worktree slot kept diverging for chat %s after %d "
+                            "attempts; skipping execution to avoid lock mismatch",
+                            req.chat_id, _MAX_SLOT_RESOLVE_ATTEMPTS,
                         )
                         return
 
-                    lock_acquired = True
-                    # Resolve resume target now that the lock is held:
-                    # any preceding task for this chat sharing the same
-                    # slot has finished and committed its SessionStore
-                    # writes, so this reads the latest entry.
-                    pre_resolved = self._resolve_resume_target(req)
                     await self._execute(req, claim_expired, pre_resolved=pre_resolved)
                 finally:
-                    if lock_acquired:
+                    if lock_acquired and wt_lock is not None:
                         wt_lock.release()
         except asyncio.CancelledError:
             try:

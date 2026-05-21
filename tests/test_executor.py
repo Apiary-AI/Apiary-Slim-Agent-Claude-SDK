@@ -1698,6 +1698,84 @@ async def test_resume_target_observes_sessionstore_writes_during_lock_wait(
     )
 
 
+async def test_lock_swaps_to_canonical_slot_when_branch_diverges_post_resolve(
+    executor, mock_config,
+):
+    """Regression: if a same-chat task writes SessionStore mid-wait,
+    the peeked branch can mismatch the post-lock resolved branch.
+    Execution must serialize on the resolved slot — otherwise it runs
+    in branch B while holding branch A's lock, defeating the
+    per-worktree mutex and allowing concurrent git mutations in the
+    same tree under ``executor_max_parallel > 1``.
+    """
+    mock_config.executor_worktree_isolation = True
+    mock_config.executor_working_dir = "/workspace"
+
+    executor._persona_version = 1
+
+    # Pre-existing stored entry — what the pre-lock peek sees.
+    executor._sessions.set_with_version(
+        "chat-1", "sess-old", 1, branch="feat/old",
+    )
+
+    req = ExecutionRequest(
+        prompt="follow-up", chat_id="chat-1", source="telegram",
+    )
+
+    captured_pre_resolved: list = []
+    locks_acquired: list[str] = []
+
+    async def fake_execute(req, claim_expired, pre_resolved=None):
+        captured_pre_resolved.append(pre_resolved)
+
+    original_resolve_slot = executor._resolve_slot
+    original_get_lock = executor._get_worktree_lock
+
+    def get_lock_recording(slot):
+        locks_acquired.append(slot)
+        return original_get_lock(slot)
+
+    resolve_count = {"n": 0}
+
+    def resolve_slot_with_first_call_swap(branch):
+        # On the FIRST call (pre-lock, peeked branch=feat/old), simulate
+        # a same-chat task committing a SessionStore write that swaps the
+        # branch.  The post-lock resolve will then see the new branch
+        # and the loop must re-acquire on its slot.
+        resolve_count["n"] += 1
+        if resolve_count["n"] == 1:
+            executor._sessions.set_with_version(
+                "chat-1", "sess-new", 1, branch="feat/new",
+            )
+        return original_resolve_slot(branch)
+
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True), \
+         patch.object(executor, "_resolve_slot", side_effect=resolve_slot_with_first_call_swap), \
+         patch.object(executor, "_get_worktree_lock", side_effect=get_lock_recording), \
+         patch.object(executor, "_execute", side_effect=fake_execute), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer"):
+        await executor.queue.put(req)
+        await executor.queue.get()
+        await executor._run_one(req)
+
+    assert captured_pre_resolved, "_execute was never called"
+    resume_id, branch = captured_pre_resolved[0]
+    assert resume_id == "sess-new" and branch == "feat/new", (
+        f"Expected post-lock resolve to land on (sess-new, feat/new); "
+        f"got ({resume_id!r}, {branch!r})"
+    )
+    # Two locks must have been touched: the peeked slot (feat/old) and
+    # the post-resolve canonical slot (feat/new).  The peek slot is
+    # released and the canonical slot is held for execution.
+    assert len(locks_acquired) >= 2, (
+        f"Expected at least one lock swap; locks_acquired={locks_acquired!r}"
+    )
+    assert locks_acquired[0] != locks_acquired[-1], (
+        f"Slot swap didn't happen — peek and final slot are identical: "
+        f"{locks_acquired!r}"
+    )
+
+
 async def test_session_save_pins_branch_only_when_worktree_used(
     executor, mock_config,
 ):
