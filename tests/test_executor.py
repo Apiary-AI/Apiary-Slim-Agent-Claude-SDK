@@ -1422,7 +1422,7 @@ async def test_execute_tracks_chat_task_for_stop(executor, mock_config):
     started = asyncio.Event()
     inner_was_cancelled = asyncio.Event()
 
-    async def slow_execute_inner(_req, _streamer, _retries):
+    async def slow_execute_inner(_req, _streamer, _retries, **_kwargs):
         started.set()
         try:
             await asyncio.sleep(60)
@@ -1634,6 +1634,68 @@ async def test_resume_falls_back_to_default_when_stored_branch_is_none(
         await executor._execute_inner(req, streamer, retries=1)
 
     mock_ensure.assert_not_called()
+
+
+async def test_resume_target_observes_sessionstore_writes_during_lock_wait(
+    executor, mock_config,
+):
+    """Regression for Codex P1 on resume-target snapshot timing.
+
+    Scenario: msg A is running for chat-1, msg B for the same chat
+    queues up.  A finishes and writes a new session id to SessionStore.
+    B then acquires the worktree lock and starts executing.  If B
+    snapshotted its resume target at queue time, it would resume A's
+    *old* session id and lose the most recent context.  The fix
+    resolves the resume target *after* the worktree lock is held, so B
+    observes A's just-committed write.
+
+    Simulated here by mutating SessionStore inside ``_resolve_slot``,
+    which runs after the peek (pre-lock) and before the post-lock
+    resolve.  ``pre_resolved`` passed to ``_execute`` must carry the
+    new session id.
+    """
+    mock_config.executor_worktree_isolation = False
+    executor._persona_version = 1
+
+    # Stored entry at the time msg B's _run_one starts — i.e., what
+    # the old (buggy) pre-lock snapshot would have captured.
+    executor._sessions.set_with_version(
+        "chat-1", "sess-old", 1, branch=None,
+    )
+
+    req = ExecutionRequest(
+        prompt="follow-up", chat_id="chat-1", source="telegram",
+    )
+
+    captured_pre_resolved: list = []
+
+    async def fake_execute(req, claim_expired, pre_resolved=None):
+        captured_pre_resolved.append(pre_resolved)
+
+    original_resolve_slot = executor._resolve_slot
+
+    def resolve_slot_with_concurrent_write(branch):
+        # Stand-in for msg A finishing and committing its
+        # ``set_with_version`` write while msg B holds the semaphore
+        # but hasn't yet resolved its resume target.
+        executor._sessions.set_with_version(
+            "chat-1", "sess-new", 1, branch=None,
+        )
+        return original_resolve_slot(branch)
+
+    with patch.object(executor, "_resolve_slot", side_effect=resolve_slot_with_concurrent_write), \
+         patch.object(executor, "_execute", side_effect=fake_execute), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer"):
+        await executor.queue.put(req)
+        await executor.queue.get()
+        await executor._run_one(req)
+
+    assert captured_pre_resolved, "_execute was never called"
+    resume_id, _branch = captured_pre_resolved[0]
+    assert resume_id == "sess-new", (
+        f"Expected post-lock resolution to see the new session id "
+        f"committed during the lock wait, but got {resume_id!r}"
+    )
 
 
 async def test_session_save_pins_branch_only_when_worktree_used(

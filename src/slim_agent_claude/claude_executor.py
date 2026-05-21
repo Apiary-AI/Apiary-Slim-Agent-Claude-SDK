@@ -436,6 +436,33 @@ class ClaudeExecutor(Executor):
 
     # ── Resume target resolution ─────────────────────────────────────────
 
+    def _peek_effective_branch(
+        self, req: ExecutionRequest,
+    ) -> str | None:
+        """Branch the slot lock should key off, *without* mutating state.
+
+        Called from ``_run_one`` before the worktree lock is acquired
+        so the slot we lock matches the cwd ``_execute_inner`` will
+        actually use.  Reads — but does not clear — the SessionStore
+        entry, leaving full resolution (persona invalidation, resume
+        id) to :meth:`_resolve_resume_target`, which fires *after* the
+        lock so it observes whatever a preceding task for this chat
+        wrote back.
+
+        In the rare case where persona invalidation will fire post-lock
+        and reset the effective branch, the slot picked here can be a
+        miss — accepted as a minor scheduling cost.  The common case
+        (no persona bump between peek and resolve) sees peek and
+        resolution agree on the branch.
+        """
+        if req.branch is not None or req.source != "telegram":
+            return req.branch
+        stored = self._sessions.get_with_version(req.chat_id)
+        if stored is None:
+            return None
+        _, _, stored_branch = stored
+        return stored_branch
+
     def _resolve_resume_target(
         self, req: ExecutionRequest,
     ) -> tuple[str | None, str | None]:
@@ -505,16 +532,15 @@ class ClaudeExecutor(Executor):
         claim_expired = asyncio.Event()
         progress_task: asyncio.Task | None = None
 
-        # Resolve resume target up front so the worktree lock key, the
-        # cwd built by ``_execute_inner``, and the SessionStore writes
-        # all agree on the same effective branch.  Without this, a
-        # resumed Telegram turn (whose effective branch comes from the
-        # stored session) would key the lock by ``req.branch`` — often
-        # ``None → "__main__"`` — while execution runs in the stored
-        # branch's worktree, letting two tasks targeting the same branch
-        # run concurrently against the same git tree.
-        pre_resolved = self._resolve_resume_target(req)
-        _, effective_branch = pre_resolved
+        # Two-phase lookup.  The slot lock has to key off the effective
+        # branch (otherwise a resumed turn with ``req.branch=None`` but
+        # ``stored_branch=X`` would lock ``__main__`` while running in
+        # the X worktree), so we peek the branch up front for the slot
+        # key.  But the resume id has to come from SessionStore *after*
+        # the lock is held — otherwise a follow-up message would
+        # snapshot the stored id at queue time and miss the newer id
+        # the preceding task for this chat wrote when it finished.
+        slot_branch = self._peek_effective_branch(req)
 
         if req.source == "superpos" and req.superpos_task_id and self._superpos:
             progress_task = asyncio.create_task(
@@ -530,7 +556,7 @@ class ClaudeExecutor(Executor):
                     )
                     return
 
-                slot = self._resolve_slot(effective_branch)
+                slot = self._resolve_slot(slot_branch)
                 wt_lock = self._get_worktree_lock(slot)
 
                 lock_acquired = False
@@ -558,6 +584,11 @@ class ClaudeExecutor(Executor):
                         return
 
                     lock_acquired = True
+                    # Resolve resume target now that the lock is held:
+                    # any preceding task for this chat sharing the same
+                    # slot has finished and committed its SessionStore
+                    # writes, so this reads the latest entry.
+                    pre_resolved = self._resolve_resume_target(req)
                     await self._execute(req, claim_expired, pre_resolved=pre_resolved)
                 finally:
                     if lock_acquired:
