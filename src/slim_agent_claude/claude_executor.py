@@ -891,6 +891,17 @@ class ClaudeExecutor(Executor):
                     effective_branch, exc_info=True,
                 )
 
+        # The branch we pin on the SessionStore entry must match where the
+        # transcript actually lives.  Claude CLI writes the transcript under
+        # ``~/.claude/projects/<encoded-cwd>/<sid>.jsonl``, so a future
+        # resume that restores cwd from the stored branch will look in the
+        # wrong project dir whenever execution didn't actually run in the
+        # worktree (ensure_worktree raised, isolation disabled, or the repo
+        # isn't git).  In those cases the transcript lives under the default
+        # cwd's project dir; pin branch=None so future resumes resolve to
+        # the same default cwd and find it.
+        session_branch = effective_branch if cwd_override else None
+
         system_prompt_append: str | None = None
         wt_base = self._config.executor_working_dir
         if not effective_branch and is_git_repo(wt_base):
@@ -967,7 +978,7 @@ class ClaudeExecutor(Executor):
                             if req.source == "telegram":
                                 self._sessions.set_with_version(
                                     req.chat_id, sid, self._persona_version,
-                                    branch=effective_branch,
+                                    branch=session_branch,
                                 )
                     elif isinstance(message, ResultMessage) and hasattr(message, "session_id"):
                         sid = message.session_id
@@ -976,7 +987,7 @@ class ClaudeExecutor(Executor):
                             if req.source == "telegram":
                                 self._sessions.set_with_version(
                                     req.chat_id, sid, self._persona_version,
-                                    branch=effective_branch,
+                                    branch=session_branch,
                                 )
 
                     text = self._extract_text(message)

@@ -1636,6 +1636,57 @@ async def test_resume_falls_back_to_default_when_stored_branch_is_none(
     mock_ensure.assert_not_called()
 
 
+async def test_session_save_pins_branch_only_when_worktree_used(
+    executor, mock_config,
+):
+    """When ensure_worktree raises, execution falls back to the default
+    cwd — the transcript is then written under that default cwd's
+    project dir.  The stored branch must be None in that case, otherwise
+    a future resume would restore cwd to the worktree path and Claude
+    CLI would silently fail to find the transcript (then start fresh).
+    """
+    from claude_code_sdk.types import SystemMessage
+
+    mock_config.executor_worktree_isolation = True
+    mock_config.executor_working_dir = "/workspace"
+
+    executor._persona_version = 1
+    # No prior session; this is a fresh first turn that *requests* a
+    # branch, but the worktree creation will fail.
+    req = ExecutionRequest(
+        prompt="hello", chat_id="chat-x", source="telegram",
+        branch="bad-branch",
+    )
+
+    init_msg = SystemMessage(
+        subtype="init",
+        data={"session_id": "sess-new", "type": "system", "subtype": "init"},
+    )
+
+    async def stream_init():
+        yield init_msg
+
+    with patch("slim_agent_claude.claude_executor.is_git_repo", return_value=True), \
+         patch("slim_agent_claude.claude_executor.ensure_worktree", new_callable=AsyncMock) as mock_ensure, \
+         patch("slim_agent_claude.claude_executor.query", side_effect=lambda *a, **kw: stream_init()), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        mock_ensure.side_effect = RuntimeError("git error")
+        streamer = MockStreamer.return_value
+        streamer.start = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.append = AsyncMock()
+        streamer.error = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=1)
+
+    assert executor._sessions.get_with_version("chat-x") == (
+        "sess-new", 1, None,
+    ), (
+        "ensure_worktree failed → transcript lives under default cwd → "
+        "stored branch must be None so resumes resolve to the same path"
+    )
+
+
 # --- cleanup_stale_sessions walks every project subdir ─────────────────
 
 def test_cleanup_stale_sessions_walks_worktree_project_dirs(
