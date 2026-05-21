@@ -1404,3 +1404,60 @@ async def test_new_session_id_stored_with_current_persona_version(
         await executor._execute_inner(req, streamer, retries=1)
 
     assert executor._sessions.get_with_version("chat-new") == ("sess-fresh", 7)
+
+
+# --- /stop wiring ---------------------------------------------------------
+
+
+async def test_execute_tracks_chat_task_for_stop(executor, mock_config):
+    """Core's base-class ``cancel_chat`` can only see in-flight work if
+    executors register their inner task via ``_track_chat_task``.  Verify
+    that hook actually runs from ``_execute`` so /stop is real.
+    """
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
+
+    req = ExecutionRequest(prompt="hi", chat_id="chat-stop", source="telegram")
+
+    started = asyncio.Event()
+    inner_was_cancelled = asyncio.Event()
+
+    async def slow_execute_inner(_req, _streamer, _retries):
+        started.set()
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            inner_was_cancelled.set()
+            raise
+
+    with patch.object(executor, "_execute_inner", slow_execute_inner), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        MockStreamer.return_value.start = AsyncMock()
+        MockStreamer.return_value.finish = AsyncMock()
+
+        runner = asyncio.create_task(executor._execute(req, asyncio.Event()))
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+
+        # _execute should have registered the inner task under "chat-stop"
+        assert "chat-stop" in executor._chat_tasks, (
+            "executor._track_chat_task must be called from _execute so /stop "
+            "can find this in-flight work"
+        )
+
+        # Simulate /stop firing
+        cancelled = executor.cancel_chat("chat-stop")
+        assert cancelled == 1
+
+        await asyncio.wait_for(inner_was_cancelled.wait(), timeout=2.0)
+
+        try:
+            await asyncio.wait_for(runner, timeout=2.0)
+        except (asyncio.CancelledError, asyncio.TimeoutError):
+            runner.cancel()
+            try:
+                await runner
+            except asyncio.CancelledError:
+                pass
+
+    # Auto-untrack via done callback
+    assert "chat-stop" not in executor._chat_tasks
