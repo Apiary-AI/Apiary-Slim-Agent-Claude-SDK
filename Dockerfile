@@ -25,16 +25,9 @@ COPY src/ /app/src/
 COPY entrypoint.sh /app/entrypoint.sh
 COPY workspace/ /workspace/
 
-# Symlink module scripts onto PATH so Claude can call them by name
-RUN mkdir -p /workspace/.claude/modules-bin && \
-    for dir in /workspace/.claude/modules/*/scripts; do \
-      if [ -d "$dir" ]; then \
-        for script in "$dir"/*; do \
-          chmod +x "$script" && \
-          ln -sf "$script" /workspace/.claude/modules-bin/$(basename "$script"); \
-        done; \
-      fi; \
-    done
+# Symlinks into modules-bin are created at startup by entrypoint.sh
+# (via `python3 -m superpos_agent_core.module_setup --bin-dir ...`) so
+# both workspace and bundled modules' scripts end up on PATH together.
 ENV PATH="/workspace/.claude/modules-bin:$PATH"
 
 # Create non-root user (required for bypassPermissions mode)

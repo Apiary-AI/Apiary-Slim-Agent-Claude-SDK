@@ -34,10 +34,14 @@ if [ -n "$GITHUB_TOKEN" ]; then
     gh auth setup-git 2>/dev/null || true
 fi
 
-# Run module setup (install deps, update CLAUDE.md)
+# Run module setup: install deps, symlink scripts onto PATH, update CLAUDE.md.
+# --bin-dir links scripts from both workspace and core-bundled modules,
+# so platform tools (e.g. superpos-issues) work even when nothing is in
+# /workspace/.claude/modules.
 python3 -m superpos_agent_core.module_setup \
     --modules-dir /workspace/.claude/modules \
     --agents-md /workspace/CLAUDE.md \
+    --bin-dir /workspace/.claude/modules-bin \
     || echo "Warning: module setup failed"
 
 exec "$@"
