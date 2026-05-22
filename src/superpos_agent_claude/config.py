@@ -15,6 +15,11 @@ class ClaudeConfig(BaseConfig):
     anthropic_api_key: str = ""
     claude_model: str = "claude-opus-4-8"
     claude_effort: str = "high"
+    # Max seconds the claude SDK iterator may go without yielding a message
+    # before we treat the subprocess as deadlocked and cancel.  Set generously
+    # to survive long Bash tool calls — the per-tool SDK timeout will fire
+    # first under normal conditions and advance the iterator.
+    claude_stall_timeout: int = 900
 
     def __post_init__(self) -> None:
         if not self.executor_kind or self.executor_kind == "generic":
@@ -55,5 +60,6 @@ class ClaudeConfig(BaseConfig):
             anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
             claude_model=os.environ.get("CLAUDE_MODEL", "claude-opus-4-8"),
             claude_effort=os.environ.get("CLAUDE_EFFORT", "high"),
+            claude_stall_timeout=int(os.environ.get("CLAUDE_STALL_TIMEOUT", "900")),
         )
         return cls(**base)
