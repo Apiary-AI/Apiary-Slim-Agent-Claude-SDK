@@ -48,6 +48,12 @@ from .runtime_config import ClaudeRuntimeConfig
 log = logging.getLogger(__name__)
 
 
+# Per-chat SessionStore writes happen at most twice per execution (init +
+# result), so 5 iterations gives ample headroom over the realistic worst
+# case while still bailing on a runaway loop.
+_MAX_SLOT_RESOLVE_ATTEMPTS = 5
+
+
 # ── SDK patches ───────────────────────────────────────────────────────────
 #
 # These monkey-patches keep the Claude CLI bridge usable in our container:
@@ -330,6 +336,13 @@ class ClaudeExecutor(Executor):
         the next ``--resume`` would silently fall through to a fresh
         session, and the user would experience "agent lost the
         conversation on restart".  We preserve every id still mapped.
+
+        Worktree-scoped sessions live under their own
+        ``projects/<encoded-cwd>/`` dir (one per branch), so we scan every
+        subdirectory of ``projects/`` rather than only the main workspace
+        project.  Otherwise idle worktree sessions accumulate unbounded
+        and active ones risk deletion if the agent later runs on a
+        different branch.
         """
         counts = {"projects": 0, "session_env": 0, "bytes_freed": 0}
         cutoff = time.time() - (max_age_hours * 3600)
@@ -341,27 +354,31 @@ class ClaudeExecutor(Executor):
             # Both `<sid>` (dir) and `<sid>.jsonl` (transcript) live in projects/.
             return name[:-6] if name.endswith(".jsonl") else name
 
-        projects_dir = os.path.join(claude_dir, "projects", "-workspace")
-        if os.path.isdir(projects_dir):
-            for name in os.listdir(projects_dir):
-                path = os.path.join(projects_dir, name)
-                if not os.path.isdir(path):
+        projects_root = os.path.join(claude_dir, "projects")
+        if os.path.isdir(projects_root):
+            for project_name in os.listdir(projects_root):
+                projects_dir = os.path.join(projects_root, project_name)
+                if not os.path.isdir(projects_dir):
                     continue
-                if _session_id_from_name(name) in preserve:
-                    continue
-                try:
-                    mtime = os.path.getmtime(path)
-                    if mtime < cutoff:
-                        size = sum(
-                            os.path.getsize(os.path.join(dp, f))
-                            for dp, _, fns in os.walk(path)
-                            for f in fns
-                        )
-                        shutil.rmtree(path)
-                        counts["projects"] += 1
-                        counts["bytes_freed"] += size
-                except OSError:
-                    pass
+                for name in os.listdir(projects_dir):
+                    path = os.path.join(projects_dir, name)
+                    if not os.path.isdir(path):
+                        continue
+                    if _session_id_from_name(name) in preserve:
+                        continue
+                    try:
+                        mtime = os.path.getmtime(path)
+                        if mtime < cutoff:
+                            size = sum(
+                                os.path.getsize(os.path.join(dp, f))
+                                for dp, _, fns in os.walk(path)
+                                for f in fns
+                            )
+                            shutil.rmtree(path)
+                            counts["projects"] += 1
+                            counts["bytes_freed"] += size
+                    except OSError:
+                        pass
 
         # Claude CLI writes per-session env snapshots to `session-env`
         # (hyphenated).  The pre-port code scanned `session_env` (underscore)
@@ -405,20 +422,158 @@ class ClaudeExecutor(Executor):
             self._worktree_locks[slot] = asyncio.Lock()
         return self._worktree_locks[slot]
 
-    def _resolve_slot(self, req: ExecutionRequest) -> str:
+    def _resolve_slot(self, branch: str | None) -> str:
+        """Return the worktree lock key for ``branch``.
+
+        Callers pass the *effective* branch — i.e. the branch the
+        execution will actually run on after any SessionStore-based
+        restoration — so the lock key matches the cwd used by
+        ``_execute_inner``.  Passing ``req.branch`` directly is unsafe
+        for resumed Telegram turns where the effective branch comes
+        from the stored session.
+        """
         if (
-            req.branch
+            branch
             and self._config.executor_worktree_isolation
             and is_git_repo(self._config.executor_working_dir)
         ):
-            return worktree_path(self._config.executor_working_dir, req.branch)
+            return worktree_path(self._config.executor_working_dir, branch)
         return "__main__"
 
+    # ── Resume target resolution ─────────────────────────────────────────
+
+    def _peek_effective_branch(
+        self, req: ExecutionRequest,
+    ) -> str | None:
+        """Branch the slot lock should key off, *without* mutating state.
+
+        Called from ``_run_one`` before the worktree lock is acquired
+        so the slot we lock matches the cwd ``_execute_inner`` will
+        actually use.  Reads — but does not clear — the SessionStore
+        entry, leaving full resolution (persona invalidation, resume
+        id) to :meth:`_resolve_resume_target`, which fires *after* the
+        lock so it observes whatever a preceding task for this chat
+        wrote back.
+
+        In the rare case where persona invalidation will fire post-lock
+        and reset the effective branch, the slot picked here can be a
+        miss — accepted as a minor scheduling cost.  The common case
+        (no persona bump between peek and resolve) sees peek and
+        resolution agree on the branch.
+        """
+        if req.branch is not None or req.source != "telegram":
+            return req.branch
+        stored = self._sessions.get_with_version(req.chat_id)
+        if stored is None:
+            return None
+        _, _, stored_branch = stored
+        return stored_branch
+
+    def _resolve_resume_target(
+        self, req: ExecutionRequest,
+    ) -> tuple[str | None, str | None]:
+        """Return ``(resume_id, effective_branch)`` for this request.
+
+        Reads the SessionStore for Telegram chats and applies two
+        policies:
+
+        * Persona invalidation — if the stored session was written under
+          an older persona version, drop the resume and clear the entry
+          so the next run starts fresh.
+        * Branch restoration — when the request has no explicit branch
+          (no ``--branch`` token, no PR ref in the text), inherit the
+          branch the session was started on so cwd matches the
+          original transcript at
+          ``~/.claude/projects/<encoded-cwd>/<sid>.jsonl``.
+
+        Called by ``_run_one`` *before* slot resolution so the worktree
+        lock key matches the cwd ``_execute_inner`` will actually use.
+        Non-Telegram sources (Superpos tasks) skip the SessionStore
+        entirely and pass ``req.branch`` through unchanged.
+
+        This call mutates the SessionStore when persona invalidation
+        triggers (clears the stale entry).  Call it exactly once per
+        request — ``_run_one`` does so and threads the result into
+        ``_execute`` / ``_execute_inner`` via ``pre_resolved``.
+        """
+        if req.source != "telegram":
+            return None, req.branch
+        stored = self._sessions.get_with_version(req.chat_id)
+        if stored is None:
+            return None, req.branch
+        resume_id, stored_version, stored_branch = stored
+        # Lazy persona invalidation: a session started under an older
+        # persona must not be resumed — Claude stays consistent with
+        # prior turns, so the new --append-system-prompt alone can't
+        # undo an old self-introduction in the resumed transcript.
+        # `stored_version is None` covers the startup race where
+        # Telegram polling can write a session before the Superpos
+        # version poller has populated `_persona_version`.
+        if self._persona_version is not None and (
+            stored_version is None
+            or stored_version < self._persona_version
+        ):
+            log.info(
+                "Dropping resume for chat %s: session persona v%s < "
+                "current v%s — starting fresh",
+                req.chat_id,
+                "?" if stored_version is None else stored_version,
+                self._persona_version,
+            )
+            self._sessions.clear(req.chat_id)
+            return None, req.branch
+        effective_branch = req.branch
+        if req.branch is None and stored_branch is not None:
+            log.info(
+                "Resuming session for chat %s on stored branch %r "
+                "(req.branch was None)",
+                req.chat_id, stored_branch,
+            )
+            effective_branch = stored_branch
+        return resume_id, effective_branch
+
     # ── Main consumer loop ───────────────────────────────────────────────
+
+    async def _acquire_lock_with_expiry(
+        self, lock: asyncio.Lock, claim_expired: asyncio.Event,
+    ) -> bool:
+        """Acquire ``lock`` or bail when ``claim_expired`` fires.
+
+        Returns ``True`` when the caller now holds the lock.  If
+        ``claim_expired`` won the race, the lock is released (if it
+        had also acquired) and ``False`` is returned.
+        """
+        lock_task = asyncio.create_task(lock.acquire())
+        expire_task = asyncio.create_task(claim_expired.wait())
+        done, pending = await asyncio.wait(
+            [lock_task, expire_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for p in pending:
+            p.cancel()
+            try:
+                await p
+            except asyncio.CancelledError:
+                pass
+        if claim_expired.is_set():
+            if lock_task in done and lock_task.result():
+                lock.release()
+            return False
+        return True
 
     async def _run_one(self, req: ExecutionRequest) -> None:
         claim_expired = asyncio.Event()
         progress_task: asyncio.Task | None = None
+
+        # Two-phase lookup.  The slot lock has to key off the effective
+        # branch (otherwise a resumed turn with ``req.branch=None`` but
+        # ``stored_branch=X`` would lock ``__main__`` while running in
+        # the X worktree), so we peek the branch up front for the slot
+        # key.  But the resume id has to come from SessionStore *after*
+        # the lock is held — otherwise a follow-up message would
+        # snapshot the stored id at queue time and miss the newer id
+        # the preceding task for this chat wrote when it finished.
+        slot_branch = self._peek_effective_branch(req)
 
         if req.source == "superpos" and req.superpos_task_id and self._superpos:
             progress_task = asyncio.create_task(
@@ -434,37 +589,65 @@ class ClaudeExecutor(Executor):
                     )
                     return
 
-                slot = self._resolve_slot(req)
-                wt_lock = self._get_worktree_lock(slot)
-
+                # Acquire the worktree lock, then re-resolve under it.
+                # If a same-chat task wrote SessionStore during the
+                # wait, the post-lock effective branch may not match
+                # the peeked slot — execution would then run in branch
+                # Y while serialized on branch X's lock, defeating the
+                # per-worktree mutex.  Release and retry on the
+                # canonical slot.  Converges in ≤2 iterations in
+                # practice (one wait, one resolve, maybe one swap).
+                wt_lock: asyncio.Lock | None = None
                 lock_acquired = False
+                pre_resolved: tuple[str | None, str | None] | None = None
                 try:
-                    lock_task = asyncio.create_task(wt_lock.acquire())
-                    expire_task = asyncio.create_task(claim_expired.wait())
-                    done, pending = await asyncio.wait(
-                        [lock_task, expire_task],
-                        return_when=asyncio.FIRST_COMPLETED,
-                    )
-                    for p in pending:
-                        p.cancel()
-                        try:
-                            await p
-                        except asyncio.CancelledError:
-                            pass
+                    for attempt in range(_MAX_SLOT_RESOLVE_ATTEMPTS):
+                        slot = self._resolve_slot(slot_branch)
+                        wt_lock = self._get_worktree_lock(slot)
+                        if not await self._acquire_lock_with_expiry(
+                            wt_lock, claim_expired,
+                        ):
+                            log.warning(
+                                "Claim expired while waiting for worktree lock: %s",
+                                req.superpos_task_id,
+                            )
+                            return
 
-                    if claim_expired.is_set():
-                        if lock_task in done and lock_task.result():
-                            wt_lock.release()
+                        pre_resolved = self._resolve_resume_target(req)
+                        _, effective_branch = pre_resolved
+                        if self._resolve_slot(effective_branch) == slot:
+                            lock_acquired = True
+                            break
+
+                        # Effective branch diverged from the slot we
+                        # locked — a same-chat task updated
+                        # SessionStore mid-wait.  Release and reacquire
+                        # on the now-canonical slot so execution and
+                        # serialization agree.
+                        log.info(
+                            "Worktree slot %r diverged from resolved branch %r; "
+                            "swapping lock (attempt %d)",
+                            slot, effective_branch, attempt + 1,
+                        )
+                        wt_lock.release()
+                        wt_lock = None
+                        slot_branch = effective_branch
+                    else:
+                        # Loop exhausted — SessionStore churn for this
+                        # chat is keeping the slot moving.  Bail rather
+                        # than spin: another concurrent same-chat task
+                        # holds the canonical slot, and forcing through
+                        # would defeat the serialization guarantee.
                         log.warning(
-                            "Claim expired while waiting for worktree lock: %s",
-                            req.superpos_task_id,
+                            "Worktree slot kept diverging for chat %s after %d "
+                            "attempts; skipping execution to avoid lock mismatch",
+                            req.chat_id, _MAX_SLOT_RESOLVE_ATTEMPTS,
                         )
                         return
 
-                    lock_acquired = True
-                    await self._execute(req, claim_expired)
+                    await self._execute(req, claim_expired, pre_resolved=pre_resolved)
                 finally:
-                    if lock_acquired:
+                    if lock_acquired and wt_lock is not None:
                         wt_lock.release()
         except asyncio.CancelledError:
             try:
@@ -506,8 +689,22 @@ class ClaudeExecutor(Executor):
                 log.debug("Progress update failed for task %s", task_id)
 
     async def _execute(
-        self, req: ExecutionRequest, claim_expired: asyncio.Event, retries: int = 3,
+        self,
+        req: ExecutionRequest,
+        claim_expired: asyncio.Event,
+        retries: int = 3,
+        *,
+        pre_resolved: tuple[str | None, str | None] | None = None,
     ) -> None:
+        """Run a single request to completion.
+
+        ``pre_resolved`` is the ``(resume_id, effective_branch)`` pair
+        already computed by ``_run_one``.  Threading it through avoids
+        a redundant SessionStore lookup in ``_execute_inner`` (and the
+        risk of repeating the persona-invalidation side effect).
+        Direct callers — e.g. unit tests — may omit it and let the
+        inner method fall back to ``_resolve_resume_target`` itself.
+        """
         self._active_count += 1
         if self._active_count == 1 and self._superpos:
             try:
@@ -530,7 +727,9 @@ class ClaudeExecutor(Executor):
                 inner_task.cancel()
 
         try:
-            inner_task = asyncio.create_task(self._execute_inner(req, streamer, retries))
+            inner_task = asyncio.create_task(
+                self._execute_inner(req, streamer, retries, pre_resolved=pre_resolved),
+            )
             # Register with the base class so the /stop Telegram command can
             # find and cancel this in-flight work via cancel_chat(chat_id).
             # Auto-untracks via done callback — no cleanup needed in finally.
@@ -740,30 +939,59 @@ class ClaudeExecutor(Executor):
         return ClaudeCodeOptions(**opts)
 
     async def _execute_inner(
-        self, req: ExecutionRequest, streamer: TelegramStreamer, retries: int,
+        self,
+        req: ExecutionRequest,
+        streamer: TelegramStreamer,
+        retries: int,
+        *,
+        pre_resolved: tuple[str | None, str | None] | None = None,
     ) -> None:
         t0 = time.monotonic()
         full_text = ""
 
+        # ``_run_one`` resolves the resume target before slot/lock
+        # acquisition so the lock key matches the cwd we use here.
+        # When called via that path ``pre_resolved`` carries the
+        # result; direct callers (unit tests, future entrypoints) fall
+        # back to the helper.  Calling the helper twice for one
+        # request is safe — persona invalidation already cleared the
+        # entry on the first call — but it's redundant work, so
+        # prefer pre_resolved.
+        if pre_resolved is not None:
+            resume_id, effective_branch = pre_resolved
+        else:
+            resume_id, effective_branch = self._resolve_resume_target(req)
+
         cwd_override: str | None = None
         if (
-            req.branch
+            effective_branch
             and self._config.executor_worktree_isolation
             and is_git_repo(self._config.executor_working_dir)
         ):
             try:
                 cwd_override = await ensure_worktree(
-                    self._config.executor_working_dir, req.branch,
+                    self._config.executor_working_dir, effective_branch,
                 )
             except Exception:
                 log.warning(
                     "Failed to create worktree for branch %r; falling back to default cwd",
-                    req.branch, exc_info=True,
+                    effective_branch, exc_info=True,
                 )
+
+        # The branch we pin on the SessionStore entry must match where the
+        # transcript actually lives.  Claude CLI writes the transcript under
+        # ``~/.claude/projects/<encoded-cwd>/<sid>.jsonl``, so a future
+        # resume that restores cwd from the stored branch will look in the
+        # wrong project dir whenever execution didn't actually run in the
+        # worktree (ensure_worktree raised, isolation disabled, or the repo
+        # isn't git).  In those cases the transcript lives under the default
+        # cwd's project dir; pin branch=None so future resumes resolve to
+        # the same default cwd and find it.
+        session_branch = effective_branch if cwd_override else None
 
         system_prompt_append: str | None = None
         wt_base = self._config.executor_working_dir
-        if not req.branch and is_git_repo(wt_base):
+        if not effective_branch and is_git_repo(wt_base):
             if self._config.executor_worktree_isolation:
                 system_prompt_append = (
                     "## Worktree Isolation\n"
@@ -789,36 +1017,7 @@ class ClaudeExecutor(Executor):
                     "For conversational replies or read-only tasks, skip this entirely."
                 )
 
-        resume_id = None
         if req.source == "telegram":
-            stored = self._sessions.get_with_version(req.chat_id)
-            if stored is not None:
-                resume_id, stored_version = stored
-                # Lazy persona invalidation: if the persona has been updated
-                # since this session started, drop the resume.  Conversation
-                # history under the old persona would otherwise override the
-                # new identity/behavior — Claude stays consistent with prior
-                # turns, so the new --append-system-prompt alone can't undo
-                # an old self-introduction in the resume transcript.
-                #
-                # `stored_version is None` covers the startup race where
-                # Telegram polling can write a session before the Superpos
-                # version poller has populated `_persona_version`.  Without
-                # this, those sessions would be permanently exempt from
-                # invalidation on later persona bumps.
-                if self._persona_version is not None and (
-                    stored_version is None
-                    or stored_version < self._persona_version
-                ):
-                    log.info(
-                        "Dropping resume for chat %s: session persona v%s < "
-                        "current v%s — starting fresh",
-                        req.chat_id,
-                        "?" if stored_version is None else stored_version,
-                        self._persona_version,
-                    )
-                    self._sessions.clear(req.chat_id)
-                    resume_id = None
             recent = self._recent_tasks.render(req.chat_id)
             if recent:
                 system_prompt_append = (
@@ -866,6 +1065,7 @@ class ClaudeExecutor(Executor):
                             if req.source == "telegram":
                                 self._sessions.set_with_version(
                                     req.chat_id, sid, self._persona_version,
+                                    branch=session_branch,
                                 )
                     elif isinstance(message, ResultMessage) and hasattr(message, "session_id"):
                         sid = message.session_id
@@ -874,6 +1074,7 @@ class ClaudeExecutor(Executor):
                             if req.source == "telegram":
                                 self._sessions.set_with_version(
                                     req.chat_id, sid, self._persona_version,
+                                    branch=session_branch,
                                 )
 
                     text = self._extract_text(message)
