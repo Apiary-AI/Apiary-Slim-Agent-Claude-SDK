@@ -25,9 +25,21 @@ COPY src/ /app/src/
 COPY entrypoint.sh /app/entrypoint.sh
 COPY workspace/ /workspace/
 
-# Symlinks into modules-bin are created at startup by entrypoint.sh
-# (via `python3 -m superpos_agent_core.module_setup --bin-dir ...`) so
-# both workspace and bundled modules' scripts end up on PATH together.
+# Pre-populate modules-bin at build time with the workspace modules'
+# scripts.  This is a safety net: at runtime, entrypoint.sh re-runs the
+# symlinking via `module_setup --bin-dir` to layer in core-bundled
+# modules (e.g. superpos-issues) on top.  If that runtime call fails for
+# any reason, the build-time symlinks here keep workspace tools
+# callable from PATH so the container is not totally broken.
+RUN mkdir -p /workspace/.claude/modules-bin && \
+    for dir in /workspace/.claude/modules/*/scripts; do \
+      if [ -d "$dir" ]; then \
+        for script in "$dir"/*; do \
+          chmod +x "$script" && \
+          ln -sf "$script" /workspace/.claude/modules-bin/$(basename "$script"); \
+        done; \
+      fi; \
+    done
 ENV PATH="/workspace/.claude/modules-bin:$PATH"
 
 # Create non-root user (required for bypassPermissions mode)
