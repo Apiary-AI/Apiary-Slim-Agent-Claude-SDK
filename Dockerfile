@@ -25,7 +25,12 @@ COPY src/ /app/src/
 COPY entrypoint.sh /app/entrypoint.sh
 COPY workspace/ /workspace/
 
-# Symlink module scripts onto PATH so Claude can call them by name
+# Pre-populate modules-bin at build time with the workspace modules'
+# scripts.  This is a safety net: at runtime, entrypoint.sh re-runs the
+# symlinking via `module_setup --bin-dir` to layer in core-bundled
+# modules (e.g. superpos-issues) on top.  If that runtime call fails for
+# any reason, the build-time symlinks here keep workspace tools
+# callable from PATH so the container is not totally broken.
 RUN mkdir -p /workspace/.claude/modules-bin && \
     for dir in /workspace/.claude/modules/*/scripts; do \
       if [ -d "$dir" ]; then \
