@@ -39,6 +39,7 @@ from superpos_agent_core import (
     discover_modules,
     ensure_worktree,
     is_git_repo,
+    report_progress,
     worktree_path,
 )
 
@@ -577,7 +578,7 @@ class ClaudeExecutor(Executor):
 
         if req.source == "superpos" and req.superpos_task_id and self._superpos:
             progress_task = asyncio.create_task(
-                self._report_progress(req.superpos_task_id, claim_expired)
+                report_progress(self._superpos, req.superpos_task_id, claim_expired)
             )
 
         try:
@@ -667,26 +668,6 @@ class ClaudeExecutor(Executor):
             if req.superpos_task_id:
                 self.remove_superpos_task(req.superpos_task_id)
             self.queue.task_done()
-
-    async def _report_progress(
-        self, task_id: str, claim_expired: asyncio.Event, interval: int = 30,
-    ) -> None:
-        progress = 5
-        while True:
-            await asyncio.sleep(interval)
-            progress = min(progress + 5, 95)
-            try:
-                await self._superpos.update_progress(task_id, progress)
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 409:
-                    log.warning(
-                        "Claim expired for task %s (409); aborting execution", task_id,
-                    )
-                    claim_expired.set()
-                    return
-                log.debug("Progress update failed for task %s", task_id)
-            except Exception:
-                log.debug("Progress update failed for task %s", task_id)
 
     async def _execute(
         self,
@@ -811,7 +792,7 @@ class ClaudeExecutor(Executor):
         progress_task: asyncio.Task | None = None
         if self._superpos:
             progress_task = asyncio.create_task(
-                self._report_progress(task_id, claim_expired)
+                report_progress(self._superpos, task_id, claim_expired)
             )
 
         full_text = ""

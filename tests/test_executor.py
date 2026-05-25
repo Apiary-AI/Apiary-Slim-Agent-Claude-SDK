@@ -29,41 +29,10 @@ def test_remove_nonexistent_is_safe(executor):
     executor.remove_superpos_task("nonexistent")  # must not raise
 
 
-# --- _report_progress: 409 sets event, other errors don't ---
-
-async def test_report_progress_409_sets_event(executor, mock_superpos):
-    mock_response = Mock()
-    mock_response.status_code = 409
-    mock_superpos.update_progress.side_effect = httpx.HTTPStatusError(
-        "conflict", request=Mock(), response=mock_response
-    )
-    claim_expired = asyncio.Event()
-    await executor._report_progress("task-1", claim_expired, interval=0.01)
-    assert claim_expired.is_set()
-
-
-async def test_report_progress_500_does_not_set_event(executor, mock_superpos):
-    mock_response = Mock()
-    mock_response.status_code = 500
-    mock_superpos.update_progress.side_effect = [
-        httpx.HTTPStatusError("server error", request=Mock(), response=mock_response),
-        asyncio.CancelledError(),  # stop the loop on second iteration
-    ]
-    claim_expired = asyncio.Event()
-    with pytest.raises(asyncio.CancelledError):
-        await executor._report_progress("task-1", claim_expired, interval=0.01)
-    assert not claim_expired.is_set()
-
-
-async def test_report_progress_generic_exception_does_not_set_event(executor, mock_superpos):
-    mock_superpos.update_progress.side_effect = [
-        Exception("network error"),
-        asyncio.CancelledError(),
-    ]
-    claim_expired = asyncio.Event()
-    with pytest.raises(asyncio.CancelledError):
-        await executor._report_progress("task-1", claim_expired, interval=0.01)
-    assert not claim_expired.is_set()
+# Note: report_progress (the heartbeat coroutine) lives in
+# `superpos_agent_core.progress_reporter` now.  Its unit tests live next to it
+# in core (`tests/test_progress_reporter.py`); we don't re-test the contract
+# here.  Only behaviour that depends on *this* executor's wiring is kept.
 
 
 # --- Claim expiry removes task from in-flight set ---
@@ -71,7 +40,7 @@ async def test_report_progress_generic_exception_does_not_set_event(executor, mo
 async def test_execute_removes_task_after_claim_expiry(executor):
     executor.add_superpos_task("task-x")
 
-    async def fake_report_progress(task_id, claim_expired, interval=30):
+    async def fake_report_progress(client, task_id, claim_expired):
         claim_expired.set()
 
     async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None):
@@ -81,7 +50,10 @@ async def test_execute_removes_task_after_claim_expiry(executor):
         prompt="hello", chat_id="123", source="superpos", superpos_task_id="task-x"
     )
 
-    with patch.object(executor, "_report_progress", fake_report_progress), \
+    # Patch the *imported* name in the executor module — `report_progress`
+    # is a free function from core, not a method on the executor, so
+    # `patch.object(executor, ...)` no longer applies.
+    with patch("slim_agent_claude.claude_executor.report_progress", fake_report_progress), \
          patch.object(executor, "_execute_inner", fake_execute_inner), \
          patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         MockStreamer.return_value.start = AsyncMock()
