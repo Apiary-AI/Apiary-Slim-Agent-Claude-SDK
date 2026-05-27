@@ -752,6 +752,30 @@ class ClaudeExecutor(Executor):
                     await inner_task
                 except asyncio.CancelledError:
                     pass
+                # Explicitly fail the task on the server so it moves to a
+                # terminal state instead of lingering "in_progress" until the
+                # server's separate progress_timeout fires.  Without this,
+                # the dashboard kept showing the task at 95% (heartbeat cap)
+                # for the full server-side reclaim window, even though the
+                # agent had already given up locally.  Skip if the claim has
+                # already expired — the server knows we don't own it anymore.
+                if (
+                    req.source == "superpos"
+                    and req.superpos_task_id
+                    and self._superpos
+                    and not claim_expired.is_set()
+                ):
+                    try:
+                        await self._superpos.fail_task(
+                            req.superpos_task_id,
+                            f"Execution timed out after {max_timeout}s "
+                            f"(possible zombie pipe — Claude SDK iterator hung).",
+                        )
+                    except Exception:
+                        log.debug(
+                            "Failed to mark task %s as failed after timeout",
+                            req.superpos_task_id, exc_info=True,
+                        )
             except asyncio.CancelledError:
                 if claim_expired.is_set():
                     log.warning(

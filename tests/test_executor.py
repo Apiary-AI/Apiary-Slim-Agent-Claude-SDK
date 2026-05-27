@@ -66,6 +66,82 @@ async def test_report_progress_generic_exception_does_not_set_event(executor, mo
     assert not claim_expired.is_set()
 
 
+# --- Execution timeout fails the task on the server ---
+
+async def test_execute_timeout_calls_fail_task(executor, mock_superpos, mock_config):
+    """Regression: when `wait_for(inner_task, timeout=max_timeout)` fires,
+    the cleanup path must explicitly fail_task on the server.  Without
+    this the dashboard showed timed-out tasks lingering "in_progress" at
+    95% (the heartbeat counter cap) until the server's separate
+    progress_timeout fired — sometimes minutes later.
+    """
+    executor.add_superpos_task("task-zombie")
+    # Make the timeout cap tiny so the test doesn't wait an hour.
+    mock_config.executor_max_turns = 0  # max_timeout = 0 * 120 = 0s
+
+    async def fake_report_progress(task_id, claim_expired, interval=30):
+        # Just keep the coroutine alive — we never set claim_expired.
+        await asyncio.sleep(5)
+
+    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None):
+        # Simulate a Claude SDK iterator that hangs forever.
+        await asyncio.sleep(10)
+
+    req = ExecutionRequest(
+        prompt="hello", chat_id="123",
+        source="superpos", superpos_task_id="task-zombie",
+    )
+
+    with patch.object(executor, "_report_progress", fake_report_progress), \
+         patch.object(executor, "_execute_inner", fake_execute_inner), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        MockStreamer.return_value.start = AsyncMock()
+        await executor.queue.put(req)
+        await executor.queue.get()
+        await asyncio.wait_for(executor._run_one(req), timeout=2.0)
+
+    mock_superpos.fail_task.assert_called_once()
+    call_args = mock_superpos.fail_task.call_args
+    assert call_args.args[0] == "task-zombie"
+    assert "timed out" in call_args.args[1].lower()
+    assert not executor.has_superpos_task("task-zombie")
+
+
+async def test_execute_timeout_skips_fail_when_claim_already_expired(
+    executor, mock_superpos, mock_config,
+):
+    """If `_report_progress` already saw a 409 and set claim_expired
+    before the timeout fired, the server already knows we don't own the
+    task — calling fail_task again would get its own 409.  Skip it.
+    """
+    executor.add_superpos_task("task-y")
+    mock_config.executor_max_turns = 0
+
+    async def fake_report_progress(task_id, claim_expired, interval=30):
+        # Mimic the real reporter detecting a 409 immediately.
+        claim_expired.set()
+
+    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None):
+        await asyncio.sleep(10)
+
+    req = ExecutionRequest(
+        prompt="hello", chat_id="123",
+        source="superpos", superpos_task_id="task-y",
+    )
+
+    with patch.object(executor, "_report_progress", fake_report_progress), \
+         patch.object(executor, "_execute_inner", fake_execute_inner), \
+         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        MockStreamer.return_value.start = AsyncMock()
+        await executor.queue.put(req)
+        await executor.queue.get()
+        await asyncio.wait_for(executor._run_one(req), timeout=2.0)
+
+    # Cancellation path runs first (claim_expired was set before the
+    # timeout fires), so fail_task should NOT be called.
+    mock_superpos.fail_task.assert_not_called()
+
+
 # --- Claim expiry removes task from in-flight set ---
 
 async def test_execute_removes_task_after_claim_expiry(executor):
