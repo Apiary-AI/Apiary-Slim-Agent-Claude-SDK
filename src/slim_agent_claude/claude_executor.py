@@ -259,6 +259,14 @@ class ClaudeExecutor(Executor):
         under the old persona — Claude tends to stay consistent with
         prior turns, so a new ``--append-system-prompt`` alone can't
         overcome an old self-introduction in the resume transcript.
+
+        Note: re-syncing SubAgentDefinitions after a persona bump is owned
+        by ``superpos_agent_core.superpos_poller._resync_sub_agents``,
+        which the core poller calls in a background thread on the same
+        event.  Kicking off a second sync from here would race with that
+        one on the same ``.claude/subagents`` tree (duplicate HTTP traffic
+        plus file-write contention), so this method only updates the
+        in-memory persona/version state.
         """
         self._persona = prompt
         prev_version = self._persona_version

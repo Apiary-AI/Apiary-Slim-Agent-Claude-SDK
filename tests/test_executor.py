@@ -1169,6 +1169,26 @@ def test_update_persona_first_set_does_not_log_bump(executor, caplog):
     assert not any("Persona version bumped" in r.message for r in caplog.records)
 
 
+def test_update_persona_does_not_spawn_background_sub_agent_sync(executor):
+    """SubAgentDefinition re-sync after a persona bump is owned by
+    ``superpos_agent_core.superpos_poller._resync_sub_agents``.  The
+    executor must NOT start its own duplicate background thread on the
+    same persona bump — that would race the core sync on
+    ``.claude/subagents`` (duplicate HTTP traffic + concurrent writes)."""
+    import threading as _threading
+
+    # Belt-and-braces: the helper method should be gone entirely.
+    assert not hasattr(executor, "_sync_sub_agents_background"), (
+        "Executor must not own a sub-agent sync path — core's poller owns it"
+    )
+
+    before = _threading.active_count()
+    executor.update_persona("v1", version=1)
+    executor.update_persona("v2", version=2)  # triggers the "bump" branch
+    # No new daemon threads should have been spawned by update_persona.
+    assert _threading.active_count() == before
+
+
 async def test_resume_dropped_when_stored_version_older_than_current(
     executor, mock_config,
 ):
