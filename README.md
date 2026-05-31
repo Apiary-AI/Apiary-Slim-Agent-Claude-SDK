@@ -25,7 +25,7 @@ Fill in your `.env`:
 | `SUPERPOS_CAPABILITIES` | No | Comma-separated capabilities |
 | `SUPERPOS_POLL_INTERVAL` | No | Poll interval in seconds (default: 5) |
 | `ANTHROPIC_API_KEY` | No | Only if not using OAuth |
-| `CLAUDE_MODEL` | No | Default: claude-opus-4-8 |
+| `CLAUDE_MODEL` | No | Default: claude-opus-4-7 |
 | `CLAUDE_EFFORT` | No | Effort level: low, medium, high, max (default: high) |
 | `CLAUDE_MAX_TURNS` | No | Default: 30 |
 | `CLAUDE_WORKING_DIR` | No | Default: /workspace |

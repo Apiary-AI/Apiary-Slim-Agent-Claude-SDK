@@ -13,7 +13,7 @@ class ClaudeConfig(BaseConfig):
     """Adds Claude-specific knobs on top of the universal BaseConfig."""
 
     anthropic_api_key: str = ""
-    claude_model: str = "claude-opus-4-8"
+    claude_model: str = "claude-opus-4-7"
     claude_effort: str = "high"
 
     def __post_init__(self) -> None:
@@ -53,7 +53,7 @@ class ClaudeConfig(BaseConfig):
         base.update(
             executor_kind="claude",
             anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
-            claude_model=os.environ.get("CLAUDE_MODEL", "claude-opus-4-8"),
+            claude_model=os.environ.get("CLAUDE_MODEL", "claude-opus-4-7"),
             claude_effort=os.environ.get("CLAUDE_EFFORT", "high"),
         )
         return cls(**base)
