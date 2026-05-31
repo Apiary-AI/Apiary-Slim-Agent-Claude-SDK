@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+WORKING_DIR="${CLAUDE_WORKING_DIR:-/workspace}"
+
 # Restore .claude.json from backup if missing
 CLAUDE_JSON="$HOME/.claude.json"
 BACKUP_DIR="$HOME/.claude/backups"
@@ -59,9 +61,9 @@ python3 -m superpos_agent_core.module_setup \
 # and ``--inject-modules`` is only meaningful when both ``--modules-dir`` and
 # ``--skills-dir`` are supplied as scan targets.
 python3 /app/src/sync_sub_agents.py \
-    --subagents-dir /workspace/.claude/subagents \
-    --modules-dir /workspace/.claude/modules \
-    --skills-dir /workspace/.claude/skills \
+    --subagents-dir "$WORKING_DIR/.claude/subagents" \
+    --modules-dir "$WORKING_DIR/.claude/modules" \
+    --skills-dir "$WORKING_DIR/.claude/skills" \
     --inject-memory --inject-modules \
     || echo "Warning: sub-agent sync failed (local subagent files remain unchanged)"
 
