@@ -63,10 +63,29 @@ def _get_document_content(doc_value: str | dict | None) -> str | None:
     return None
 
 
+def fetch_runtime_bundle(
+    base_url: str, token: str,
+) -> dict | None:
+    """Fetch all definitions + agent memory in one call via runtime-bundle endpoint.
+
+    Returns dict with 'definitions', 'agent_memory', 'persona_version' or None
+    if the endpoint is not available (older backend).
+    """
+    with httpx.Client(base_url=base_url, timeout=30.0, follow_redirects=True) as client:
+        resp = client.get("/api/v1/sub-agents/runtime-bundle", headers=_headers(token))
+        if resp.status_code != 200:
+            return None
+        data = resp.json()
+        payload = data.get("data", data) if isinstance(data, dict) else {}
+        if not isinstance(payload, dict) or "definitions" not in payload:
+            return None
+        return payload
+
+
 def fetch_sub_agent_definitions(
     base_url: str, token: str,
 ) -> list[dict]:
-    """Fetch all active sub-agent definitions with full documents."""
+    """Fetch all active sub-agent definitions with full documents (N+1 fallback)."""
     with httpx.Client(base_url=base_url, timeout=30.0, follow_redirects=True) as client:
         resp = client.get("/api/v1/sub-agents", headers=_headers(token))
         if resp.status_code != 200:
@@ -98,7 +117,7 @@ def fetch_sub_agent_definitions(
 
 
 def fetch_persona_memory(base_url: str, token: str) -> str | None:
-    """Fetch the MEMORY document from the active persona."""
+    """Fetch the MEMORY document from the active persona (fallback)."""
     with httpx.Client(base_url=base_url, timeout=30.0, follow_redirects=True) as client:
         resp = client.get(
             "/api/v1/persona/documents/MEMORY", headers=_headers(token),
@@ -237,13 +256,25 @@ def sync_sub_agents(
     """
     Path(subagents_dir).mkdir(parents=True, exist_ok=True)
 
-    definitions = fetch_sub_agent_definitions(base_url, token)
+    # Try the single-call runtime-bundle endpoint first; fall back to N+1
+    # calls for backends that haven't deployed it yet.
+    bundle = fetch_runtime_bundle(base_url, token)
 
-    memory: str | None = None
-    if inject_memory and definitions:
-        memory = fetch_persona_memory(base_url, token)
-        if memory:
-            log.info("Fetched persona MEMORY (%d chars)", len(memory))
+    if bundle is not None:
+        definitions = bundle.get("definitions") or []
+        memory = bundle.get("agent_memory") if inject_memory else None
+        log.info(
+            "Fetched runtime bundle: %d definition(s), memory=%s",
+            len(definitions), "yes" if memory else "no",
+        )
+    else:
+        definitions = fetch_sub_agent_definitions(base_url, token)
+        memory = None
+        if inject_memory and definitions:
+            memory = fetch_persona_memory(base_url, token)
+
+    if memory:
+        log.info("Agent MEMORY: %d chars", len(memory))
 
     slugs = [d["slug"] for d in definitions if "slug" in d]
 
