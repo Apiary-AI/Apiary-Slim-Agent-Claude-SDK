@@ -50,4 +50,11 @@ python3 -m superpos_agent_core.module_setup \
     --bin-dir /workspace/.claude/modules-bin \
     || echo "Warning: module setup failed (build-time workspace symlinks remain in place)"
 
+# Sync SubAgentDefinitions from Superpos to .claude/subagents/.
+# Injects persona memory and module/skill context so that spawned Claude Code
+# subagents inherit the parent agent's learned knowledge and available tooling.
+python3 /app/src/sync_sub_agents.py \
+    --inject-memory --inject-modules \
+    || echo "Warning: sub-agent sync failed (local subagent files remain unchanged)"
+
 exec "$@"
