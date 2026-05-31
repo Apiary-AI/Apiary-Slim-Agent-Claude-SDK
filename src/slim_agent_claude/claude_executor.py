@@ -16,7 +16,6 @@ import os
 import shutil
 import sys
 import tempfile as _tempfile
-import threading
 import time
 
 import anyio
@@ -260,6 +259,14 @@ class ClaudeExecutor(Executor):
         under the old persona — Claude tends to stay consistent with
         prior turns, so a new ``--append-system-prompt`` alone can't
         overcome an old self-introduction in the resume transcript.
+
+        Note: re-syncing SubAgentDefinitions after a persona bump is owned
+        by ``superpos_agent_core.superpos_poller._resync_sub_agents``,
+        which the core poller calls in a background thread on the same
+        event.  Kicking off a second sync from here would race with that
+        one on the same ``.claude/subagents`` tree (duplicate HTTP traffic
+        plus file-write contention), so this method only updates the
+        in-memory persona/version state.
         """
         self._persona = prompt
         prev_version = self._persona_version
@@ -271,42 +278,6 @@ class ClaudeExecutor(Executor):
                     "older persona will be invalidated on next use",
                     prev_version, version,
                 )
-                self._sync_sub_agents_background()
-
-    def _sync_sub_agents_background(self) -> None:
-        """Re-sync SubAgentDefinitions from Superpos in a background thread.
-
-        Called when persona version bumps — SubAgentDefinitions may have
-        changed too, and the updated persona MEMORY should be injected
-        into subagent prompts.
-        """
-        base_url = os.environ.get("SUPERPOS_BASE_URL", "").rstrip("/")
-        token = os.environ.get("SUPERPOS_API_TOKEN", "")
-        if not base_url or not token:
-            return
-
-        working_dir = self._config.executor_working_dir
-        subagents_dir = os.path.join(working_dir, ".claude", "subagents")
-        modules_dir = self._config.modules_dir
-        skills_dir = os.path.join(working_dir, ".claude", "skills")
-
-        def _do_sync() -> None:
-            try:
-                from superpos_agent_core.sub_agent_sync import sync_sub_agents
-                count = sync_sub_agents(
-                    subagents_dir=subagents_dir,
-                    base_url=base_url,
-                    token=token,
-                    inject_memory=True,
-                    modules_dir=modules_dir,
-                    skills_dir=skills_dir,
-                )
-                if count:
-                    log.info("Re-synced %d sub-agent definition(s) after persona bump", count)
-            except Exception:
-                log.debug("Sub-agent sync failed (non-fatal)", exc_info=True)
-
-        threading.Thread(target=_do_sync, daemon=True).start()
 
     def clear_session(self, chat_id: int | str) -> None:
         self._sessions.clear(chat_id)

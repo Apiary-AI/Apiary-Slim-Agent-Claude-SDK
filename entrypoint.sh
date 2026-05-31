@@ -53,7 +53,15 @@ python3 -m superpos_agent_core.module_setup \
 # Sync SubAgentDefinitions from Superpos to .claude/subagents/.
 # Injects persona memory and module/skill context so that spawned Claude Code
 # subagents inherit the parent agent's learned knowledge and available tooling.
+#
+# All three directory paths are passed explicitly — the upstream
+# ``superpos_agent_core.sub_agent_sync`` CLI requires ``--subagents-dir``,
+# and ``--inject-modules`` is only meaningful when both ``--modules-dir`` and
+# ``--skills-dir`` are supplied as scan targets.
 python3 /app/src/sync_sub_agents.py \
+    --subagents-dir /workspace/.claude/subagents \
+    --modules-dir /workspace/.claude/modules \
+    --skills-dir /workspace/.claude/skills \
     --inject-memory --inject-modules \
     || echo "Warning: sub-agent sync failed (local subagent files remain unchanged)"
 
