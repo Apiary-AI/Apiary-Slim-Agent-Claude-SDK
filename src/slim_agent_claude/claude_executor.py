@@ -292,7 +292,7 @@ class ClaudeExecutor(Executor):
 
         def _do_sync() -> None:
             try:
-                from sync_sub_agents import sync_sub_agents
+                from superpos_agent_core.sub_agent_sync import sync_sub_agents
                 count = sync_sub_agents(
                     subagents_dir=subagents_dir,
                     base_url=base_url,

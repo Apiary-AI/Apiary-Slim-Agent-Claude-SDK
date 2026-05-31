@@ -179,20 +179,13 @@ class TestSyncSubAgents:
         local = tmp_path / "my-local.md"
         local.write_text("---\nname: my-local\n---\nLocal only.\n")
 
-        import sync_sub_agents as mod
-        orig_bundle = mod.fetch_runtime_bundle
-        orig_defs = mod.fetch_sub_agent_definitions
-        mod.fetch_runtime_bundle = lambda *a, **kw: {"definitions": [], "agent_memory": None}
-        mod.fetch_sub_agent_definitions = lambda *a, **kw: []
-        try:
-            mod.sync_sub_agents(
-                subagents_dir=str(tmp_path),
-                base_url="http://fake",
-                token="fake",
-            )
-        finally:
-            mod.fetch_runtime_bundle = orig_bundle
-            mod.fetch_sub_agent_definitions = orig_defs
+        from sync_sub_agents import sync_sub_agents as do_sync
+        do_sync(
+            subagents_dir=str(tmp_path),
+            base_url="http://fake",
+            token="fake",
+            definitions=[],
+        )
 
         assert not stale.exists(), "Stale managed file should be deleted"
         assert local.exists(), "Local (unmanaged) file should be preserved"
