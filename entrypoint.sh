@@ -39,7 +39,9 @@ fi
 # Run module setup: install deps, symlink scripts onto PATH, update CLAUDE.md.
 # --bin-dir links scripts from both workspace and core-bundled modules,
 # so platform tools (e.g. superpos-issues) work even when nothing is in
-# /workspace/.claude/modules.
+# $WORKING_DIR/.claude/modules. All paths derive from $WORKING_DIR so that
+# the sync block below (which also reads from $WORKING_DIR) sees the modules
+# this step provisioned, even when CLAUDE_WORKING_DIR overrides the default.
 #
 # If this fails (network blip on `pip install`, broken module, etc.) the
 # container still starts — the Dockerfile pre-populated modules-bin with
@@ -47,9 +49,9 @@ fi
 # PATH.  Only core-bundled tools (added at runtime) are lost in that
 # degraded mode.
 python3 -m superpos_agent_core.module_setup \
-    --modules-dir /workspace/.claude/modules \
-    --agents-md /workspace/CLAUDE.md \
-    --bin-dir /workspace/.claude/modules-bin \
+    --modules-dir "$WORKING_DIR/.claude/modules" \
+    --agents-md "$WORKING_DIR/CLAUDE.md" \
+    --bin-dir "$WORKING_DIR/.claude/modules-bin" \
     || echo "Warning: module setup failed (build-time workspace symlinks remain in place)"
 
 # Sync SubAgentDefinitions from Superpos to .claude/subagents/.
