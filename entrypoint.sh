@@ -64,6 +64,12 @@ CORE_MODULES_DIR=$(python3 -c \
     "from pathlib import Path; import superpos_agent_core; print(Path(superpos_agent_core.__file__).parent / 'modules')" \
     2>/dev/null) || true
 if [ -n "$CORE_MODULES_DIR" ] && [ -d "$CORE_MODULES_DIR" ]; then
+    # module_setup creates --bin-dir during symlink_module_scripts(); if it
+    # aborted earlier (e.g. a workspace setup.sh hook exited non-zero) the
+    # directory may not exist yet, which would make every `ln -sf` below
+    # fail silently and leave bundled tools missing from PATH. Create it
+    # up-front so the fallback actually restores them.
+    mkdir -p "$WORKING_DIR/.claude/modules-bin"
     for dir in "$CORE_MODULES_DIR"/*/scripts; do
         if [ -d "$dir" ]; then
             for script in "$dir"/*; do

@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import sys
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -143,6 +147,113 @@ class TestCoreBundledFallback:
         block = self._fallback_block()
         assert "|| true" in block, (
             "fallback must tolerate failures (|| true) to avoid crashing the entrypoint"
+        )
+
+    def test_fallback_restores_bundled_tools_when_module_setup_aborts_early(
+        self, tmp_path
+    ):
+        """Reproduce the degraded-mode bug: a workspace ``setup.sh`` exits
+        non-zero, ``module_setup`` aborts before ``symlink_module_scripts()``
+        runs, so ``$WORKING_DIR/.claude/modules-bin/`` never gets created.
+        The fallback block in ``entrypoint.sh`` must still restore bundled
+        scripts (e.g. ``superpos-knowledge``) onto PATH — which requires it
+        to create the bin dir itself before relinking."""
+        # Skip if the core package isn't importable in this environment.
+        try:
+            import superpos_agent_core  # noqa: F401
+        except Exception:  # pragma: no cover - environment guard
+            pytest.skip("superpos_agent_core not importable in this env")
+
+        core_modules_dir = Path(
+            subprocess.check_output(
+                [
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; import superpos_agent_core; "
+                    "print(Path(superpos_agent_core.__file__).parent / 'modules')",
+                ],
+                text=True,
+            ).strip()
+        )
+        if not (core_modules_dir / "superpos-knowledge" / "scripts" / "superpos-knowledge").exists():
+            pytest.skip("bundled superpos-knowledge script not available")
+
+        # Fresh CLAUDE_WORKING_DIR with NO pre-existing modules-bin/.
+        working_dir = tmp_path / "workspace"
+        modules_dir = working_dir / ".claude" / "modules"
+        modules_dir.mkdir(parents=True)
+        agents_md = working_dir / "CLAUDE.md"
+        agents_md.write_text("# Stub\n")
+
+        # A workspace module whose setup.sh exits non-zero — this makes
+        # module_setup raise mid-way (run_setup_scripts uses check=True),
+        # so symlink_module_scripts() never runs.
+        failing_module = modules_dir / "failing-mod"
+        failing_module.mkdir()
+        (failing_module / "module.yaml").write_text("name: failing-mod\n")
+        setup = failing_module / "setup.sh"
+        setup.write_text("#!/bin/bash\nexit 1\n")
+        setup.chmod(0o755)
+
+        bin_dir = working_dir / ".claude" / "modules-bin"
+        assert not bin_dir.exists(), "precondition: modules-bin must not pre-exist"
+
+        # Extract the actual entrypoint snippet that runs module_setup +
+        # the core-bundled fallback, so the test exercises the real shell
+        # we ship rather than a paraphrase.
+        text = ENTRYPOINT.read_text()
+        setup_match = re.search(
+            r"(python3 -m superpos_agent_core\.module_setup\b.*?\|\| echo[^\n]*)",
+            text,
+            re.DOTALL,
+        )
+        fallback_match = re.search(
+            r"(CORE_MODULES_DIR=.*?\nfi)\n", text, re.DOTALL
+        )
+        assert setup_match and fallback_match, "could not extract entrypoint blocks"
+
+        script = textwrap.dedent(
+            f"""
+            #!/bin/bash
+            set -e
+            WORKING_DIR={working_dir!s}
+            {setup_match.group(1)}
+            {fallback_match.group(1)}
+            """
+        )
+        script_path = tmp_path / "run.sh"
+        script_path.write_text(script)
+        script_path.chmod(0o755)
+
+        env = os.environ.copy()
+        # Ensure the subprocess can import superpos_agent_core the same way
+        # the in-test import succeeded (covers editable installs).
+        env["PYTHONPATH"] = os.pathsep.join(
+            [p for p in (env.get("PYTHONPATH"), *sys.path) if p]
+        )
+        result = subprocess.run(
+            ["bash", str(script_path)],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        # The entrypoint must not crash overall; module_setup is allowed to
+        # warn (|| echo ...) and the fallback must succeed regardless.
+        assert result.returncode == 0, (
+            f"fallback script crashed: stdout={result.stdout!r} "
+            f"stderr={result.stderr!r}"
+        )
+
+        # The bug: without `mkdir -p` in the fallback, this symlink would
+        # never get created because modules-bin didn't exist.
+        knowledge_link = bin_dir / "superpos-knowledge"
+        assert bin_dir.is_dir(), (
+            "fallback must create modules-bin/ even when module_setup aborted "
+            "before symlink_module_scripts() ran"
+        )
+        assert knowledge_link.exists(), (
+            "fallback must restore bundled superpos-knowledge onto PATH "
+            "after module_setup aborts in the degraded path"
         )
 
 
