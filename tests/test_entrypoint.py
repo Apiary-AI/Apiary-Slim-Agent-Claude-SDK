@@ -256,6 +256,113 @@ class TestCoreBundledFallback:
             "after module_setup aborts in the degraded path"
         )
 
+    def test_bundled_tools_discoverable_with_overridden_working_dir(
+        self, tmp_path
+    ):
+        """When CLAUDE_WORKING_DIR points to a non-default directory and
+        module_setup fails, the bundled tools must still be *discoverable*
+        (on PATH), not merely symlinked.  The Dockerfile hard-codes
+        ``/workspace/.claude/modules-bin`` on PATH; if CLAUDE_WORKING_DIR
+        is something else, the runtime ``export PATH=…`` in entrypoint.sh
+        must add the correct directory so ``which <tool>`` succeeds."""
+        try:
+            import superpos_agent_core  # noqa: F401
+        except Exception:  # pragma: no cover - environment guard
+            pytest.skip("superpos_agent_core not importable in this env")
+
+        core_modules_dir = Path(
+            subprocess.check_output(
+                [
+                    sys.executable,
+                    "-c",
+                    "from pathlib import Path; import superpos_agent_core; "
+                    "print(Path(superpos_agent_core.__file__).parent / 'modules')",
+                ],
+                text=True,
+            ).strip()
+        )
+        if not (core_modules_dir / "superpos-knowledge" / "scripts" / "superpos-knowledge").exists():
+            pytest.skip("bundled superpos-knowledge script not available")
+
+        # Use a non-default working dir to prove the PATH export is dynamic.
+        working_dir = tmp_path / "custom-workdir"
+        modules_dir = working_dir / ".claude" / "modules"
+        modules_dir.mkdir(parents=True)
+        agents_md = working_dir / "CLAUDE.md"
+        agents_md.write_text("# Stub\n")
+
+        # A failing workspace module forces the degraded (fallback) path.
+        failing_module = modules_dir / "failing-mod"
+        failing_module.mkdir()
+        (failing_module / "module.yaml").write_text("name: failing-mod\n")
+        setup = failing_module / "setup.sh"
+        setup.write_text("#!/bin/bash\nexit 1\n")
+        setup.chmod(0o755)
+
+        # Extract the real entrypoint blocks we ship.
+        text = ENTRYPOINT.read_text()
+        setup_match = re.search(
+            r"(python3 -m superpos_agent_core\.module_setup\b.*?\|\| echo[^\n]*)",
+            text,
+            re.DOTALL,
+        )
+        fallback_match = re.search(
+            r"(CORE_MODULES_DIR=.*?\nfi)\n", text, re.DOTALL
+        )
+        path_export_match = re.search(
+            r'(export PATH="\$WORKING_DIR/\.claude/modules-bin:\$PATH")',
+            text,
+        )
+        assert setup_match and fallback_match and path_export_match, (
+            "could not extract entrypoint blocks"
+        )
+
+        # Build a minimal script that mirrors the entrypoint flow and then
+        # checks discoverability via `which`.
+        script = textwrap.dedent(
+            f"""
+            #!/bin/bash
+            set -e
+            WORKING_DIR={working_dir!s}
+            {path_export_match.group(1)}
+            {setup_match.group(1)}
+            {fallback_match.group(1)}
+            # The real assertion: the tool must be discoverable on PATH.
+            which superpos-knowledge
+            """
+        )
+        script_path = tmp_path / "run.sh"
+        script_path.write_text(script)
+        script_path.chmod(0o755)
+
+        env = os.environ.copy()
+        env["PYTHONPATH"] = os.pathsep.join(
+            [p for p in (env.get("PYTHONPATH"), *sys.path) if p]
+        )
+        # Deliberately strip /workspace/.claude/modules-bin from PATH so
+        # only the dynamic export can make the tool discoverable.
+        env["PATH"] = os.pathsep.join(
+            p
+            for p in env.get("PATH", "").split(os.pathsep)
+            if p != "/workspace/.claude/modules-bin"
+        )
+
+        result = subprocess.run(
+            ["bash", str(script_path)],
+            env=env,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (
+            f"superpos-knowledge not discoverable on PATH after entrypoint "
+            f"with overridden CLAUDE_WORKING_DIR: "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
+        # `which` output must point into the custom working dir, not /workspace.
+        assert str(working_dir) in result.stdout, (
+            f"tool resolved to wrong directory: {result.stdout!r}"
+        )
+
 
 class TestPathContractAgreement:
     """module_setup and sync_sub_agents must point at the same module/skill

@@ -2,6 +2,7 @@
 set -e
 
 WORKING_DIR="${CLAUDE_WORKING_DIR:-/workspace}"
+export PATH="$WORKING_DIR/.claude/modules-bin:$PATH"
 
 # Restore .claude.json from backup if missing
 CLAUDE_JSON="$HOME/.claude.json"
