@@ -1,4 +1,4 @@
-superpos-agent-core @ git+https://github.com/Superpos-AI/superpos-agent-core.git@9c3195c689a246cdd6c1d62b3099965c911dae44
+superpos-agent-core~=0.1
 claude-code-sdk>=0.0.25
 python-telegram-bot>=21.0
 httpx>=0.27.0
