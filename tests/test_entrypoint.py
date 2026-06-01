@@ -96,6 +96,56 @@ class TestModuleSetupPaths:
         )
 
 
+class TestCoreBundledFallback:
+    """After module_setup, entrypoint.sh must re-link core-bundled module
+    scripts so they survive a module_setup failure (degraded-mode).  Without
+    this fallback, tools that only exist in the core package (e.g.
+    superpos-knowledge after its workspace copy was removed) vanish from PATH
+    when a workspace setup.sh hook fails and module_setup aborts early."""
+
+    def _fallback_block(self) -> str:
+        text = _read_entrypoint()
+        match = re.search(
+            r"(CORE_MODULES_DIR=.*?)(?=\n# \w|\nexec |\Z)",
+            text,
+            re.DOTALL,
+        )
+        assert match, (
+            "Could not locate core-bundled fallback block in entrypoint.sh"
+        )
+        return match.group(1)
+
+    def test_fallback_exists_after_module_setup(self):
+        text = _read_entrypoint()
+        setup_pos = text.find("python3 -m superpos_agent_core.module_setup")
+        fallback_pos = text.find("CORE_MODULES_DIR=")
+        assert setup_pos != -1, "module_setup invocation not found"
+        assert fallback_pos != -1, "core-bundled fallback block not found"
+        assert fallback_pos > setup_pos, (
+            "core-bundled fallback must appear AFTER module_setup"
+        )
+
+    def test_fallback_discovers_core_package_modules(self):
+        block = self._fallback_block()
+        assert "superpos_agent_core" in block, (
+            "fallback must discover modules from the superpos_agent_core package"
+        )
+
+    def test_fallback_symlinks_into_working_dir(self):
+        block = self._fallback_block()
+        assert "$WORKING_DIR/.claude/modules-bin" in block, (
+            "fallback must symlink scripts into $WORKING_DIR/.claude/modules-bin"
+        )
+
+    def test_fallback_tolerates_errors(self):
+        """The fallback itself must not crash the entrypoint if the core
+        package is somehow missing or unimportable."""
+        block = self._fallback_block()
+        assert "|| true" in block, (
+            "fallback must tolerate failures (|| true) to avoid crashing the entrypoint"
+        )
+
+
 class TestPathContractAgreement:
     """module_setup and sync_sub_agents must point at the same module/skill
     roots, otherwise an overridden CLAUDE_WORKING_DIR causes the sync step to
