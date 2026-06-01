@@ -2,6 +2,7 @@
 set -e
 
 WORKING_DIR="${CLAUDE_WORKING_DIR:-/workspace}"
+export PATH="$WORKING_DIR/.claude/modules-bin:$PATH"
 
 # Restore .claude.json from backup if missing
 CLAUDE_JSON="$HOME/.claude.json"
@@ -45,14 +46,40 @@ fi
 #
 # If this fails (network blip on `pip install`, broken module, etc.) the
 # container still starts — the Dockerfile pre-populated modules-bin with
-# build-time symlinks to workspace scripts, so those stay callable from
-# PATH.  Only core-bundled tools (added at runtime) are lost in that
-# degraded mode.
+# build-time symlinks to workspace scripts, and the core-bundled
+# fallback block below re-links scripts from the installed package, so
+# both workspace and core-bundled tools stay callable from PATH.
 python3 -m superpos_agent_core.module_setup \
     --modules-dir "$WORKING_DIR/.claude/modules" \
     --agents-md "$WORKING_DIR/CLAUDE.md" \
     --bin-dir "$WORKING_DIR/.claude/modules-bin" \
     || echo "Warning: module setup failed (build-time workspace symlinks remain in place)"
+
+# Fallback: ensure core-bundled module scripts survive a module_setup
+# failure.  module_setup links both workspace and core-bundled scripts;
+# if it crashes (e.g. a workspace setup.sh hook fails mid-way), tools
+# that only exist in the core package (no workspace copy) vanish from
+# PATH.  This block idempotently re-links them from the installed
+# package so they are always available.
+CORE_MODULES_DIR=$(python3 -c \
+    "from pathlib import Path; import superpos_agent_core; print(Path(superpos_agent_core.__file__).parent / 'modules')" \
+    2>/dev/null) || true
+if [ -n "$CORE_MODULES_DIR" ] && [ -d "$CORE_MODULES_DIR" ]; then
+    # module_setup creates --bin-dir during symlink_module_scripts(); if it
+    # aborted earlier (e.g. a workspace setup.sh hook exited non-zero) the
+    # directory may not exist yet, which would make every `ln -sf` below
+    # fail silently and leave bundled tools missing from PATH. Create it
+    # up-front so the fallback actually restores them.
+    mkdir -p "$WORKING_DIR/.claude/modules-bin"
+    for dir in "$CORE_MODULES_DIR"/*/scripts; do
+        if [ -d "$dir" ]; then
+            for script in "$dir"/*; do
+                chmod +x "$script" 2>/dev/null || true
+                ln -sf "$script" "$WORKING_DIR/.claude/modules-bin/$(basename "$script")" 2>/dev/null || true
+            done
+        fi
+    done
+fi
 
 # Sync SubAgentDefinitions from Superpos to .claude/subagents/.
 # Injects persona memory and module/skill context so that spawned Claude Code
