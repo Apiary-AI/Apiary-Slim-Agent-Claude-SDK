@@ -94,7 +94,7 @@ class TestBuildSubagentMd:
         }
         result = build_subagent_md(defn)
         assert "name: coder" in result
-        assert 'description: "Coding Agent — Writes code"' in result
+        assert "description: Coding Agent — Writes code" in result
         assert "model: claude-opus-4-6" in result
         assert "# SOUL\n\nYou write code." in result
         assert MANAGED_MARKER in result
