@@ -771,6 +771,19 @@ class ClaudeExecutor(Executor):
                             "Failed to mark task %s as failed after timeout",
                             req.superpos_task_id, exc_info=True,
                         )
+                    timeout_detail = (
+                        f"Execution timed out after {max_timeout}s "
+                        f"(possible zombie pipe — Claude SDK iterator hung)."
+                    )
+                    self._recent_tasks.record(
+                        req.chat_id,
+                        TaskSummary(
+                            task_id=req.superpos_task_id,
+                            description=req.prompt[:200],
+                            outcome="failed",
+                            detail=timeout_detail,
+                        ),
+                    )
             except asyncio.CancelledError:
                 if claim_expired.is_set():
                     log.warning(
