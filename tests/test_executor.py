@@ -28,6 +28,20 @@ def test_remove_nonexistent_is_safe(executor):
     executor.remove_superpos_task("nonexistent")  # must not raise
 
 
+# --- model_info: reported to Superpos on heartbeat ---
+
+def test_model_info_reports_runtime_model_and_effort(executor, mock_runtime):
+    assert executor.model_info() == {
+        "model": mock_runtime.model,
+        "effort": mock_runtime.effort,
+    }
+
+
+def test_model_info_tracks_runtime_model_switch(executor, mock_runtime):
+    mock_runtime.set_model("claude-haiku-4-5")
+    assert executor.model_info()["model"] == "claude-haiku-4-5"
+
+
 # --- report_progress: core function is wired correctly ---
 
 async def test_run_one_uses_core_report_progress(executor, mock_superpos):
