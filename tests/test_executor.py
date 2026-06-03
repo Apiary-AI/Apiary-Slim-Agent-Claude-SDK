@@ -28,6 +28,12 @@ def test_remove_nonexistent_is_safe(executor):
     executor.remove_superpos_task("nonexistent")  # must not raise
 
 
+# Note: report_progress (the heartbeat coroutine) lives in
+# `superpos_agent_core.progress_reporter` now.  Its unit tests live next to it
+# in core (`tests/test_progress_reporter.py`); we don't re-test the contract
+# here.  Only behaviour that depends on *this* executor's wiring is kept.
+
+
 # --- model_info: reported to Superpos on heartbeat ---
 
 def test_model_info_reports_runtime_model_and_effort(executor, mock_runtime):
@@ -189,6 +195,9 @@ async def test_execute_removes_task_after_claim_expiry(executor):
         prompt="hello", chat_id="123", source="superpos", superpos_task_id="task-x"
     )
 
+    # Patch the *imported* name in the executor module — `report_progress`
+    # is a free function from core, not a method on the executor, so
+    # `patch.object(executor, ...)` no longer applies.
     with patch("superpos_agent_claude.claude_executor.report_progress", fake_report_progress), \
          patch.object(executor, "_execute_inner", fake_execute_inner), \
          patch("superpos_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
