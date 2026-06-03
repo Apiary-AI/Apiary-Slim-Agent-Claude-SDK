@@ -60,4 +60,4 @@ WORKDIR /workspace
 # subprocesses left behind when a Claude run dies) — without it they
 # accumulate as zombies because Python doesn't reap reparented orphans.
 ENTRYPOINT ["/usr/bin/tini", "--", "/app/entrypoint.sh"]
-CMD ["python3", "-m", "slim_agent_claude"]
+CMD ["python3", "-m", "superpos_agent_claude"]

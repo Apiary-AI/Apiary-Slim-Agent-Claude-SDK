@@ -25,7 +25,7 @@ Fill in your `.env`:
 | `SUPERPOS_CAPABILITIES` | No | Comma-separated capabilities |
 | `SUPERPOS_POLL_INTERVAL` | No | Poll interval in seconds (default: 5) |
 | `ANTHROPIC_API_KEY` | No | Only if not using OAuth |
-| `CLAUDE_MODEL` | No | Default: claude-opus-4-6 |
+| `CLAUDE_MODEL` | No | Default: claude-opus-4-8 |
 | `CLAUDE_EFFORT` | No | Effort level: low, medium, high, max (default: high) |
 | `CLAUDE_MAX_TURNS` | No | Default: 30 |
 | `CLAUDE_WORKING_DIR` | No | Default: /workspace |
@@ -87,9 +87,9 @@ Each variant does `FROM slim-apiary-agent-base`, so first tag the base according
 docker build -t slim-apiary-agent-base -f Dockerfile .
 
 # 2. Build the variant
-docker build -t slim-agent-claude-php        -f Dockerfile.php        .
-docker build -t slim-agent-claude-node       -f Dockerfile.node       .
-docker build -t slim-agent-claude-playwright -f Dockerfile.playwright .
+docker build -t superpos-agent-claude-php        -f Dockerfile.php        .
+docker build -t superpos-agent-claude-node       -f Dockerfile.node       .
+docker build -t superpos-agent-claude-playwright -f Dockerfile.playwright .
 ```
 
 To use one in `docker-compose.yml`, point the `dockerfile:` field at the variant:
@@ -107,7 +107,7 @@ services:
       - claude_auth_1:/home/agent/.claude
 ```
 
-If you need two stacks together (e.g. JS + browser), the cleanest path is to create a chained `Dockerfile.node-playwright` that does `FROM slim-agent-claude-node` and then adds the Playwright layers — there's no inherent conflict.
+If you need two stacks together (e.g. JS + browser), the cleanest path is to create a chained `Dockerfile.node-playwright` that does `FROM superpos-agent-claude-node` and then adds the Playwright layers — there's no inherent conflict.
 
 ### Alternative: API key auth
 

@@ -6,7 +6,7 @@
 # packages.sury.org repo (the PHP team's recommended source for Debian).
 #
 # Build:
-#   docker build -t slim-agent-claude-php -f Dockerfile.php .
+#   docker build -t superpos-agent-claude-php -f Dockerfile.php .
 
 FROM slim-apiary-agent-base
 

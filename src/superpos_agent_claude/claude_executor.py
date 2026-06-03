@@ -19,8 +19,6 @@ import tempfile as _tempfile
 import time
 
 import anyio
-import httpx
-
 from claude_code_sdk import ClaudeCodeOptions, ClaudeSDKError, Message, ProcessError, query
 from claude_code_sdk._internal import client as _sdk_client
 from claude_code_sdk._internal import message_parser
@@ -39,6 +37,7 @@ from superpos_agent_core import (
     discover_modules,
     ensure_worktree,
     is_git_repo,
+    report_progress,
     worktree_path,
 )
 
@@ -260,6 +259,14 @@ class ClaudeExecutor(Executor):
         under the old persona — Claude tends to stay consistent with
         prior turns, so a new ``--append-system-prompt`` alone can't
         overcome an old self-introduction in the resume transcript.
+
+        Note: re-syncing SubAgentDefinitions after a persona bump is owned
+        by ``superpos_agent_core.superpos_poller._resync_sub_agents``,
+        which the core poller calls in a background thread on the same
+        event.  Kicking off a second sync from here would race with that
+        one on the same ``.claude/subagents`` tree (duplicate HTTP traffic
+        plus file-write contention), so this method only updates the
+        in-memory persona/version state.
         """
         self._persona = prompt
         prev_version = self._persona_version
@@ -274,6 +281,14 @@ class ClaudeExecutor(Executor):
 
     def clear_session(self, chat_id: int | str) -> None:
         self._sessions.clear(chat_id)
+
+    def model_info(self) -> dict[str, str]:
+        """Current model/effort, reported to Superpos on each heartbeat.
+
+        Reads live runtime state so mid-session ``/model`` / ``/effort``
+        switches surface on the dashboard.
+        """
+        return {"model": self._runtime.model, "effort": self._runtime.effort}
 
     async def run(self) -> None:
         log.info(
@@ -577,7 +592,7 @@ class ClaudeExecutor(Executor):
 
         if req.source == "superpos" and req.superpos_task_id and self._superpos:
             progress_task = asyncio.create_task(
-                self._report_progress(req.superpos_task_id, claim_expired)
+                report_progress(self._superpos, req.superpos_task_id, claim_expired)
             )
 
         try:
@@ -667,26 +682,6 @@ class ClaudeExecutor(Executor):
             if req.superpos_task_id:
                 self.remove_superpos_task(req.superpos_task_id)
             self.queue.task_done()
-
-    async def _report_progress(
-        self, task_id: str, claim_expired: asyncio.Event, interval: int = 30,
-    ) -> None:
-        progress = 5
-        while True:
-            await asyncio.sleep(interval)
-            progress = min(progress + 5, 95)
-            try:
-                await self._superpos.update_progress(task_id, progress)
-            except httpx.HTTPStatusError as e:
-                if e.response.status_code == 409:
-                    log.warning(
-                        "Claim expired for task %s (409); aborting execution", task_id,
-                    )
-                    claim_expired.set()
-                    return
-                log.debug("Progress update failed for task %s", task_id)
-            except Exception:
-                log.debug("Progress update failed for task %s", task_id)
 
     async def _execute(
         self,
@@ -835,7 +830,7 @@ class ClaudeExecutor(Executor):
         progress_task: asyncio.Task | None = None
         if self._superpos:
             progress_task = asyncio.create_task(
-                self._report_progress(task_id, claim_expired)
+                report_progress(self._superpos, task_id, claim_expired)
             )
 
         full_text = ""
