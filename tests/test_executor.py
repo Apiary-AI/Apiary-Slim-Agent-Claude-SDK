@@ -78,7 +78,7 @@ async def test_execute_timeout_calls_fail_task(executor, mock_superpos, mock_con
     # Make the timeout cap tiny so the test doesn't wait an hour.
     mock_config.executor_max_turns = 0  # max_timeout = 0 * 120 = 0s
 
-    async def fake_report_progress(task_id, claim_expired, interval=30):
+    async def fake_report_progress(client, task_id, claim_expired, **kwargs):
         # Just keep the coroutine alive — we never set claim_expired.
         await asyncio.sleep(5)
 
@@ -91,9 +91,9 @@ async def test_execute_timeout_calls_fail_task(executor, mock_superpos, mock_con
         source="superpos", superpos_task_id="task-zombie",
     )
 
-    with patch.object(executor, "_report_progress", fake_report_progress), \
+    with patch("superpos_agent_claude.claude_executor.report_progress", fake_report_progress), \
          patch.object(executor, "_execute_inner", fake_execute_inner), \
-         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+         patch("superpos_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         MockStreamer.return_value.start = AsyncMock()
         await executor.queue.put(req)
         await executor.queue.get()
@@ -116,7 +116,7 @@ async def test_execute_timeout_skips_fail_when_claim_already_expired(
     executor.add_superpos_task("task-y")
     mock_config.executor_max_turns = 0
 
-    async def fake_report_progress(task_id, claim_expired, interval=30):
+    async def fake_report_progress(client, task_id, claim_expired, **kwargs):
         # Mimic the real reporter detecting a 409 immediately.
         claim_expired.set()
 
@@ -128,9 +128,9 @@ async def test_execute_timeout_skips_fail_when_claim_already_expired(
         source="superpos", superpos_task_id="task-y",
     )
 
-    with patch.object(executor, "_report_progress", fake_report_progress), \
+    with patch("superpos_agent_claude.claude_executor.report_progress", fake_report_progress), \
          patch.object(executor, "_execute_inner", fake_execute_inner), \
-         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+         patch("superpos_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         MockStreamer.return_value.start = AsyncMock()
         await executor.queue.put(req)
         await executor.queue.get()
