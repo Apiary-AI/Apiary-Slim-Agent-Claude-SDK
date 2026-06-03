@@ -1,9 +1,9 @@
 import pytest
 from unittest.mock import AsyncMock, MagicMock
 
-from slim_agent_claude.config import ClaudeConfig as Config
-from slim_agent_claude.claude_executor import ClaudeExecutor
-from slim_agent_claude.runtime_config import ClaudeRuntimeConfig as RuntimeConfig
+from superpos_agent_claude.config import ClaudeConfig as Config
+from superpos_agent_claude.claude_executor import ClaudeExecutor
+from superpos_agent_claude.runtime_config import ClaudeRuntimeConfig as RuntimeConfig
 
 
 @pytest.fixture
