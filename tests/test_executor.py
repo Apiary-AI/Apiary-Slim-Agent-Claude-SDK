@@ -88,8 +88,12 @@ async def test_execute_timeout_calls_fail_task(executor, mock_superpos, mock_con
         # Just keep the coroutine alive — we never set claim_expired.
         await asyncio.sleep(5)
 
-    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None):
+    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None):
         # Simulate a Claude SDK iterator that hangs forever.
+        # Pulse progress_event so the stall watchdog doesn't fire before the
+        # overall timeout — this test exercises the timeout path, not stall.
+        if progress_event is not None:
+            progress_event.set()
         await asyncio.sleep(10)
 
     req = ExecutionRequest(
@@ -126,7 +130,9 @@ async def test_execute_timeout_skips_fail_when_claim_already_expired(
         # Mimic the real reporter detecting a 409 immediately.
         claim_expired.set()
 
-    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None):
+    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None):
+        if progress_event is not None:
+            progress_event.set()
         await asyncio.sleep(10)
 
     req = ExecutionRequest(
@@ -157,7 +163,11 @@ async def test_execute_timeout_records_recent_task(executor, mock_superpos, mock
     async def fake_report_progress(client, task_id, claim_expired, **kwargs):
         await asyncio.sleep(5)
 
-    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None):
+    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None):
+        # Pulse progress_event so the stall watchdog doesn't fire before the
+        # overall timeout — this test exercises the timeout path, not stall.
+        if progress_event is not None:
+            progress_event.set()
         await asyncio.sleep(10)
 
     req = ExecutionRequest(
@@ -2230,7 +2240,7 @@ async def test_execute_cancels_inner_when_progress_event_stalls(
             raise
 
     with patch.object(executor, "_execute_inner", stalling_inner), \
-         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+         patch("superpos_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         streamer = MockStreamer.return_value
         streamer.start = AsyncMock()
         streamer.finish = AsyncMock()
@@ -2272,7 +2282,7 @@ async def test_execute_does_not_cancel_when_progress_event_pulsed(
             await asyncio.sleep(0.05)
 
     with patch.object(executor, "_execute_inner", progressing_inner), \
-         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+         patch("superpos_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         streamer = MockStreamer.return_value
         streamer.start = AsyncMock()
         streamer.finish = AsyncMock()
@@ -2346,8 +2356,8 @@ async def test_execute_inner_pulses_progress_event_on_each_message(
 
     progress_event = _CountingEvent()
 
-    with patch("slim_agent_claude.claude_executor.query", return_value=fake_query()), \
-         patch("slim_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+    with patch("superpos_agent_claude.claude_executor.query", return_value=fake_query()), \
+         patch("superpos_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
         streamer = MockStreamer.return_value
         streamer.start = AsyncMock()
         streamer.finish = AsyncMock()
@@ -2360,4 +2370,91 @@ async def test_execute_inner_pulses_progress_event_on_each_message(
 
     assert pulse_count == 3, (
         f"expected one progress_event.set() per yielded message, got {pulse_count}"
+    )
+
+
+async def test_backoff_sleep_chunk_derives_from_stall_timeout(executor, mock_config):
+    """The heartbeat chunk interval in _backoff_sleep must derive from
+    claude_stall_timeout (stall / 2) rather than being hard-coded.  When
+    stall_timeout is very small (e.g. in tests), the chunk must be smaller
+    than the timeout so the watchdog never fires mid-backoff (Codex P2).
+    """
+    mock_config.claude_stall_timeout = 0.1  # very small, like in tests
+
+    sleep_durations: list[float] = []
+    original_sleep = asyncio.sleep
+
+    async def recording_sleep(secs):
+        sleep_durations.append(secs)
+        await original_sleep(secs)
+
+    progress_event = asyncio.Event()
+
+    with patch("asyncio.sleep", recording_sleep):
+        await executor._backoff_sleep(0.2, progress_event)
+
+    # With stall_timeout=0.1, upper = max(0.05, 0.1/2) = 0.05,
+    # chunk = max(0.05, min(0.05, 15.0, 0.2)) = 0.05.
+    # Each sleep call should be <= 0.05 (well under the 0.1s stall timeout).
+    assert all(d <= 0.06 for d in sleep_durations), (
+        f"_backoff_sleep chunk must be smaller than stall_timeout (0.1s) "
+        f"but got sleep durations: {sleep_durations}"
+    )
+    assert len(sleep_durations) >= 3, (
+        f"expected at least 3 chunks for a 0.2s wait with 0.05s chunk, "
+        f"got {len(sleep_durations)}"
+    )
+
+
+async def test_low_stall_timeout_does_not_false_cancel_during_backoff(
+    executor, mock_config,
+):
+    """_backoff_sleep with a stall timeout smaller than the total wait must
+    pulse progress_event frequently enough that a concurrent _watch_stall
+    never fires.  Run them together and verify no false cancellation.
+    """
+    mock_config.claude_stall_timeout = 0.1  # stall timeout
+
+    progress_event = asyncio.Event()
+    stalled = False
+
+    async def _watch_stall():
+        nonlocal stalled
+        while True:
+            try:
+                await asyncio.wait_for(
+                    progress_event.wait(), timeout=0.1,
+                )
+            except asyncio.TimeoutError:
+                stalled = True
+                return
+            progress_event.clear()
+
+    # Backoff wait is 0.5s — 5x the stall timeout.  Without proper
+    # heartbeating the watchdog would fire after 0.1s.
+    # We run both concurrently: if the watcher fires *during* the
+    # backoff, `stalled` flips True and the backoff_sleep task gets
+    # cancelled.  If backoff_sleep finishes first, the watcher is
+    # still waiting on the cleared event — cancel it before it
+    # times out on the *post*-backoff gap (which is expected).
+    watcher = asyncio.create_task(_watch_stall())
+    backoff = asyncio.create_task(executor._backoff_sleep(0.5, progress_event))
+
+    done, pending = await asyncio.wait(
+        [watcher, backoff], return_when=asyncio.FIRST_COMPLETED,
+    )
+    for p in pending:
+        p.cancel()
+        try:
+            await p
+        except asyncio.CancelledError:
+            pass
+
+    assert not stalled, (
+        "_watch_stall falsely fired during _backoff_sleep — heartbeat "
+        "chunks are too large for the configured stall timeout"
+    )
+    assert backoff in done, (
+        "backoff_sleep should complete first; if the watcher finished "
+        "first, it means the heartbeat was too slow"
     )
