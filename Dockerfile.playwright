@@ -5,7 +5,7 @@
 # reachable through page.context() / CDPSession when needed.
 #
 # Build:
-#   docker build -t slim-agent-claude-playwright -f Dockerfile.playwright .
+#   docker build -t superpos-agent-claude-playwright -f Dockerfile.playwright .
 
 FROM slim-apiary-agent-base
 

@@ -1,4 +1,4 @@
-"""Slim-Agent-Claude entry point — wires ClaudeExecutor into the core orchestrator."""
+"""Superpos-Agent-Claude entry point — wires ClaudeExecutor into the core orchestrator."""
 
 from __future__ import annotations
 

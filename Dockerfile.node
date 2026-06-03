@@ -4,7 +4,7 @@
 # native npm modules (better-sqlite3, sharp, node-gyp targets, etc.).
 #
 # Build:
-#   docker build -t slim-agent-claude-node -f Dockerfile.node .
+#   docker build -t superpos-agent-claude-node -f Dockerfile.node .
 
 FROM slim-apiary-agent-base
 
