@@ -19,8 +19,6 @@ import tempfile as _tempfile
 import time
 
 import anyio
-import httpx
-
 from claude_code_sdk import ClaudeCodeOptions, ClaudeSDKError, Message, ProcessError, query
 from claude_code_sdk._internal import client as _sdk_client
 from claude_code_sdk._internal import message_parser
@@ -261,6 +259,14 @@ class ClaudeExecutor(Executor):
         under the old persona — Claude tends to stay consistent with
         prior turns, so a new ``--append-system-prompt`` alone can't
         overcome an old self-introduction in the resume transcript.
+
+        Note: re-syncing SubAgentDefinitions after a persona bump is owned
+        by ``superpos_agent_core.superpos_poller._resync_sub_agents``,
+        which the core poller calls in a background thread on the same
+        event.  Kicking off a second sync from here would race with that
+        one on the same ``.claude/subagents`` tree (duplicate HTTP traffic
+        plus file-write contention), so this method only updates the
+        in-memory persona/version state.
         """
         self._persona = prompt
         prev_version = self._persona_version
@@ -275,6 +281,14 @@ class ClaudeExecutor(Executor):
 
     def clear_session(self, chat_id: int | str) -> None:
         self._sessions.clear(chat_id)
+
+    def model_info(self) -> dict[str, str]:
+        """Current model/effort, reported to Superpos on each heartbeat.
+
+        Reads live runtime state so mid-session ``/model`` / ``/effort``
+        switches surface on the dashboard.
+        """
+        return {"model": self._runtime.model, "effort": self._runtime.effort}
 
     async def run(self) -> None:
         log.info(
