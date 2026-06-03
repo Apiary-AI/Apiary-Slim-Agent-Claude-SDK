@@ -1043,18 +1043,22 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "python-telegram-bot", specifier = ">=21.0" },
     { name = "pyyaml", specifier = ">=6.0" },
-    { name = "superpos-agent-core", git = "https://github.com/Superpos-AI/superpos-agent-core.git?rev=42809b9ad1fb23a860a75081066d5c57bebe1123" },
+    { name = "superpos-agent-core", specifier = "~=0.1" },
 ]
 provides-extras = ["dev"]
 
 [[package]]
 name = "superpos-agent-core"
-version = "0.1.0"
-source = { git = "https://github.com/Superpos-AI/superpos-agent-core.git?rev=42809b9ad1fb23a860a75081066d5c57bebe1123#42809b9ad1fb23a860a75081066d5c57bebe1123" }
+version = "0.1.1"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
     { name = "python-telegram-bot" },
     { name = "pyyaml" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/7e/d0/7740facecd38ef9cd2f9aa65a49ee2f3c1d6964130b5bf0a88a0becf7a80/superpos_agent_core-0.1.1.tar.gz", hash = "sha256:98c21d5336b88dc027f110a632111f504b2dda07094acfcda7c66a7beaa9d29b", size = 121987, upload-time = "2026-06-03T12:06:55.14Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b7/af/c76114e6a4034f820538aaf827d6b1275bb881ad231be0ed09b8cfe87d04/superpos_agent_core-0.1.1-py3-none-any.whl", hash = "sha256:f86fbafb6ace099c167e8d47ca8c441444fc4c03e7f2ddcf91e843bc9d966289", size = 99698, upload-time = "2026-06-03T12:06:53.589Z" },
 ]
 
 [[package]]
