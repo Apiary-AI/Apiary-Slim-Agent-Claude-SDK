@@ -14,6 +14,10 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
 
 RUN npm install -g @anthropic-ai/claude-code
 
+# uv / uvx — used to launch MiniMax's web-search MCP (uvx minimax-coding-plan-mcp)
+# on shim backends. Harmless on native Anthropic (only invoked when configured).
+RUN pip install --no-cache-dir --break-system-packages uv
+
 WORKDIR /app
 
 # slim-agent-core is pulled directly from GitHub via requirements.txt
