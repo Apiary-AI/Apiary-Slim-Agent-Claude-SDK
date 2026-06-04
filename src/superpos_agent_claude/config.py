@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from superpos_agent_core import BaseConfig
 
@@ -16,10 +17,39 @@ class ClaudeConfig(BaseConfig):
     claude_model: str = "claude-opus-4-8"
     claude_effort: str = "high"
 
+    # When the Claude CLI is pointed at an Anthropic-compatible *shim*
+    # (e.g. MiniMax via ANTHROPIC_BASE_URL), Anthropic's hosted server tools
+    # (WebSearch/WebFetch) don't exist on the other end and 400. We detect the
+    # shim from the base URL and swap in provider-native tooling instead.
+    anthropic_base_url: str = ""
+    # MiniMax's own web-search MCP (uvx minimax-coding-plan-mcp). Loaded only
+    # when a key is present; billed against MiniMax Token-Plan credits, so it
+    # is kept separate from the model auth token on purpose.
+    minimax_api_key: str = ""
+    minimax_api_host: str = "https://api.minimax.io"
+
     def __post_init__(self) -> None:
         if not self.executor_kind or self.executor_kind == "generic":
             self.executor_kind = "claude"
         super().__post_init__()
+
+    @property
+    def is_native_anthropic(self) -> bool:
+        """True when talking to Anthropic's own API (vs a compatible shim).
+
+        Native = no base URL override, or one whose host is anthropic.com
+        (or a subdomain of it). Anything else (MiniMax, other gateways) is a
+        shim where hosted server tools are unavailable.
+        """
+        url = self.anthropic_base_url.strip()
+        if not url:
+            return True
+        # urlparse needs a scheme to populate hostname; add one if missing
+        # so bare "api.anthropic.com" still parses correctly.
+        if "://" not in url:
+            url = "//" + url
+        host = (urlparse(url).hostname or "").lower()
+        return host == "anthropic.com" or host.endswith(".anthropic.com")
 
     @classmethod
     def from_env(cls) -> "ClaudeConfig":
@@ -55,5 +85,12 @@ class ClaudeConfig(BaseConfig):
             anthropic_api_key=os.environ.get("ANTHROPIC_API_KEY", ""),
             claude_model=os.environ.get("CLAUDE_MODEL", "claude-opus-4-8"),
             claude_effort=os.environ.get("CLAUDE_EFFORT", "high"),
+            # The CLI consumes ANTHROPIC_BASE_URL itself; we read it only to
+            # detect a non-Anthropic shim and adjust tooling accordingly.
+            anthropic_base_url=os.environ.get("ANTHROPIC_BASE_URL", ""),
+            minimax_api_key=os.environ.get("MINIMAX_API_KEY", ""),
+            minimax_api_host=os.environ.get(
+                "MINIMAX_API_HOST", "https://api.minimax.io"
+            ),
         )
         return cls(**base)
