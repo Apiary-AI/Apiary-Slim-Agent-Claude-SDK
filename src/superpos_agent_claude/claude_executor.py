@@ -262,6 +262,13 @@ class ClaudeExecutor(Executor):
         only so newly created sessions record which version they started
         under, for diagnostics.
 
+        When ``prompt`` is ``None`` — which happens when
+        ``get_persona_assembled()`` returns ``None`` on a 404 or transport
+        failure — the previous persona is preserved.  Without this guard,
+        a failed refresh after a real persona/environment change would
+        leave ``_persona`` as ``None`` and the resumed session would
+        continue with no system prompt at all.
+
         Note: re-syncing SubAgentDefinitions after a persona bump is owned
         by ``superpos_agent_core.superpos_poller._resync_sub_agents``,
         which the core poller calls in a background thread on the same
@@ -270,7 +277,8 @@ class ClaudeExecutor(Executor):
         plus file-write contention), so this method only updates the
         in-memory persona/version state.
         """
-        self._persona = prompt
+        if prompt is not None:
+            self._persona = prompt
         if version is not None:
             self._persona_version = version
 

@@ -1296,6 +1296,36 @@ def test_update_persona_bump_does_not_log_invalidation(executor, caplog):
     assert not any("Persona version bumped" in r.message for r in caplog.records)
 
 
+def test_update_persona_none_preserves_previous_persona(executor):
+    """Regression: when get_persona_assembled() returns None on a 404 or
+    transport failure, update_persona(None, version=X) must NOT overwrite
+    the existing persona with None.  Before the fix this left the executor
+    with no system prompt at all, so a resumed session would continue with
+    a stale transcript and no replacement persona."""
+    executor.update_persona("original persona", version=1)
+    assert executor._persona == "original persona"
+
+    # Simulate a failed persona refresh — the poller calls
+    # update_persona(None, version=2) when the fetch 404s.
+    executor.update_persona(None, version=2)
+
+    # Persona must be preserved; version is still updated (the server
+    # did bump the version, we just failed to fetch the content).
+    assert executor._persona == "original persona", (
+        "A None persona from a failed refresh must not overwrite the "
+        "previous persona — sessions would resume with no system prompt"
+    )
+    assert executor._persona_version == 2
+
+    # Sessions must NOT be cleared — the whole point of the PR is to
+    # stop tearing down sessions on version bumps.
+    executor._sessions.set_with_version("chat-1", "sess-1", 1)
+    executor.update_persona(None, version=3)
+    assert executor._sessions.get_with_version("chat-1") is not None, (
+        "Sessions must not be cleared when persona refresh fails"
+    )
+
+
 def test_update_persona_does_not_spawn_background_sub_agent_sync(executor):
     """SubAgentDefinition re-sync after a persona bump is owned by
     ``superpos_agent_core.superpos_poller._resync_sub_agents``.  The
