@@ -48,18 +48,26 @@ log = logging.getLogger(__name__)
 
 
 class PersonaRefreshFailed(RuntimeError):
-    """Reserved for genuine persona-refresh failures.
+    """Raised by ``update_persona`` when the assembled-prompt fetch
+    failed but the server still reports a real persona version.
 
-    Currently unused: ``superpos_agent_core.superpos_client.get_persona_assembled``
-    swallows both 404s and transport errors and returns ``None`` in either
-    case, so the executor cannot distinguish a real fetch failure from the
-    valid "no persona configured" steady state at the
-    ``update_persona`` boundary.  ``update_persona`` therefore treats a
-    ``None`` prompt the same way ``superpos_agent_core.main.run_agent``
-    does at startup — as a successful empty response — and never raises.
-    Kept around so external monkey-patches that import the symbol don't
-    break, and so a future SDK change that surfaces fetch failures
-    distinctly has an obvious place to plug in.
+    ``superpos_agent_core.superpos_client.get_persona_assembled`` swallows
+    both 404s and transport errors and returns ``None`` in either case, so
+    the executor cannot tell those apart on its own.  We use the
+    accompanying ``version`` argument as the disambiguator: when the
+    server-reported ``version`` is not ``None`` but the assembled prompt
+    came back as ``None``, that combination can only mean a real fetch
+    failure (a server that reports a live version cannot simultaneously
+    have no configured persona), so we raise.  When ``version`` is also
+    ``None`` we treat the empty response as the valid "no persona
+    configured" steady state and clear without raising — matching
+    ``superpos_agent_core.main.run_agent``'s startup semantics.
+
+    Raising here is load-bearing: the core poller wraps its persona
+    refresh in a broad ``except Exception``, so this exception aborts the
+    follow-up ``persona_version = server_version`` assignment, the next
+    poll cycle still sees ``changed == True``, and the fetch is retried
+    instead of leaving Claude running indefinitely with no persona at all.
     """
 
 
@@ -278,25 +286,32 @@ class ClaudeExecutor(Executor):
         only so newly created sessions record which version they started
         under, for diagnostics.
 
-        When ``prompt`` is ``None`` this is treated as the valid
-        "no persona configured" steady state — mirroring what
-        ``superpos_agent_core.main.run_agent`` does at startup when
-        ``get_persona_assembled()`` returns ``None``.  The cached persona
-        is cleared and the version is allowed to advance, so the poller's
-        ``persona_version`` / platform / environment trackers move forward
-        and we don't refetch the empty response on every poll.
+        A ``None`` ``prompt`` is interpreted in two distinct ways,
+        disambiguated by ``version``:
 
-        Note that ``superpos_agent_core.superpos_client.get_persona_assembled``
-        currently swallows both 404s and transport errors and returns
-        ``None`` for both the "no persona configured" success case and
-        any real fetch failure, so we cannot distinguish them here.
-        Raising on every ``None`` (the prior behaviour) starved the
-        steady-state-empty case: when the operator intentionally removed
-        the persona, the executor kept injecting the stale prompt and
-        the poller retried the fetch on every cycle forever.  Matching
-        ``run_agent``'s startup semantics is the safer default; the rare
-        transient-failure case recovers on the next real version bump
-        (or restart).
+        * ``version is None`` — the server reports no active persona at
+          all.  This is the valid "no persona configured" steady state
+          (e.g. operator removed the persona); we clear the cached
+          persona and return without raising, mirroring what
+          ``superpos_agent_core.main.run_agent`` does at startup.
+          ``_persona_version`` is left untouched because there is no new
+          version to record.
+        * ``version is not None`` — the server reports a real live
+          persona version but the assembled prompt came back ``None``.
+          ``superpos_agent_core.superpos_client.get_persona_assembled``
+          swallows both 404s and transport errors and returns ``None`` in
+          either case, so this combination can only mean a fetch failure
+          (a server that reports a live version cannot simultaneously
+          have no configured persona).  We raise
+          ``PersonaRefreshFailed`` and leave the cached persona / version
+          untouched.  The core poller wraps its refresh block in a broad
+          ``except Exception``, so the raise aborts the follow-up
+          ``persona_version = server_version`` assignment; the next poll
+          cycle still sees ``changed == True`` and retries the fetch
+          instead of leaving Claude running indefinitely with no persona
+          at all.  Preserving the cached persona also keeps the system
+          prompt intact for resumed Claude sessions during the transient
+          failure window.
 
         Note: re-syncing SubAgentDefinitions after a persona bump is owned
         by ``superpos_agent_core.superpos_poller._resync_sub_agents``,
@@ -306,6 +321,15 @@ class ClaudeExecutor(Executor):
         plus file-write contention), so this method only updates the
         in-memory persona/version state.
         """
+        if prompt is None and version is not None:
+            raise PersonaRefreshFailed(
+                f"Persona v{version} fetch returned None; the server reports a "
+                "real persona exists but the assembled prompt could not be "
+                "loaded. Keeping cached persona so resumed Claude sessions still "
+                "see a system prompt; the poller's outer except will abort its "
+                "``persona_version = server_version`` assignment, so the next "
+                "poll cycle will retry the fetch."
+            )
         self._persona = prompt
         if version is not None:
             self._persona_version = version
