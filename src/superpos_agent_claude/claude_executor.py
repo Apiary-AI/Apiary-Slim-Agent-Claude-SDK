@@ -713,6 +713,57 @@ class ClaudeExecutor(Executor):
                 self.remove_superpos_task(req.superpos_task_id)
             self.queue.task_done()
 
+    async def _backoff_sleep(
+        self, wait: float, progress_event: asyncio.Event | None,
+    ) -> None:
+        """Sleep for ``wait`` seconds while keeping the stall watchdog happy.
+
+        Retry backoffs (API 500, rate-limit, CLI crash) are intentional idle
+        windows — without a heartbeat the watchdog cancels healthy runs when
+        ``claude_stall_timeout`` is set below the backoff duration.  Pulse
+        the event in chunks well under the stall timeout so the watchdog
+        only fires for genuine deadlocks (Codex P2).
+        """
+        if progress_event is None or wait <= 0:
+            await asyncio.sleep(wait)
+            return
+        progress_event.set()
+        # Chunk must be smaller than stall_timeout so the watchdog never
+        # fires mid-backoff, but not so small we burn CPU on a busy-loop
+        # of sleeps for very small stall_timeout configs (e.g. in tests).
+        stall = float(self._config.claude_stall_timeout)
+        upper = max(0.05, stall / 2)
+        chunk = max(0.05, min(upper, 15.0, wait))
+        remaining = wait
+        while remaining > 0:
+            slice_ = min(chunk, remaining)
+            await asyncio.sleep(slice_)
+            remaining -= slice_
+            progress_event.set()
+
+    async def _report_stall(
+        self,
+        req: ExecutionRequest,
+        streamer: TelegramStreamer,
+        stall_timeout: int,
+    ) -> None:
+        """Notify the user and Superpos that a task was killed for stalling."""
+        msg = (
+            f"Task aborted: the Claude subprocess produced no output for "
+            f"{stall_timeout}s and was forcibly cancelled."
+        )
+        try:
+            await streamer.error(msg)
+        except Exception:
+            log.debug("Failed to send stall notification to Telegram", exc_info=True)
+        if req.source == "superpos" and req.superpos_task_id and self._superpos:
+            try:
+                await self._superpos.fail_task(req.superpos_task_id, msg)
+            except Exception:
+                log.debug(
+                    "Failed to mark task %s as failed after stall",
+                    req.superpos_task_id, exc_info=True,
+                )
     async def _execute(
         self,
         req: ExecutionRequest,
@@ -745,15 +796,43 @@ class ClaudeExecutor(Executor):
 
         inner_task: asyncio.Task | None = None
         watcher_task: asyncio.Task | None = None
+        stall_watchdog: asyncio.Task | None = None
+        progress_event = asyncio.Event()
+        stalled = False
 
         async def _watch_claim_expiry() -> None:
             await claim_expired.wait()
             if inner_task is not None:
                 inner_task.cancel()
 
+        stall_timeout = self._config.claude_stall_timeout
+
+        async def _watch_stall() -> None:
+            nonlocal stalled
+            while True:
+                try:
+                    await asyncio.wait_for(
+                        progress_event.wait(), timeout=stall_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    stalled = True
+                    log.warning(
+                        "Claude SDK iterator stalled for %ds on task %s "
+                        "(no message yielded) — cancelling subprocess",
+                        stall_timeout, req.superpos_task_id or req.chat_id,
+                    )
+                    if inner_task is not None and not inner_task.done():
+                        inner_task.cancel()
+                    return
+                progress_event.clear()
+
         try:
             inner_task = asyncio.create_task(
-                self._execute_inner(req, streamer, retries, pre_resolved=pre_resolved),
+                self._execute_inner(
+                    req, streamer, retries,
+                    pre_resolved=pre_resolved,
+                    progress_event=progress_event,
+                ),
             )
             # Register with the base class so the /stop Telegram command can
             # find and cancel this in-flight work via cancel_chat(chat_id).
@@ -761,6 +840,7 @@ class ClaudeExecutor(Executor):
             self._track_chat_task(req.chat_id, inner_task)
             if req.source == "superpos" and req.superpos_task_id:
                 watcher_task = asyncio.create_task(_watch_claim_expiry())
+            stall_watchdog = asyncio.create_task(_watch_stall())
             try:
                 # Safety net against zombie pipes where the Claude subprocess
                 # dies but grandchildren keep stdout open, hanging the
@@ -820,6 +900,13 @@ class ClaudeExecutor(Executor):
                         "Execution aborted: claim expired for superpos task %s",
                         req.superpos_task_id,
                     )
+                elif stalled:
+                    log.warning(
+                        "Execution aborted: claude subprocess stalled for "
+                        "%ds on task %s",
+                        stall_timeout, req.superpos_task_id or req.chat_id,
+                    )
+                    await self._report_stall(req, streamer, stall_timeout)
                 else:
                     raise
         finally:
@@ -827,6 +914,12 @@ class ClaudeExecutor(Executor):
                 watcher_task.cancel()
                 try:
                     await watcher_task
+                except asyncio.CancelledError:
+                    pass
+            if stall_watchdog:
+                stall_watchdog.cancel()
+                try:
+                    await stall_watchdog
                 except asyncio.CancelledError:
                     pass
             try:
@@ -1019,6 +1112,7 @@ class ClaudeExecutor(Executor):
         retries: int,
         *,
         pre_resolved: tuple[str | None, str | None] | None = None,
+        progress_event: asyncio.Event | None = None,
     ) -> None:
         t0 = time.monotonic()
         full_text = ""
@@ -1127,6 +1221,10 @@ class ClaudeExecutor(Executor):
                     system_prompt_append=system_prompt_append,
                 )
                 async for message in query(prompt=effective_prompt, options=options):
+                    # Signal the stall watchdog that the SDK iterator is
+                    # alive — every yielded message resets the deadline.
+                    if progress_event is not None:
+                        progress_event.set()
                     # Capture session_id from init (fires on every run) and
                     # result (terminal, success only).  Init survives a CLI
                     # crash mid-stream — ResultMessage doesn't fire if the
@@ -1229,7 +1327,7 @@ class ClaudeExecutor(Executor):
                         attempt, retries, wait, err_str[:100],
                     )
                     await streamer.append(f"\n⏳ API error, retrying in {wait}s...\n")
-                    await asyncio.sleep(wait)
+                    await self._backoff_sleep(wait, progress_event)
                     continue
 
                 # CLI subprocess crash — resume the session so completed tool
@@ -1255,7 +1353,7 @@ class ClaudeExecutor(Executor):
                         f"\n⏳ CLI crashed (exit {exit_code}), "
                         f"resuming session in {wait}s...{stderr_blurb}\n",
                     )
-                    await asyncio.sleep(wait)
+                    await self._backoff_sleep(wait, progress_event)
                     resume_id = last_session_id
                     effective_prompt = (
                         "Your previous CLI invocation crashed before completing this task. "
@@ -1277,7 +1375,7 @@ class ClaudeExecutor(Executor):
                         attempt, retries, wait,
                     )
                     await streamer.append(f"\n⏳ Rate limited, retrying in {wait}s...\n")
-                    await asyncio.sleep(wait)
+                    await self._backoff_sleep(wait, progress_event)
                     continue
                 elif resume_id and attempt < retries:
                     log.warning("Session resume failed, retrying with fresh session")

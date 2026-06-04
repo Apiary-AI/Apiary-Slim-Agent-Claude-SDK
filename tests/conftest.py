@@ -18,6 +18,7 @@ def mock_config(tmp_path):
     cfg.executor_max_parallel = 3
     cfg.home_dir = str(tmp_path)
     cfg.modules_dir = str(tmp_path / "modules")
+    cfg.claude_stall_timeout = 900
     return cfg
 
 
