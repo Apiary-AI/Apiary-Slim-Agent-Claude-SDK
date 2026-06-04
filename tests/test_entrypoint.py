@@ -11,7 +11,21 @@ from pathlib import Path
 
 import pytest
 
-ENTRYPOINT = Path(__file__).resolve().parent.parent / "entrypoint.sh"
+REPO_ROOT = Path(__file__).resolve().parent.parent
+ENTRYPOINT = REPO_ROOT / "entrypoint.sh"
+
+# Minimum agent-core version that ships the `github_auth` module the
+# entrypoint now invokes. Bump this in lockstep with any new core API the
+# entrypoint starts depending on.
+MIN_CORE_VERSION = (0, 1, 2)
+
+
+def _parse_lower_bound(specifier: str) -> tuple[int, ...]:
+    """Extract the numeric lower bound from a PEP 440 specifier like
+    ``~=0.1.2`` or ``>=0.1.2`` so it can be compared against MIN_CORE_VERSION."""
+    match = re.search(r"(?:~=|>=|==)\s*(\d+(?:\.\d+)*)", specifier)
+    assert match, f"no lower-bound version found in specifier: {specifier!r}"
+    return tuple(int(p) for p in match.group(1).split("."))
 
 
 def _read_entrypoint() -> str:
@@ -381,4 +395,48 @@ class TestPathContractAgreement:
         assert setup_match.group(1) == sync_match.group(1), (
             "module_setup --modules-dir and sync_sub_agents --modules-dir "
             "must agree so an overridden CLAUDE_WORKING_DIR keeps them aligned"
+        )
+
+
+class TestAgentCoreVersionPin:
+    """entrypoint.sh invokes ``superpos_agent_core.github_auth``, which only
+    exists in agent-core >= 0.1.2. The declared dependency floor *and* the
+    lockfile must therefore resolve to at least 0.1.2 — otherwise a lockfile
+    install, a minimum-version resolution, or a cached Docker layer pulls
+    0.1.1, where ``github_auth`` is missing and the entrypoint crashes."""
+
+    def test_entrypoint_uses_github_auth(self):
+        """Guard the premise: if the entrypoint stops importing github_auth,
+        the version-floor assertions below should be revisited."""
+        text = _read_entrypoint()
+        assert "superpos_agent_core.github_auth" in text, (
+            "entrypoint no longer invokes github_auth — revisit MIN_CORE_VERSION"
+        )
+
+    def test_requirements_txt_floor(self):
+        text = (REPO_ROOT / "requirements.txt").read_text()
+        match = re.search(r"^superpos-agent-core\s*(\S+)", text, re.MULTILINE)
+        assert match, "superpos-agent-core not pinned in requirements.txt"
+        assert _parse_lower_bound(match.group(1)) >= MIN_CORE_VERSION, (
+            "requirements.txt must require agent-core >= 0.1.2 for github_auth"
+        )
+
+    def test_pyproject_floor(self):
+        text = (REPO_ROOT / "pyproject.toml").read_text()
+        match = re.search(r'"superpos-agent-core\s*([^"]+)"', text)
+        assert match, "superpos-agent-core not pinned in pyproject.toml"
+        assert _parse_lower_bound(match.group(1)) >= MIN_CORE_VERSION, (
+            "pyproject.toml must require agent-core >= 0.1.2 for github_auth"
+        )
+
+    def test_uv_lock_resolves_at_least_min_version(self):
+        text = (REPO_ROOT / "uv.lock").read_text()
+        match = re.search(
+            r'name = "superpos-agent-core"\s*\nversion = "([^"]+)"', text
+        )
+        assert match, "superpos-agent-core not present in uv.lock"
+        locked = tuple(int(p) for p in match.group(1).split("."))
+        assert locked >= MIN_CORE_VERSION, (
+            f"uv.lock pins agent-core {match.group(1)}, but the entrypoint's "
+            "github_auth call needs >= 0.1.2"
         )

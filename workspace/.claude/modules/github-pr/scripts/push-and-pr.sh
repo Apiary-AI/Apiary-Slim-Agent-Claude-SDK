@@ -7,6 +7,16 @@ PR_BODY="${3:-}"
 
 cd "$REPO_DIR"
 
+# `gh` reads GITHUB_TOKEN from the env directly. When it isn't set (GitHub App
+# path), mint a short-lived installation token from the Superpos broker so
+# `gh pr create` is authenticated the same way `git push` is. Best-effort: if
+# no broker connection exists, GH_TOKEN stays empty and gh falls back to its
+# own auth state.
+if [ -z "${GITHUB_TOKEN:-}" ]; then
+    GH_TOKEN="$(python3 -m superpos_agent_core.github_auth token 2>/dev/null || true)"
+    export GH_TOKEN
+fi
+
 BRANCH=$(git rev-parse --abbrev-ref HEAD)
 if [ "$BRANCH" = "main" ] || [ "$BRANCH" = "master" ]; then
     echo "ERROR: refusing to push directly to $BRANCH"
