@@ -252,13 +252,15 @@ class ClaudeExecutor(Executor):
     def update_persona(self, prompt: str | None, version: int | None = None) -> None:
         """Replace the persona used for subsequent executions.
 
-        When ``version`` is provided and is newer than the previously
-        tracked version, the next message in each chat will start a fresh
-        session instead of resuming.  Otherwise the LLM inherits its
-        previous identity / context from conversation history written
-        under the old persona — Claude tends to stay consistent with
-        prior turns, so a new ``--append-system-prompt`` alone can't
-        overcome an old self-introduction in the resume transcript.
+        The new persona — including an edited MEMORY — takes effect on the
+        next message because ``_build_options`` re-injects the live
+        ``self._persona`` via ``--append-system-prompt`` every turn.
+        Resumed Telegram sessions are *not* torn down on a version bump:
+        the agent's own MEMORY writes bump the persona version constantly,
+        and dropping the conversation each time wiped the user's context
+        mid-chat (see ``_resolve_resume_target``).  ``version`` is tracked
+        only so newly created sessions record which version they started
+        under, for diagnostics.
 
         Note: re-syncing SubAgentDefinitions after a persona bump is owned
         by ``superpos_agent_core.superpos_poller._resync_sub_agents``,
@@ -269,15 +271,8 @@ class ClaudeExecutor(Executor):
         in-memory persona/version state.
         """
         self._persona = prompt
-        prev_version = self._persona_version
         if version is not None:
             self._persona_version = version
-            if prev_version is not None and version > prev_version:
-                log.info(
-                    "Persona version bumped %s -> %s; sessions started under "
-                    "older persona will be invalidated on next use",
-                    prev_version, version,
-                )
 
     def clear_session(self, chat_id: int | str) -> None:
         self._sessions.clear(chat_id)
@@ -489,54 +484,35 @@ class ClaudeExecutor(Executor):
     ) -> tuple[str | None, str | None]:
         """Return ``(resume_id, effective_branch)`` for this request.
 
-        Reads the SessionStore for Telegram chats and applies two
-        policies:
+        Reads the SessionStore for Telegram chats and restores the branch
+        the session was started on when the request carries no explicit
+        branch (no ``--branch`` token, no PR ref in the text), so cwd
+        matches the original transcript at
+        ``~/.claude/projects/<encoded-cwd>/<sid>.jsonl``.
 
-        * Persona invalidation — if the stored session was written under
-          an older persona version, drop the resume and clear the entry
-          so the next run starts fresh.
-        * Branch restoration — when the request has no explicit branch
-          (no ``--branch`` token, no PR ref in the text), inherit the
-          branch the session was started on so cwd matches the
-          original transcript at
-          ``~/.claude/projects/<encoded-cwd>/<sid>.jsonl``.
+        We resume regardless of the persona version the session was
+        created under.  The live persona — including a freshly edited
+        MEMORY — is re-injected into every turn via
+        ``--append-system-prompt`` (see ``_build_options``), so a
+        persona-version bump never needs a fresh session.  The agent's
+        own MEMORY writes bump that version constantly, so invalidating
+        on every bump wiped the user's context mid-chat; this matches the
+        Codex/Gemini/Qwen agents, which re-read their persona file each
+        turn and never tear down the conversation.
 
         Called by ``_run_one`` *before* slot resolution so the worktree
         lock key matches the cwd ``_execute_inner`` will actually use.
         Non-Telegram sources (Superpos tasks) skip the SessionStore
-        entirely and pass ``req.branch`` through unchanged.
-
-        This call mutates the SessionStore when persona invalidation
-        triggers (clears the stale entry).  Call it exactly once per
-        request — ``_run_one`` does so and threads the result into
-        ``_execute`` / ``_execute_inner`` via ``pre_resolved``.
+        entirely and pass ``req.branch`` through unchanged.  Call it
+        exactly once per request — ``_run_one`` does so and threads the
+        result into ``_execute`` / ``_execute_inner`` via ``pre_resolved``.
         """
         if req.source != "telegram":
             return None, req.branch
         stored = self._sessions.get_with_version(req.chat_id)
         if stored is None:
             return None, req.branch
-        resume_id, stored_version, stored_branch = stored
-        # Lazy persona invalidation: a session started under an older
-        # persona must not be resumed — Claude stays consistent with
-        # prior turns, so the new --append-system-prompt alone can't
-        # undo an old self-introduction in the resumed transcript.
-        # `stored_version is None` covers the startup race where
-        # Telegram polling can write a session before the Superpos
-        # version poller has populated `_persona_version`.
-        if self._persona_version is not None and (
-            stored_version is None
-            or stored_version < self._persona_version
-        ):
-            log.info(
-                "Dropping resume for chat %s: session persona v%s < "
-                "current v%s — starting fresh",
-                req.chat_id,
-                "?" if stored_version is None else stored_version,
-                self._persona_version,
-            )
-            self._sessions.clear(req.chat_id)
-            return None, req.branch
+        resume_id, _stored_version, stored_branch = stored
         effective_branch = req.branch
         if req.branch is None and stored_branch is not None:
             log.info(

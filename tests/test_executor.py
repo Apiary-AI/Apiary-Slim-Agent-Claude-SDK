@@ -1281,23 +1281,18 @@ def test_update_persona_without_version_keeps_prior_version(executor):
     assert executor._persona_version == 2
 
 
-def test_update_persona_bump_logs_invalidation_intent(executor, caplog):
+def test_update_persona_bump_does_not_log_invalidation(executor, caplog):
+    """A persona-version bump must NOT announce session invalidation:
+    resumed Telegram sessions are kept across bumps (the agent's own
+    MEMORY writes bump the version constantly, and the live persona is
+    re-injected each turn via --append-system-prompt).  Guards against
+    regressing to the old tear-down-on-every-bump behaviour."""
     import logging
     caplog.set_level(logging.INFO, logger="superpos_agent_claude.claude_executor")
     executor.update_persona("v1", version=1)
     executor.update_persona("v2", version=2)
-    assert any(
-        "Persona version bumped 1 -> 2" in r.message for r in caplog.records
-    )
-
-
-def test_update_persona_first_set_does_not_log_bump(executor, caplog):
-    """First-time set of version (None → N) is just initialisation,
-    not a bump — no chat sessions exist yet under any earlier persona,
-    so logging "invalidated on next use" would be noise."""
-    import logging
-    caplog.set_level(logging.INFO, logger="superpos_agent_claude.claude_executor")
-    executor.update_persona("v1", version=1)
+    assert executor._persona_version == 2
+    assert not any("invalidated" in r.message for r in caplog.records)
     assert not any("Persona version bumped" in r.message for r in caplog.records)
 
 
@@ -1316,17 +1311,19 @@ def test_update_persona_does_not_spawn_background_sub_agent_sync(executor):
 
     before = _threading.active_count()
     executor.update_persona("v1", version=1)
-    executor.update_persona("v2", version=2)  # triggers the "bump" branch
+    executor.update_persona("v2", version=2)
     # No new daemon threads should have been spawned by update_persona.
     assert _threading.active_count() == before
 
 
-async def test_resume_dropped_when_stored_version_older_than_current(
+async def test_resume_kept_when_stored_version_older_than_current(
     executor, mock_config,
 ):
-    """The core invariant: a session started under persona v1 must NOT
-    be resumed once the executor is on v2.  Otherwise the LLM inherits
-    its old identity from the resumed transcript."""
+    """The core invariant: a session started under persona v1 must still
+    be resumed once the executor is on v2.  The agent's own MEMORY writes
+    bump the persona version constantly, and the fresh persona/MEMORY is
+    re-injected each turn via --append-system-prompt, so an older stored
+    version is no reason to drop the user's conversation."""
     mock_config.executor_worktree_isolation = False
     mock_config.executor_working_dir = "/workspace"
 
@@ -1361,11 +1358,11 @@ async def test_resume_dropped_when_stored_version_older_than_current(
         streamer.send_tool_notification = AsyncMock()
         await executor._execute_inner(req, streamer, retries=1)
 
-    assert captured_resumes == [None], (
-        "stale-persona session must not be resumed"
+    assert captured_resumes == ["sess-old"], (
+        "older-persona session must still be resumed"
     )
-    assert executor._sessions.get_with_version("chat-old") is None, (
-        "stale session must be cleared from the store"
+    assert executor._sessions.get_with_version("chat-old") is not None, (
+        "session must be retained in the store across a persona bump"
     )
 
 
@@ -1410,15 +1407,15 @@ async def test_resume_kept_when_versions_match(executor, mock_config):
     assert captured_resumes == ["sess-current"]
 
 
-async def test_unversioned_session_invalidated_once_persona_version_known(
+async def test_unversioned_session_kept_once_persona_version_known(
     executor, mock_config,
 ):
     """Startup race: Telegram polling can write a session before the
     Superpos persona-version poller has populated `_persona_version`,
-    so the session is saved with persona_version=None.  Once a version
-    becomes known, that None must be treated as "older than current"
-    and invalidated — otherwise those chats are permanently exempt from
-    persona refreshes.
+    so the session is saved with persona_version=None.  Even once a
+    version becomes known, that session must still be resumed — the
+    fresh persona is re-injected each turn via --append-system-prompt,
+    so there is no reason to drop the conversation.
     """
     mock_config.executor_worktree_isolation = False
     mock_config.executor_working_dir = "/workspace"
@@ -1458,8 +1455,8 @@ async def test_unversioned_session_invalidated_once_persona_version_known(
         streamer.send_tool_notification = AsyncMock()
         await executor._execute_inner(req, streamer, retries=1)
 
-    assert captured_resumes == [None]
-    assert executor._sessions.get_with_version("chat-race") is None
+    assert captured_resumes == ["sess-stale"]
+    assert executor._sessions.get_with_version("chat-race") is not None
 
 
 async def test_unversioned_session_kept_when_persona_version_not_known(
@@ -2080,16 +2077,17 @@ def test_resolve_resume_target_explicit_branch_wins_over_stored(executor):
     assert executor._resolve_resume_target(req) == ("sess-old", "feat/new")
 
 
-def test_resolve_resume_target_drops_resume_on_persona_bump(executor):
-    """Stale-persona session is cleared as a side effect — caller gets
-    no resume and the entry no longer exists in the store."""
+def test_resolve_resume_target_keeps_resume_across_persona_bump(executor):
+    """A session created under an older persona is still resumed (with its
+    stored branch restored) and left intact in the store — persona bumps
+    no longer tear down the conversation."""
     executor._persona_version = 5
     executor._sessions.set_with_version(
         "chat-1", "sess-stale", 1, branch="feat/x",
     )
     req = ExecutionRequest(prompt="hi", chat_id="chat-1", source="telegram")
-    assert executor._resolve_resume_target(req) == (None, None)
-    assert executor._sessions.get_with_version("chat-1") is None
+    assert executor._resolve_resume_target(req) == ("sess-stale", "feat/x")
+    assert executor._sessions.get_with_version("chat-1") is not None
 
 
 async def test_run_one_keys_worktree_lock_by_effective_branch(
