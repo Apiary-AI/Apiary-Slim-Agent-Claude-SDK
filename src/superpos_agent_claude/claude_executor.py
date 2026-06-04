@@ -47,6 +47,18 @@ from .runtime_config import ClaudeRuntimeConfig
 log = logging.getLogger(__name__)
 
 
+class PersonaRefreshFailed(RuntimeError):
+    """Raised by ``update_persona`` when the assembled prompt fetch failed.
+
+    Propagated to the core poller so its broad ``except Exception`` in the
+    persona-refresh block aborts the ``persona_version = server_version``
+    assignment that would otherwise mark the bumped version as current.
+    Leaving the poller's tracker stale forces ``changed=True`` on the next
+    poll, retrying the fetch — the in-memory persona stays on its previous
+    value as a temporary fallback until that retry succeeds.
+    """
+
+
 # Per-chat SessionStore writes happen at most twice per execution (init +
 # result), so 5 iterations gives ample headroom over the realistic worst
 # case while still bailing on a runaway loop.
@@ -264,10 +276,18 @@ class ClaudeExecutor(Executor):
 
         When ``prompt`` is ``None`` — which happens when
         ``get_persona_assembled()`` returns ``None`` on a 404 or transport
-        failure — the previous persona is preserved.  Without this guard,
-        a failed refresh after a real persona/environment change would
-        leave ``_persona`` as ``None`` and the resumed session would
-        continue with no system prompt at all.
+        failure — the previous persona is preserved as a temporary
+        fallback AND this method raises ``PersonaRefreshFailed``.  The
+        core poller wraps its persona-refresh block in a broad
+        ``except Exception``, so raising aborts the
+        ``persona_version = server_version`` assignment that follows
+        ``update_persona`` in the poller.  That leaves the poller's
+        ``known_version`` stale, so the next ``get_persona_version`` call
+        returns ``changed=True`` again and we retry the assembled-prompt
+        fetch.  Without this signal, a single transient fetch failure
+        would leave every chat running under the stale fallback persona
+        indefinitely (the poller would have marked the bumped version as
+        current and stopped retrying).
 
         Note: re-syncing SubAgentDefinitions after a persona bump is owned
         by ``superpos_agent_core.superpos_poller._resync_sub_agents``,
@@ -277,8 +297,15 @@ class ClaudeExecutor(Executor):
         plus file-write contention), so this method only updates the
         in-memory persona/version state.
         """
-        if prompt is not None:
-            self._persona = prompt
+        if prompt is None:
+            # Preserve previous ``self._persona`` / ``self._persona_version``
+            # as a fallback so in-flight resumes still have a system prompt
+            # to inject, then signal the poller to retry next cycle.
+            raise PersonaRefreshFailed(
+                "get_persona_assembled() returned None; preserving previous "
+                "persona and forcing the poller to retry on the next cycle",
+            )
+        self._persona = prompt
         if version is not None:
             self._persona_version = version
 

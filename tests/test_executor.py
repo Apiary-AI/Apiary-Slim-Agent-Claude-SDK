@@ -1301,29 +1301,121 @@ def test_update_persona_none_preserves_previous_persona(executor):
     transport failure, update_persona(None, version=X) must NOT overwrite
     the existing persona with None.  Before the fix this left the executor
     with no system prompt at all, so a resumed session would continue with
-    a stale transcript and no replacement persona."""
+    a stale transcript and no replacement persona.
+
+    The call must also raise ``PersonaRefreshFailed`` so the core poller
+    aborts its ``persona_version = server_version`` advancement — without
+    that signal, the poller would mark the bumped version as current and
+    stop retrying the fetch, leaving every chat running under the stale
+    fallback persona forever.  ``self._persona_version`` is therefore NOT
+    advanced either (the bookkeeping mirrors what the poller will track)."""
+    import pytest as _pytest
+
+    from superpos_agent_claude.claude_executor import PersonaRefreshFailed
+
     executor.update_persona("original persona", version=1)
     assert executor._persona == "original persona"
 
     # Simulate a failed persona refresh — the poller calls
     # update_persona(None, version=2) when the fetch 404s.
-    executor.update_persona(None, version=2)
+    with _pytest.raises(PersonaRefreshFailed):
+        executor.update_persona(None, version=2)
 
-    # Persona must be preserved; version is still updated (the server
-    # did bump the version, we just failed to fetch the content).
+    # Persona must be preserved as a fallback so in-flight resumes still
+    # have a system prompt; version is NOT advanced because the poller's
+    # ``persona_version`` won't advance either (the exception aborts that
+    # assignment), and the two trackers should stay in sync.
     assert executor._persona == "original persona", (
         "A None persona from a failed refresh must not overwrite the "
         "previous persona — sessions would resume with no system prompt"
     )
-    assert executor._persona_version == 2
+    assert executor._persona_version == 1, (
+        "Version must not advance on a failed refresh — the poller's "
+        "``persona_version`` won't advance either, so this tracker must "
+        "mirror that to keep diagnostics honest"
+    )
 
     # Sessions must NOT be cleared — the whole point of the PR is to
     # stop tearing down sessions on version bumps.
     executor._sessions.set_with_version("chat-1", "sess-1", 1)
-    executor.update_persona(None, version=3)
+    with _pytest.raises(PersonaRefreshFailed):
+        executor.update_persona(None, version=3)
     assert executor._sessions.get_with_version("chat-1") is not None, (
         "Sessions must not be cleared when persona refresh fails"
     )
+
+
+async def test_poller_does_not_advance_version_when_assembled_fetch_returns_none(
+    executor,
+):
+    """Regression: simulate the core poller's persona-refresh block at
+    the executor boundary.  When the server reports a version change but
+    ``get_persona_assembled()`` returns ``None`` (404 / transient
+    transport failure), the poller MUST NOT advance its
+    ``persona_version`` tracker — otherwise the next poll sees
+    ``changed == False`` and we stop retrying, leaving every chat under
+    the stale fallback persona forever.
+
+    Achieved by ``update_persona(None, ...)`` raising
+    ``PersonaRefreshFailed``, which propagates into the poller's broad
+    ``except Exception`` and aborts the
+    ``persona_version = server_version`` assignment that follows.
+
+    This test mirrors the relevant lines from
+    ``superpos_agent_core.superpos_poller.run_superpos_poller`` so a
+    regression in either the executor's signal or the poller's contract
+    is caught here — at the seam between the two."""
+    # Seed the executor with a working persona on v1.
+    executor.update_persona("seeded persona", version=1)
+
+    # State that mirrors the poller's local tracker variables.
+    persona_version: int | None = 1
+    server_version = 2  # the server bumped to v2
+    # Stand-in for ``superpos.get_persona_assembled()`` returning None
+    # (the symptom the reviewer flagged — a 404 on a real persona bump).
+    async def get_persona_assembled():
+        return None
+
+    # Inline the poller's persona-refresh block, including the broad
+    # ``except Exception`` that wraps it.  If the executor's signal works,
+    # ``persona_version`` MUST NOT be advanced to ``server_version``.
+    try:
+        new_persona = await get_persona_assembled()
+        executor.update_persona(new_persona, version=server_version)
+        persona_version = server_version
+    except Exception:
+        pass
+
+    assert persona_version == 1, (
+        "Poller's persona_version must remain at the last-known-good "
+        "value when the assembled fetch returns None — otherwise "
+        "``changed`` is False on the next poll and we stop retrying"
+    )
+    assert executor._persona == "seeded persona", (
+        "Previous persona must be preserved as a fallback for in-flight resumes"
+    )
+    assert executor._persona_version == 1, (
+        "Executor's tracker must mirror the poller's (still v1) so a "
+        "later successful refresh to v2 is correctly observed as a bump"
+    )
+
+    # Now simulate the NEXT poll: ``get_persona_assembled`` recovers and
+    # returns the real prompt.  Because ``persona_version`` is still 1
+    # while ``server_version`` is 2, the poller will treat this as a
+    # change and call ``update_persona`` again — this time with content.
+    async def get_persona_assembled_recovered():
+        return "recovered persona"
+
+    try:
+        new_persona = await get_persona_assembled_recovered()
+        executor.update_persona(new_persona, version=server_version)
+        persona_version = server_version
+    except Exception:
+        pass
+
+    assert persona_version == 2, "next-poll retry must succeed and advance"
+    assert executor._persona == "recovered persona"
+    assert executor._persona_version == 2
 
 
 def test_update_persona_does_not_spawn_background_sub_agent_sync(executor):
