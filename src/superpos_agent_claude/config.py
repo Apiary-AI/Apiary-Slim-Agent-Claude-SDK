@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from superpos_agent_core import BaseConfig
 
@@ -36,12 +37,19 @@ class ClaudeConfig(BaseConfig):
     def is_native_anthropic(self) -> bool:
         """True when talking to Anthropic's own API (vs a compatible shim).
 
-        Native = no base URL override, or one that still points at Anthropic.
-        Anything else (MiniMax, other gateways) is a shim where hosted server
-        tools are unavailable.
+        Native = no base URL override, or one whose host is anthropic.com
+        (or a subdomain of it). Anything else (MiniMax, other gateways) is a
+        shim where hosted server tools are unavailable.
         """
-        url = self.anthropic_base_url.strip().lower()
-        return url == "" or "anthropic.com" in url
+        url = self.anthropic_base_url.strip()
+        if not url:
+            return True
+        # urlparse needs a scheme to populate hostname; add one if missing
+        # so bare "api.anthropic.com" still parses correctly.
+        if "://" not in url:
+            url = "//" + url
+        host = (urlparse(url).hostname or "").lower()
+        return host == "anthropic.com" or host.endswith(".anthropic.com")
 
     @classmethod
     def from_env(cls) -> "ClaudeConfig":

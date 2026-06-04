@@ -17,6 +17,16 @@ from superpos_agent_claude.claude_executor import ClaudeExecutor
         ("https://api.minimax.io/anthropic", False),
         ("https://api.minimaxi.com/anthropic", False),
         ("https://my-gateway.internal/anthropic", False),
+        # Substring-match traps: a non-Anthropic host that merely *contains*
+        # the string "anthropic.com" in the path, query, or as a deceptive
+        # subdomain must NOT be classified as native.
+        ("https://my-proxy.com/anthropic.com-shim", False),
+        ("https://anthropic.com.evil.com/v1", False),
+        ("https://gateway.example.com/?backend=anthropic.com", False),
+        ("https://not-anthropic.com/v1", False),
+        # Subdomains of anthropic.com (and a scheme-less form) are native.
+        ("https://foo.anthropic.com/v1", True),
+        ("api.anthropic.com", True),
     ],
 )
 def test_is_native_anthropic(base_url, native):
