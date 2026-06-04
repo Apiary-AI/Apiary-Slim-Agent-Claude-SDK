@@ -130,6 +130,14 @@ CLAUDE_MODEL=MiniMax-M2.7
 ANTHROPIC_DEFAULT_SONNET_MODEL=MiniMax-M2.7
 ANTHROPIC_DEFAULT_OPUS_MODEL=MiniMax-M2.7
 ANTHROPIC_DEFAULT_HAIKU_MODEL=MiniMax-M2.7
+
+# Optional — web search. Anthropic's hosted WebSearch/WebFetch tools don't
+# exist on the MiniMax endpoint (they fail with HTTP 400). When a base URL
+# points at a non-Anthropic shim, the agent disables those dead tools and, if
+# a key is set here, wires MiniMax's own web-search MCP instead. Needs MiniMax
+# Token-Plan credits; kept separate from ANTHROPIC_AUTH_TOKEN on purpose.
+MINIMAX_API_KEY=your-minimax-token-plan-key
+# MINIMAX_API_HOST=https://api.minimax.io   # default
 ```
 
 Then run as normal:
@@ -138,7 +146,7 @@ Then run as normal:
 docker run --env-file .env superpos-claude-agent
 ```
 
-The `claude` CLI honors `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` and the model-override vars. To switch back to Anthropic, clear those four vars and restore your normal Anthropic auth.
+The `claude` CLI honors `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` and the model-override vars. The agent additionally reads `ANTHROPIC_BASE_URL` to detect the shim and adjust tooling (disable hosted WebSearch/WebFetch, load the MiniMax `web_search` MCP). To switch back to Anthropic, clear those vars and restore your normal Anthropic auth — the hosted tools come back automatically.
 
 ## Multi-agent setup (Docker Compose)
 

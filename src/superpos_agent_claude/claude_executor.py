@@ -247,6 +247,36 @@ class ClaudeExecutor(Executor):
         if self._mcp:
             log.info("Loaded %d MCP server(s) from %s", len(self._mcp), config.modules_dir)
 
+        # On an Anthropic-compatible *shim* (e.g. MiniMax via ANTHROPIC_BASE_URL),
+        # Anthropic's hosted WebSearch/WebFetch server tools don't exist on the
+        # other end and fail with HTTP 400. Wire MiniMax's own web-search MCP
+        # so the model has a working search tool; _build_options additionally
+        # disallows the dead hosted tools on shim backends.
+        self._shim_backend = not config.is_native_anthropic
+        if self._shim_backend and config.minimax_api_key:
+            self._mcp = {
+                **self._mcp,
+                "minimax": {
+                    "type": "stdio",
+                    "command": "uvx",
+                    "args": ["minimax-coding-plan-mcp", "-y"],
+                    "env": {
+                        "MINIMAX_API_KEY": config.minimax_api_key,
+                        "MINIMAX_API_HOST": config.minimax_api_host,
+                    },
+                },
+            }
+            log.info(
+                "Shim backend (base_url=%s) — added MiniMax web_search MCP",
+                config.anthropic_base_url,
+            )
+        elif self._shim_backend:
+            log.warning(
+                "Shim backend (base_url=%s) but MINIMAX_API_KEY unset — web "
+                "search unavailable (hosted WebSearch/WebFetch will be disabled)",
+                config.anthropic_base_url,
+            )
+
     # ── Abstract method impls ────────────────────────────────────────────
 
     def update_persona(self, prompt: str | None, version: int | None = None) -> None:
@@ -1050,6 +1080,18 @@ class ClaudeExecutor(Executor):
         parts = []
         if self._persona:
             parts.append(self._persona)
+        # On a shim backend (MiniMax), Anthropic's hosted WebSearch/WebFetch
+        # 400. Disable them so the model stops calling dead tools, and point it
+        # at the MiniMax web_search MCP when that's wired.
+        if self._shim_backend:
+            opts["disallowed_tools"] = ["WebSearch", "WebFetch"]
+            if "minimax" in self._mcp:
+                parts.append(
+                    "## Web search\n"
+                    "The built-in WebSearch/WebFetch tools are unavailable on "
+                    "this backend. For any web lookup use the `web_search` MCP "
+                    "tool (server: minimax) instead."
+                )
         if system_prompt_append:
             parts.append(system_prompt_append)
         if parts:
