@@ -1296,89 +1296,81 @@ def test_update_persona_bump_does_not_log_invalidation(executor, caplog):
     assert not any("Persona version bumped" in r.message for r in caplog.records)
 
 
-def test_update_persona_none_preserves_previous_persona(executor):
-    """Regression: when get_persona_assembled() returns None on a 404 or
-    transport failure, update_persona(None, version=X) must NOT overwrite
-    the existing persona with None.  Before the fix this left the executor
-    with no system prompt at all, so a resumed session would continue with
-    a stale transcript and no replacement persona.
+def test_update_persona_none_clears_persona_and_advances_version(executor):
+    """Regression: ``get_persona_assembled()`` returns ``None`` in two
+    cases — a real fetch failure AND the valid "no persona configured"
+    steady state.  ``update_persona(None, version=X)`` must mirror what
+    ``superpos_agent_core.main.run_agent`` does at startup with a
+    ``None`` response: treat it as the valid empty state, clear the
+    cached persona, advance the version tracker, and not raise.
 
-    The call must also raise ``PersonaRefreshFailed`` so the core poller
-    aborts its ``persona_version = server_version`` advancement — without
-    that signal, the poller would mark the bumped version as current and
-    stop retrying the fetch, leaving every chat running under the stale
-    fallback persona forever.  ``self._persona_version`` is therefore NOT
-    advanced either (the bookkeeping mirrors what the poller will track)."""
-    import pytest as _pytest
-
-    from superpos_agent_claude.claude_executor import PersonaRefreshFailed
-
+    Previously this method raised ``PersonaRefreshFailed`` on every
+    ``None`` to defend the transient-failure case.  That broke the
+    steady-state-empty case: if the operator intentionally removed the
+    active persona, ``self._persona`` kept its old value forever, the
+    poller's ``persona_version`` / platform / environment trackers
+    never advanced past the bump that emptied the persona, and every
+    poll cycle retried the now-empty fetch indefinitely while Claude
+    kept injecting a stale system prompt.  The SDK currently doesn't
+    distinguish the two cases at the boundary, so we adopt
+    ``run_agent``'s startup semantics: clear and advance."""
     executor.update_persona("original persona", version=1)
     assert executor._persona == "original persona"
+    assert executor._persona_version == 1
 
-    # Simulate a failed persona refresh — the poller calls
-    # update_persona(None, version=2) when the fetch 404s.
-    with _pytest.raises(PersonaRefreshFailed):
-        executor.update_persona(None, version=2)
+    # Simulate the poller calling update_persona(None, version=2) after
+    # the server bumped the persona version and the assembled endpoint
+    # returned an empty "no persona configured" response.
+    executor.update_persona(None, version=2)
 
-    # Persona must be preserved as a fallback so in-flight resumes still
-    # have a system prompt; version is NOT advanced because the poller's
-    # ``persona_version`` won't advance either (the exception aborts that
-    # assignment), and the two trackers should stay in sync.
-    assert executor._persona == "original persona", (
-        "A None persona from a failed refresh must not overwrite the "
-        "previous persona — sessions would resume with no system prompt"
+    assert executor._persona is None, (
+        "When get_persona_assembled() returns None, the cached persona "
+        "must be cleared — otherwise Claude keeps injecting the stale "
+        "system prompt after the operator removed the active persona"
     )
-    assert executor._persona_version == 1, (
-        "Version must not advance on a failed refresh — the poller's "
-        "``persona_version`` won't advance either, so this tracker must "
-        "mirror that to keep diagnostics honest"
+    assert executor._persona_version == 2, (
+        "Version must advance so the poller's ``persona_version`` "
+        "tracker also advances; otherwise the next poll sees "
+        "``changed == True`` again and we refetch the empty response "
+        "forever"
     )
 
-    # Sessions must NOT be cleared — the whole point of the PR is to
-    # stop tearing down sessions on version bumps.
+    # Sessions must NOT be cleared on a persona clear — the whole point
+    # of this PR is to stop tearing down resumed sessions on any persona
+    # change (the live persona is re-injected each turn).
     executor._sessions.set_with_version("chat-1", "sess-1", 1)
-    with _pytest.raises(PersonaRefreshFailed):
-        executor.update_persona(None, version=3)
+    executor.update_persona(None, version=3)
     assert executor._sessions.get_with_version("chat-1") is not None, (
-        "Sessions must not be cleared when persona refresh fails"
+        "Sessions must not be cleared when the persona is cleared"
     )
 
 
-async def test_poller_does_not_advance_version_when_assembled_fetch_returns_none(
-    executor,
-):
+async def test_poller_advances_version_when_persona_cleared(executor):
     """Regression: simulate the core poller's persona-refresh block at
-    the executor boundary.  When the server reports a version change but
-    ``get_persona_assembled()`` returns ``None`` (404 / transient
-    transport failure), the poller MUST NOT advance its
-    ``persona_version`` tracker — otherwise the next poll sees
-    ``changed == False`` and we stop retrying, leaving every chat under
-    the stale fallback persona forever.
-
-    Achieved by ``update_persona(None, ...)`` raising
-    ``PersonaRefreshFailed``, which propagates into the poller's broad
-    ``except Exception`` and aborts the
-    ``persona_version = server_version`` assignment that follows.
+    the executor boundary.  When the server reports a version change
+    and ``get_persona_assembled()`` returns ``None`` (the valid
+    "no persona configured" steady state after an operator removes the
+    active persona), the poller MUST advance its ``persona_version``
+    tracker — otherwise the next poll sees ``changed == True`` again
+    and we refetch the empty response forever, all while Claude keeps
+    injecting the stale persona.
 
     This test mirrors the relevant lines from
     ``superpos_agent_core.superpos_poller.run_superpos_poller`` so a
-    regression in either the executor's signal or the poller's contract
-    is caught here — at the seam between the two."""
-    # Seed the executor with a working persona on v1.
+    regression in the executor's contract is caught at the seam
+    between the two."""
+    # Seed the executor with a persona on v1.
     executor.update_persona("seeded persona", version=1)
 
-    # State that mirrors the poller's local tracker variables.
+    # State mirrors the poller's local tracker variables.
     persona_version: int | None = 1
-    server_version = 2  # the server bumped to v2
-    # Stand-in for ``superpos.get_persona_assembled()`` returning None
-    # (the symptom the reviewer flagged — a 404 on a real persona bump).
+    server_version = 2  # the server bumped to v2 with no active persona
+
     async def get_persona_assembled():
-        return None
+        return None  # "no persona configured" success response
 
     # Inline the poller's persona-refresh block, including the broad
-    # ``except Exception`` that wraps it.  If the executor's signal works,
-    # ``persona_version`` MUST NOT be advanced to ``server_version``.
+    # ``except Exception`` that wraps it.
     try:
         new_persona = await get_persona_assembled()
         executor.update_persona(new_persona, version=server_version)
@@ -1386,36 +1378,18 @@ async def test_poller_does_not_advance_version_when_assembled_fetch_returns_none
     except Exception:
         pass
 
-    assert persona_version == 1, (
-        "Poller's persona_version must remain at the last-known-good "
-        "value when the assembled fetch returns None — otherwise "
-        "``changed`` is False on the next poll and we stop retrying"
+    assert persona_version == 2, (
+        "Poller's persona_version must advance when the assembled fetch "
+        "returns None — otherwise the next poll loops on the same bump "
+        "forever while the stale persona keeps getting injected"
     )
-    assert executor._persona == "seeded persona", (
-        "Previous persona must be preserved as a fallback for in-flight resumes"
+    assert executor._persona is None, (
+        "Cached persona must be cleared so Claude stops injecting the "
+        "stale system prompt"
     )
-    assert executor._persona_version == 1, (
-        "Executor's tracker must mirror the poller's (still v1) so a "
-        "later successful refresh to v2 is correctly observed as a bump"
+    assert executor._persona_version == 2, (
+        "Executor's tracker must mirror the poller's (now v2)"
     )
-
-    # Now simulate the NEXT poll: ``get_persona_assembled`` recovers and
-    # returns the real prompt.  Because ``persona_version`` is still 1
-    # while ``server_version`` is 2, the poller will treat this as a
-    # change and call ``update_persona`` again — this time with content.
-    async def get_persona_assembled_recovered():
-        return "recovered persona"
-
-    try:
-        new_persona = await get_persona_assembled_recovered()
-        executor.update_persona(new_persona, version=server_version)
-        persona_version = server_version
-    except Exception:
-        pass
-
-    assert persona_version == 2, "next-poll retry must succeed and advance"
-    assert executor._persona == "recovered persona"
-    assert executor._persona_version == 2
 
 
 def test_update_persona_does_not_spawn_background_sub_agent_sync(executor):
