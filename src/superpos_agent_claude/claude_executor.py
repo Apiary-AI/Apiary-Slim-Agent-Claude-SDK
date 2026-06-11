@@ -563,7 +563,7 @@ class ClaudeExecutor(Executor):
         """
         if req.branch is not None or req.source != "telegram":
             return req.branch
-        stored = self._sessions.get_with_version(req.chat_id)
+        stored = self._sessions.get_with_version(req.chat_key)
         if stored is None:
             return None
         _, _, stored_branch = stored
@@ -599,7 +599,7 @@ class ClaudeExecutor(Executor):
         """
         if req.source != "telegram":
             return None, req.branch
-        stored = self._sessions.get_with_version(req.chat_id)
+        stored = self._sessions.get_with_version(req.chat_key)
         if stored is None:
             return None, req.branch
         resume_id, _stored_version, stored_branch = stored
@@ -608,7 +608,7 @@ class ClaudeExecutor(Executor):
             log.info(
                 "Resuming session for chat %s on stored branch %r "
                 "(req.branch was None)",
-                req.chat_id, stored_branch,
+                req.chat_key, stored_branch,
             )
             effective_branch = stored_branch
         return resume_id, effective_branch
@@ -824,7 +824,7 @@ class ClaudeExecutor(Executor):
             except Exception:
                 log.debug("Failed to set agent status to busy")
 
-        streamer = TelegramStreamer(self._gateway, req.chat_id)
+        streamer = TelegramStreamer(self._gateway, req.chat_id, thread_id=req.thread_id)
         try:
             await streamer.start()
         except Exception:
@@ -871,9 +871,11 @@ class ClaudeExecutor(Executor):
                 ),
             )
             # Register with the base class so the /stop Telegram command can
-            # find and cancel this in-flight work via cancel_chat(chat_id).
-            # Auto-untracks via done callback — no cleanup needed in finally.
-            self._track_chat_task(req.chat_id, inner_task)
+            # find and cancel this in-flight work via cancel_chat(chat_key) —
+            # keyed per forum topic so /stop in one topic leaves the others
+            # running.  Auto-untracks via done callback — no cleanup needed
+            # in finally.
+            self._track_chat_task(req.chat_key, inner_task)
             if req.source == "superpos" and req.superpos_task_id:
                 watcher_task = asyncio.create_task(_watch_claim_expiry())
             stall_watchdog = asyncio.create_task(_watch_stall())
@@ -1272,7 +1274,7 @@ class ClaudeExecutor(Executor):
                             last_session_id = sid
                             if req.source == "telegram":
                                 self._sessions.set_with_version(
-                                    req.chat_id, sid, self._persona_version,
+                                    req.chat_key, sid, self._persona_version,
                                     branch=session_branch,
                                 )
                     elif isinstance(message, ResultMessage) and hasattr(message, "session_id"):
@@ -1281,7 +1283,7 @@ class ClaudeExecutor(Executor):
                             last_session_id = sid
                             if req.source == "telegram":
                                 self._sessions.set_with_version(
-                                    req.chat_id, sid, self._persona_version,
+                                    req.chat_key, sid, self._persona_version,
                                     branch=session_branch,
                                 )
 
@@ -1415,7 +1417,7 @@ class ClaudeExecutor(Executor):
                     continue
                 elif resume_id and attempt < retries:
                     log.warning("Session resume failed, retrying with fresh session")
-                    self._sessions.clear(req.chat_id)
+                    self._sessions.clear(req.chat_key)
                     resume_id = None
                     continue
 

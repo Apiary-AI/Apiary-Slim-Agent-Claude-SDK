@@ -17,6 +17,7 @@ Fill in your `.env`:
 | `TELEGRAM_BOT_TOKEN` | Yes | From @BotFather |
 | `TELEGRAM_ALLOWED_USERS` | Yes | Your Telegram user ID (comma-separated for multiple) |
 | `TELEGRAM_CHAT_ID` | No | Default chat for Superpos task notifications |
+| `TELEGRAM_TOPIC_ID` | No | Forum topic (`message_thread_id`) this agent is bound to — see [Telegram topics](#telegram-topics) |
 | `SUPERPOS_BASE_URL` | No | Your Superpos instance URL |
 | `SUPERPOS_HIVE_ID` | No | Hive ID from Superpos UI |
 | `SUPERPOS_AGENT_ID` | No | Agent ID from agent creation dialog |
@@ -256,3 +257,23 @@ tests/
 - `/model [<id>|list]` — show or change the model. Any provider model id is accepted (e.g. `claude-opus-4-6`, `MiniMax-M2.7`); `/model list` prints known ids. Persists across restarts.
 - `/effort [low|medium|high|max]` — show or change reasoning effort. Persists across restarts.
 - Superpos tasks are automatically polled, claimed, executed, and completed
+
+## Telegram topics
+
+The agent understands [forum topics](https://telegram.org/blog/topics-in-groups-collectible-usernames)
+in supergroups (enable "Topics" in the group settings):
+
+- **Each topic is its own conversation.** Messages posted in a topic get a
+  session keyed by `chat:topic`, the reply streams into the same topic, and
+  `/new` / `/stop` only affect the topic they're issued in. DMs and plain
+  groups behave exactly as before.
+- **One topic per agent (optional).** Set `TELEGRAM_TOPIC_ID` to a topic's
+  `message_thread_id` to bind the agent to it: the agent then ignores group
+  messages outside its topic (DMs still work) and sends its proactive
+  output — Superpos task streams, disk alerts, permission warnings — into
+  that topic. Run several agents (Claude, Codex, …) in one forum group by
+  giving each bot its own topic.
+
+  The easiest way to find a topic's id: open the topic in Telegram Web and
+  copy the number after the last `/` in the URL, or forward a message from
+  the topic to @userinfobot-style tools that echo `message_thread_id`.
