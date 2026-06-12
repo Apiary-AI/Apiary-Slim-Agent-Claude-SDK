@@ -30,6 +30,8 @@ Fill in your `.env`:
 | `CLAUDE_EFFORT` | No | Effort level: low, medium, high, max (default: high) |
 | `CLAUDE_MAX_TURNS` | No | Default: 30 |
 | `CLAUDE_WORKING_DIR` | No | Default: /workspace |
+| `ANTHROPIC_BASE_URL` | No | Route through an Anthropic-compatible backend (MiniMax, Kimi, …) |
+| `WEB_SEARCH_MCP` | No | JSON MCP server config replacing web search on non-Anthropic backends |
 
 Superpos variables are optional — if omitted, only the Telegram bot runs.
 
@@ -132,11 +134,9 @@ ANTHROPIC_DEFAULT_SONNET_MODEL=MiniMax-M2.7
 ANTHROPIC_DEFAULT_OPUS_MODEL=MiniMax-M2.7
 ANTHROPIC_DEFAULT_HAIKU_MODEL=MiniMax-M2.7
 
-# Optional — web search. Anthropic's hosted WebSearch/WebFetch tools don't
-# exist on the MiniMax endpoint (they fail with HTTP 400). When a base URL
-# points at a non-Anthropic shim, the agent disables those dead tools and, if
-# a key is set here, wires MiniMax's own web-search MCP instead. Needs MiniMax
-# Token-Plan credits; kept separate from ANTHROPIC_AUTH_TOKEN on purpose.
+# Optional — MiniMax's own web-search MCP (see "Web search on alternative
+# backends" below). Needs MiniMax Token-Plan credits; kept separate from
+# ANTHROPIC_AUTH_TOKEN on purpose.
 MINIMAX_API_KEY=your-minimax-token-plan-key
 # MINIMAX_API_HOST=https://api.minimax.io   # default
 ```
@@ -147,7 +147,47 @@ Then run as normal:
 docker run --env-file .env superpos-claude-agent
 ```
 
-The `claude` CLI honors `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` and the model-override vars. The agent additionally reads `ANTHROPIC_BASE_URL` to detect the shim and adjust tooling (disable hosted WebSearch/WebFetch, load the MiniMax `web_search` MCP). To switch back to Anthropic, clear those vars and restore your normal Anthropic auth — the hosted tools come back automatically.
+The `claude` CLI honors `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` and the model-override vars. The agent additionally reads `ANTHROPIC_BASE_URL` to detect the shim and adjust tooling. To switch back to Anthropic, clear those vars and restore your normal Anthropic auth — the hosted tools come back automatically.
+
+### Alternative: Kimi Code (Anthropic-compatible endpoint)
+
+[Kimi Code](https://www.kimi.com/code/docs/en/third-party-tools/other-coding-agents.html) (Moonshot AI) also exposes an Anthropic-compatible API. It requires a Kimi membership with Code benefits — create an API key in the Kimi Code Console. The model id `kimi-for-coding` is a stable alias that auto-maps to Kimi's latest coding model, so it never needs updating.
+
+Skip OAuth and put these in your `.env`:
+
+```bash
+ANTHROPIC_BASE_URL=https://api.kimi.com/coding/
+ANTHROPIC_API_KEY=your-kimi-code-key
+CLAUDE_MODEL=kimi-for-coding
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=262144   # context window hint from Kimi's docs
+ANTHROPIC_DEFAULT_SONNET_MODEL=kimi-for-coding
+ANTHROPIC_DEFAULT_OPUS_MODEL=kimi-for-coding
+ANTHROPIC_DEFAULT_HAIKU_MODEL=kimi-for-coding
+```
+
+Then run as normal:
+
+```bash
+docker run --env-file .env superpos-claude-agent
+```
+
+Kimi ships no web-search MCP of its own, so a Kimi-backed agent has no web access out of the box — coding tasks work fine, but for web lookups set `WEB_SEARCH_MCP` (next section).
+
+### Web search on alternative backends
+
+Anthropic's hosted WebSearch/WebFetch tools exist only on Anthropic's own API — on any other `ANTHROPIC_BASE_URL` they fail with HTTP 400. The agent detects the shim from the base URL, disables the dead hosted tools, and wires a replacement web-search MCP chosen by precedence:
+
+1. **`WEB_SEARCH_MCP` set** — that server is mounted (as `web_search`) and the model is pointed at it. Works on any shim backend. The value is a JSON stdio-server config; any MCP search provider works, e.g. [Tavily](https://github.com/tavily-ai/tavily-mcp) (free tier ~1k queries/month):
+
+   ```bash
+   WEB_SEARCH_MCP={"command":"npx","args":["-y","tavily-mcp"],"env":{"TAVILY_API_KEY":"tvly-your-key"}}
+   ```
+
+2. **else `MINIMAX_API_KEY` set** — MiniMax's own web-search MCP (`uvx minimax-coding-plan-mcp`) is mounted. The natural default for a MiniMax backend.
+
+3. **else** — no web access; a warning is logged at startup.
+
+On a native Anthropic backend none of this applies: the hosted tools are used and `WEB_SEARCH_MCP` is ignored.
 
 ## Multi-agent setup (Docker Compose)
 

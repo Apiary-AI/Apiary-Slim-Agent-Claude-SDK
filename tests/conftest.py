@@ -19,6 +19,11 @@ def mock_config(tmp_path):
     cfg.home_dir = str(tmp_path)
     cfg.modules_dir = str(tmp_path / "modules")
     cfg.claude_stall_timeout = 900
+    # Backend defaults: native Anthropic, no replacement search MCP.
+    cfg.is_native_anthropic = True
+    cfg.anthropic_base_url = ""
+    cfg.minimax_api_key = ""
+    cfg.web_search_mcp = ""
     return cfg
 
 

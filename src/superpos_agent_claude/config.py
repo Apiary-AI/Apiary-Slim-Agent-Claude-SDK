@@ -32,6 +32,12 @@ class ClaudeConfig(BaseConfig):
     # is kept separate from the model auth token on purpose.
     minimax_api_key: str = ""
     minimax_api_host: str = "https://api.minimax.io"
+    # Replacement web-search MCP for shim backends that don't ship their own
+    # (e.g. Kimi): a JSON stdio-server config such as
+    # {"command": "npx", "args": ["-y", "tavily-mcp"], "env": {...}}.
+    # Takes precedence over the MiniMax MCP when both are set; ignored on
+    # native Anthropic where the hosted WebSearch/WebFetch tools are used.
+    web_search_mcp: str = ""
 
     def __post_init__(self) -> None:
         if not self.executor_kind or self.executor_kind == "generic":
@@ -98,5 +104,6 @@ class ClaudeConfig(BaseConfig):
             minimax_api_host=os.environ.get(
                 "MINIMAX_API_HOST", "https://api.minimax.io"
             ),
+            web_search_mcp=os.environ.get("WEB_SEARCH_MCP", ""),
         )
         return cls(**base)
