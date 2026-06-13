@@ -187,3 +187,8 @@ def test_build_options_passes_debug_to_stderr(executor):
     assert opts.extra_args.get("debug-to-stderr", "MISSING") is None
     # The pre-existing effort arg must survive alongside it.
     assert opts.extra_args["effort"] == executor._runtime.effort
+    # debug_stderr must be None (not the sys.stderr default).  The SDK only
+    # forwards stderr to open_process when debug-to-stderr is set AND
+    # debug_stderr is truthy; leaving it at sys.stderr would route crash
+    # output to the container stderr and defeat the open_process capture.
+    assert opts.debug_stderr is None

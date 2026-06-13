@@ -1166,9 +1166,16 @@ class ClaudeExecutor(Executor):
             # --debug-to-stderr makes the CLI write its failure reason (API
             # overload, rate limit, auth) to stderr, which the open_process
             # patch captures to a tempfile.  Without it a CLI crash exits 1
-            # with an empty stderr and we can only log "exit code 1".  The
-            # patch leaves debug_stderr unset, so the SDK still passes
+            # with an empty stderr and we can only log "exit code 1".
+            #
+            # The SDK's SubprocessCLITransport passes options.debug_stderr to
+            # open_process whenever "debug-to-stderr" is in extra_args, and
+            # ClaudeCodeOptions.debug_stderr defaults to sys.stderr.  That
+            # would route the crash output straight to the container stderr,
+            # and our open_process patch only installs the tempfile capture
+            # when stderr is None.  Force debug_stderr=None so the SDK passes
             # stderr=None and the capture (not the SDK) owns the fd.
+            "debug_stderr": None,
             "extra_args": {
                 "effort": self._runtime.effort,
                 "debug-to-stderr": None,
