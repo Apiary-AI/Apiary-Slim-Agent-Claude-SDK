@@ -175,3 +175,15 @@ def test_shim_without_key_disables_tools_but_adds_no_mcp(
     assert opts.disallowed_tools == ["WebSearch", "WebFetch"]
     assert "minimax" not in (opts.mcp_servers or {})
     assert "web_search" not in (opts.mcp_servers or {})
+
+
+# --- CLI crash diagnostics ---
+
+def test_build_options_passes_debug_to_stderr(executor):
+    """--debug-to-stderr must be on so a CLI crash leaves a real error in
+    the captured stderr instead of "(no stderr captured)"."""
+    opts = executor._build_options()
+    # A None value renders as a bare boolean flag (--debug-to-stderr) in the SDK.
+    assert opts.extra_args.get("debug-to-stderr", "MISSING") is None
+    # The pre-existing effort arg must survive alongside it.
+    assert opts.extra_args["effort"] == executor._runtime.effort
