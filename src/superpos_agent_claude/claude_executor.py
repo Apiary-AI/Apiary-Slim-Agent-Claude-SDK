@@ -14,6 +14,7 @@ import contextvars
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile as _tempfile
@@ -162,7 +163,39 @@ async def _patched_open_process(*args, **kwargs):
 anyio.open_process = _patched_open_process
 
 
-def _read_captured_stderr(path: str | None, max_bytes: int = 4096) -> str:
+# The crash cause hides in the CLI's --debug-to-stderr firehose, which is
+# ~99% per-turn bookkeeping (LSP diagnostics, hook-registry checks, tool
+# dispatch).  A raw byte-tail just shows that bookkeeping; these are the
+# lines that actually explain an exit-1 — API calls, the streaming
+# lifecycle, errors, connection teardown.
+_STDERR_SIGNAL_RE = re.compile(
+    r"\[API|Stream |first byte|Cleared connection cache|"
+    r"error|fail|fatal|exception|abort|disconnect|timeout|reset|"
+    r"overload|rate.?limit|unauthorized|forbidden|"
+    r"\b(?:401|403|429|500|502|503|529)\b|"
+    r"ECONN|ETIMEDOUT|EPIPE|socket hang up",
+    re.IGNORECASE,
+)
+
+# How much of the file's end to scan.  The crash sequence lives at the very
+# end (earlier turns in the same task succeeded), and the file can be many
+# MB, so cap the read rather than slurping it all.
+_STDERR_READ_WINDOW = 256 * 1024
+# Always keep this many trailing raw lines — the exit/teardown context a
+# human wants even when it doesn't match the signal filter.
+_STDERR_EXIT_TAIL_LINES = 6
+
+
+def _read_captured_stderr(path: str | None, max_bytes: int = 16384) -> str:
+    """Return the diagnostically useful tail of the CLI's captured stderr.
+
+    With ``--debug-to-stderr`` the CLI emits a verbose firehose, so a plain
+    byte-tail is mostly per-turn noise and the actual exit-1 cause scrolls
+    out of the window.  Filter to signal lines (API/stream/error/teardown)
+    and always append the final raw lines so the exit context survives.
+    Falls back to a raw tail when nothing matches the filter, so we never
+    lose information.
+    """
     if not path:
         return ""
     try:
@@ -170,15 +203,31 @@ def _read_captured_stderr(path: str | None, max_bytes: int = 4096) -> str:
         if size == 0:
             return ""
         with open(path, "rb") as f:
-            if size > max_bytes:
-                f.seek(size - max_bytes)
+            if size > _STDERR_READ_WINDOW:
+                f.seek(size - _STDERR_READ_WINDOW)
             data = f.read()
-        text = data.decode("utf-8", errors="replace").strip()
-        if size > max_bytes:
-            text = "…(truncated)…\n" + text
-        return text
+        text = data.decode("utf-8", errors="replace")
     except OSError:
         return ""
+
+    lines = text.splitlines()
+    signal = [ln for ln in lines if _STDERR_SIGNAL_RE.search(ln)]
+    exit_tail = lines[-_STDERR_EXIT_TAIL_LINES:]
+
+    if signal:
+        # Signal lines (in order) followed by the exit tail, skipping any
+        # tail line already shown so the teardown isn't duplicated.
+        body = signal + [ln for ln in exit_tail if ln not in signal]
+        rendered = "…(filtered to signal lines; full debug elided)…\n" + "\n".join(body)
+    else:
+        rendered = "\n".join(exit_tail)
+        if size > _STDERR_READ_WINDOW or len(lines) > _STDERR_EXIT_TAIL_LINES:
+            rendered = "…(truncated)…\n" + rendered
+
+    rendered = rendered.strip()
+    if len(rendered) > max_bytes:
+        rendered = "…(truncated)…\n" + rendered[-max_bytes:]
+    return rendered
 
 
 def _cleanup_captured_stderr(path: str | None) -> None:
