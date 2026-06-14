@@ -170,6 +170,7 @@ anyio.open_process = _patched_open_process
 # lifecycle, errors, connection teardown.
 _STDERR_SIGNAL_RE = re.compile(
     r"\[API|Stream |first byte|Cleared connection cache|"
+    r"connection closed|closed after|"
     r"error|fail|fatal|exception|abort|disconnect|timeout|reset|"
     r"overload|rate.?limit|unauthorized|forbidden|"
     r"\b(?:401|403|429|500|502|503|529)\b|"

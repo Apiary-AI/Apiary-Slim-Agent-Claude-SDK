@@ -69,6 +69,24 @@ def test_error_keywords_are_treated_as_signal(tmp_path):
     assert "overloaded_error: 529" in out
 
 
+def test_connection_teardown_is_surfaced_past_exit_tail(tmp_path):
+    # A connector teardown line ("connection closed after ...") is exactly
+    # the signal the filter exists to preserve. Bury it well above the raw
+    # exit tail (more than _STDERR_EXIT_TAIL_LINES pure-noise lines follow)
+    # so it can only survive via the signal allowlist, not the tail.
+    teardown = (
+        '2026-06-14T10:36:36.485Z [DEBUG] MCP server "claude.ai Gmail": '
+        "CLAUDEAI-PROXY connection closed after 964s (cleanly)"
+    )
+    path = _write(tmp_path, teardown + "\n" + _NOISE)
+    out = _read_captured_stderr(path)
+    # The teardown survives only because the signal allowlist matched it:
+    # _NOISE is far longer than _STDERR_EXIT_TAIL_LINES, so the always-kept
+    # raw exit tail is pure noise and cannot account for the teardown line.
+    assert "connection closed after 964s (cleanly)" in out
+    assert out.startswith("…(filtered to signal lines")
+
+
 def test_result_is_clamped_to_max_bytes(tmp_path):
     big = "\n".join(f"[API:timing] request {i} first byte after 10ms" for i in range(5000))
     out = _read_captured_stderr(_write(tmp_path, big), max_bytes=2048)
