@@ -21,12 +21,21 @@ import tempfile as _tempfile
 import time
 
 import anyio
-from claude_code_sdk import ClaudeCodeOptions, ClaudeSDKError, Message, ProcessError, query
+from claude_code_sdk import (
+    ClaudeCodeOptions,
+    ClaudeSDKError,
+    Message,
+    ProcessError,
+    create_sdk_mcp_server,
+    query,
+    tool,
+)
 from claude_code_sdk._internal import client as _sdk_client
 from claude_code_sdk._internal import message_parser
 from claude_code_sdk.types import AssistantMessage, ResultMessage, SystemMessage
 
 from superpos_agent_core import (
+    AskAlreadyPending,
     ExecutionRequest,
     Executor,
     RecentTasksLog,
@@ -35,6 +44,7 @@ from superpos_agent_core import (
     TaskSummary,
     TelegramGateway,
     TelegramStreamer,
+    ask_user_question,
     collect_mcp_servers,
     discover_modules,
     ensure_worktree,
@@ -133,6 +143,45 @@ _sdk_client.SubprocessCLITransport._build_command = _patched_build_command
 _stderr_capture_var: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
     "claude_cli_stderr_capture", default=None,
 )
+
+
+class _AskContext:
+    """Per-run handle the AskUserQuestion MCP tool closes over.
+
+    The MCP server is built once in ``__init__`` and shared across every
+    concurrent run, so the tool handler can't capture a single request.
+    Instead each run publishes its own ``_AskContext`` on a
+    :data:`_ask_context_var` ``ContextVar`` (the SDK invokes the in-process
+    tool handler on the same task that drives ``query``, so the contextvar
+    propagates).  The handler reads ``chat_id``/``thread_id`` from it and uses
+    the ``pause``/``resume`` callbacks to suspend the stall watchdog (and bump
+    the claim heartbeat) for the duration of a parked question.
+    """
+
+    def __init__(
+        self,
+        chat_id: int | str,
+        thread_id: int | None,
+        pause,
+        resume,
+    ) -> None:
+        self.chat_id = chat_id
+        self.thread_id = thread_id
+        self.pause = pause
+        self.resume = resume
+
+
+_ask_context_var: contextvars.ContextVar[_AskContext | None] = contextvars.ContextVar(
+    "claude_ask_context", default=None,
+)
+
+
+# Name of the SDK MCP server + tool that shadows the native AskUserQuestion.
+# The CLI exposes in-process SDK tools as ``mcp__<server>__<tool>``.
+_ASK_MCP_SERVER = "superpos_ask"
+_ASK_MCP_TOOL = "ask_user"
+_ASK_MCP_TOOL_FQN = f"mcp__{_ASK_MCP_SERVER}__{_ASK_MCP_TOOL}"
+
 _original_open_process = anyio.open_process
 
 
@@ -326,6 +375,13 @@ class ClaudeExecutor(Executor):
         if self._mcp:
             log.info("Loaded %d MCP server(s) from %s", len(self._mcp), config.modules_dir)
 
+        # In-process SDK MCP tool shadowing the native AskUserQuestion: it
+        # renders an inline keyboard in Telegram (via agent-core's
+        # ask_user_question) and returns the user's pick as the tool result so
+        # the run resumes.  Always registered; the native tool is steered off
+        # via disallowed_tools in _build_options.
+        self._mcp = {**self._mcp, _ASK_MCP_SERVER: self._build_ask_mcp_server()}
+
         # On an Anthropic-compatible *shim* (e.g. MiniMax or Kimi via
         # ANTHROPIC_BASE_URL), Anthropic's hosted WebSearch/WebFetch server
         # tools don't exist on the other end and fail with HTTP 400.
@@ -335,6 +391,123 @@ class ClaudeExecutor(Executor):
         self._search_note: str | None = None
         if self._shim_backend:
             self._wire_shim_search(config)
+
+    def _build_ask_mcp_server(self):
+        """Build the in-process SDK MCP server exposing ``ask_user``.
+
+        The tool's input schema mirrors the native ``AskUserQuestion`` tool: a
+        ``questions`` array, each entry carrying ``question``/``header``, an
+        ``options`` array of ``{label, description, preview?}``, and an
+        optional ``multiSelect`` flag.  The handler closes over the executor
+        (for ``self._gateway`` and the configured timeout) and reads the live
+        run's ``chat_id``/``thread_id`` from the :data:`_ask_context_var`
+        contextvar published by ``_execute_inner``, then delegates to
+        agent-core's :func:`ask_user_question`, which renders the inline
+        keyboard and parks on the user's reply.
+        """
+        ask_timeout = float(self._config.claude_ask_timeout)
+
+        input_schema = {
+            "type": "object",
+            "properties": {
+                "questions": {
+                    "type": "array",
+                    "minItems": 1,
+                    "maxItems": 4,
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "question": {"type": "string"},
+                            "header": {"type": "string"},
+                            "multiSelect": {"type": "boolean"},
+                            "options": {
+                                "type": "array",
+                                "minItems": 1,
+                                "maxItems": 4,
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "label": {"type": "string"},
+                                        "description": {"type": "string"},
+                                        "preview": {"type": "string"},
+                                    },
+                                    "required": ["label"],
+                                },
+                            },
+                        },
+                        "required": ["question", "options"],
+                    },
+                }
+            },
+            "required": ["questions"],
+        }
+
+        @tool(
+            _ASK_MCP_TOOL,
+            "Ask the user one or more multiple-choice questions and wait for "
+            "their answer. Renders interactive buttons in the chat. Use this "
+            "whenever you need the user to pick between options or confirm a "
+            "direction before continuing. Each question has a short `header`, "
+            "the `question` text, and 1-4 `options` (each with a `label` and "
+            "an optional `description`/`preview`). Set `multiSelect: true` to "
+            "let the user pick several. Returns the selected label(s) per "
+            "question; if the user does not respond in time the result is "
+            "marked `timed_out` so you can proceed without them.",
+            input_schema,
+        )
+        async def ask_user(args: dict) -> dict:
+            ctx = _ask_context_var.get()
+            if ctx is None:
+                # No live run context — shouldn't happen during a real query;
+                # fail closed rather than send to an unknown chat.  Raise so the
+                # error survives the SDK MCP adapter: create_sdk_mcp_server only
+                # forwards ``content`` and drops a returned ``is_error`` flag,
+                # whereas the mcp low-level server wraps a raised exception into
+                # a CallToolResult(isError=True) with the message preserved.
+                raise RuntimeError(
+                    "ask_user is unavailable: no active conversation context."
+                )
+
+            questions = args.get("questions") or []
+            # Pause the stall watchdog while a question is parked.  pause/resume
+            # are reference-counted (see _execute), so concurrent ask calls
+            # nest safely: the watchdog only un-pauses once every parked
+            # question has resolved.  A call that hits AskAlreadyPending still
+            # balances its own pause/resume here, and because the owning call's
+            # pause is still outstanding the count never reaches zero while a
+            # valid question is pending.
+            ctx.pause()
+            try:
+                result = await ask_user_question(
+                    ctx.chat_id,
+                    ctx.thread_id,
+                    questions,
+                    gateway=self._gateway,
+                    timeout=ask_timeout,
+                )
+            except AskAlreadyPending as exc:
+                # Re-raise as a tool error: the SDK adapter drops a returned
+                # ``is_error`` flag, so only a raised exception reaches Claude
+                # as CallToolResult(isError=True).  The ``finally`` below still
+                # balances the pause/resume; it does not suppress the raise.
+                raise RuntimeError(
+                    "A question is already pending in this chat. Wait for the "
+                    "user to answer it before asking another."
+                ) from exc
+            finally:
+                ctx.resume()
+
+            return {
+                "content": [
+                    {"type": "text", "text": json.dumps(result)}
+                ]
+            }
+
+        return create_sdk_mcp_server(
+            name=_ASK_MCP_SERVER,
+            version="1.0.0",
+            tools=[ask_user],
+        )
 
     def _wire_shim_search(self, config: ClaudeConfig) -> None:
         """Pick the replacement web-search MCP for a non-Anthropic backend.
@@ -938,6 +1111,17 @@ class ClaudeExecutor(Executor):
         watcher_task: asyncio.Task | None = None
         stall_watchdog: asyncio.Task | None = None
         progress_event = asyncio.Event()
+        # Set while one or more interactive AskUserQuestions are parked
+        # awaiting a human reply.  No SDK messages flow during that window, so
+        # the stall watchdog must not treat the silence as a deadlock; the
+        # claim/zombie guards likewise tolerate the wait.  _execute_inner
+        # pulses this via the pause/resume callbacks threaded into the ask MCP
+        # tool context.  Reference-counted (not a bare flag) so concurrent ask
+        # calls nest: if Claude emits two ask tool calls and the second fails
+        # fast with AskAlreadyPending, its resume must not un-pause the
+        # watchdog while the first question is still legitimately waiting.
+        ask_pending = asyncio.Event()
+        ask_pending_count = 0
         stalled = False
 
         async def _watch_claim_expiry() -> None:
@@ -955,6 +1139,11 @@ class ClaudeExecutor(Executor):
                         progress_event.wait(), timeout=stall_timeout,
                     )
                 except asyncio.TimeoutError:
+                    # A parked question (awaiting a human) is not a stall —
+                    # the human may legitimately take minutes.  Keep waiting
+                    # without cancelling; the ask itself has its own timeout.
+                    if ask_pending.is_set():
+                        continue
                     stalled = True
                     log.warning(
                         "Claude SDK iterator stalled for %ds on task %s "
@@ -966,12 +1155,41 @@ class ClaudeExecutor(Executor):
                     return
                 progress_event.clear()
 
+        def _pause_watchdog() -> None:
+            """Suspend the stall watchdog while a question is parked.
+
+            Reference-counted: the watchdog pauses on the 0→1 transition and
+            stays paused until every parked question has resumed.  Also pulses
+            ``progress_event`` (and, for superpos tasks, lets the claim-expiry
+            watcher's heartbeat keep flowing) so neither the stall timer nor
+            the claim watchdog fires during the human wait.
+            """
+            nonlocal ask_pending_count
+            ask_pending_count += 1
+            ask_pending.set()
+            progress_event.set()
+
+        def _resume_watchdog() -> None:
+            nonlocal ask_pending_count
+            if ask_pending_count > 0:
+                ask_pending_count -= 1
+            # Only un-pause once the last outstanding question resolves — a
+            # second, AskAlreadyPending-failing call decrements its own
+            # increment but leaves the owning question's pause in effect.
+            if ask_pending_count == 0:
+                ask_pending.clear()
+            # Treat the answer as fresh progress so the stall deadline resets
+            # from now rather than from before the (long) human pause.
+            progress_event.set()
+
         try:
             inner_task = asyncio.create_task(
                 self._execute_inner(
                     req, streamer, retries,
                     pre_resolved=pre_resolved,
                     progress_event=progress_event,
+                    pause_watchdog=_pause_watchdog,
+                    resume_watchdog=_resume_watchdog,
                 ),
             )
             # Register with the base class so the /stop Telegram command can
@@ -986,9 +1204,22 @@ class ClaudeExecutor(Executor):
             try:
                 # Safety net against zombie pipes where the Claude subprocess
                 # dies but grandchildren keep stdout open, hanging the
-                # async-for loop forever.
+                # async-for loop forever.  A parked AskUserQuestion is a
+                # legitimate long wait, so when the guard elapses while one is
+                # pending we re-arm it instead of cancelling — the ask has its
+                # own timeout, after which messages flow again and the guard
+                # behaves normally.
                 max_timeout = self._config.executor_max_turns * 120  # ~2min/turn
-                await asyncio.wait_for(inner_task, timeout=max_timeout)
+                while True:
+                    try:
+                        await asyncio.wait_for(
+                            asyncio.shield(inner_task), timeout=max_timeout,
+                        )
+                        break
+                    except asyncio.TimeoutError:
+                        if ask_pending.is_set():
+                            continue
+                        raise
             except asyncio.TimeoutError:
                 log.warning(
                     "Execution timed out after %ds for task %s — possible zombie pipe",
@@ -1115,7 +1346,11 @@ class ClaudeExecutor(Executor):
 
         async def _run_inner() -> None:
             nonlocal full_text
-            options = self._build_options()
+            # Background tasks have no Telegram round-trip context and don't
+            # stream, so the interactive ask path can't route a question.
+            # Disable it: plain no-ask options (no superpos_ask server, no
+            # steering note, native AskUserQuestion left enabled).
+            options = self._build_options(enable_ask=False)
             async for message in query(prompt=prompt, options=options):
                 text = self._extract_text(message)
                 if text:
@@ -1207,7 +1442,20 @@ class ClaudeExecutor(Executor):
         resume_session: str | None = None,
         cwd: str | None = None,
         system_prompt_append: str | None = None,
+        *,
+        enable_ask: bool = True,
     ) -> ClaudeCodeOptions:
+        """Assemble ``ClaudeCodeOptions`` for a query.
+
+        ``enable_ask`` controls the interactive AskUserQuestion-over-Telegram
+        wiring.  When True (interactive ``_execute_inner`` path) the in-process
+        ``superpos_ask`` MCP server is registered, the native AskUserQuestion
+        tool is disabled, and a steering note nudges the model toward the MCP
+        tool.  Background tasks (``run_background``) pass False: they never
+        publish an ``_AskContext`` and don't stream, so a parked question could
+        not be routed — they get a plain no-ask path instead (no ask server, no
+        steering note, native AskUserQuestion left untouched).
+        """
         opts: dict = {
             "model": self._runtime.model,
             "max_turns": self._config.executor_max_turns,
@@ -1231,20 +1479,53 @@ class ClaudeExecutor(Executor):
                 "debug-to-stderr": None,
             },
         }
-        if self._mcp:
-            opts["mcp_servers"] = self._mcp
+        # The interactive ask path needs the in-process superpos_ask MCP
+        # server; background tasks (enable_ask=False) get the plain server set
+        # without it so the native AskUserQuestion is never shadowed by a tool
+        # that can't route its question (no _AskContext, no streaming).
+        if enable_ask:
+            mcp_servers = self._mcp
+        else:
+            mcp_servers = {
+                k: v for k, v in self._mcp.items() if k != _ASK_MCP_SERVER
+            }
+        if mcp_servers:
+            opts["mcp_servers"] = mcp_servers
         if resume_session:
             opts["resume"] = resume_session
+        # Steer the model away from the native AskUserQuestion tool (handled
+        # opaquely inside the CLI subprocess, so it never reaches Telegram)
+        # toward our in-process MCP tool, which renders an inline keyboard and
+        # feeds the answer back as the tool result.  Only on the interactive
+        # path — background tasks leave AskUserQuestion enabled and skip the
+        # steering note.
+        disallowed: list[str] = []
         parts = []
         if self._persona:
             parts.append(self._persona)
+        if enable_ask:
+            disallowed.append("AskUserQuestion")
+            parts.append(
+                "## Asking the user a question\n"
+                "When you need the user to choose between options or confirm a "
+                f"direction, call the `{_ASK_MCP_TOOL_FQN}` tool (NOT the "
+                "native AskUserQuestion tool, which is disabled). It renders "
+                "interactive buttons in the chat and returns the user's "
+                "selection. Pass a `questions` array, each with a `header`, "
+                "the `question` text, and 1-4 `options` (each "
+                "`{label, description, preview?}`); set `multiSelect: true` to "
+                "allow multiple picks. If the result is marked `timed_out`, "
+                "the user did not respond — proceed sensibly without their "
+                "input."
+            )
         # On a shim backend, Anthropic's hosted WebSearch/WebFetch 400.
         # Disable them so the model stops calling dead tools, and point it
         # at the replacement search MCP when one was wired at startup.
         if self._shim_backend:
-            opts["disallowed_tools"] = ["WebSearch", "WebFetch"]
+            disallowed += ["WebSearch", "WebFetch"]
             if self._search_note:
                 parts.append(self._search_note)
+        opts["disallowed_tools"] = disallowed
         if system_prompt_append:
             parts.append(system_prompt_append)
         if parts:
@@ -1266,9 +1547,27 @@ class ClaudeExecutor(Executor):
         *,
         pre_resolved: tuple[str | None, str | None] | None = None,
         progress_event: asyncio.Event | None = None,
+        pause_watchdog=None,
+        resume_watchdog=None,
     ) -> None:
         t0 = time.monotonic()
         full_text = ""
+
+        # Publish this run's chat context (and the watchdog pause/resume
+        # hooks) so the shared ask_user MCP tool handler can route a question
+        # to the right Telegram chat/topic and suspend the stall watchdog
+        # while it's parked.  Defaults are no-ops so direct callers (tests)
+        # without a watchdog still work.
+        def _noop() -> None:
+            pass
+
+        ask_ctx = _AskContext(
+            chat_id=req.chat_id,
+            thread_id=req.thread_id,
+            pause=pause_watchdog or _noop,
+            resume=resume_watchdog or _noop,
+        )
+        ask_ctx_token = _ask_context_var.set(ask_ctx)
 
         # ``_run_one`` resolves the resume target before slot/lock
         # acquisition so the lock key matches the cwd we use here.
@@ -1364,243 +1663,271 @@ class ClaudeExecutor(Executor):
         last_session_id: str | None = None
         effective_prompt = prompt_text
 
-        for attempt in range(1, retries + 1):
-            capture: dict = {}
-            capture_token = _stderr_capture_var.set(capture)
+        # Streaming-input mode: ``query`` takes an ``AsyncIterable[dict]`` of
+        # user messages rather than a bare string.  This is required for the
+        # in-process MCP round-trip (the ask_user tool) and the SDK control
+        # protocol — under the old one-shot string form the CLI owns tool
+        # execution end-to-end and our tool handler never runs.  We yield the
+        # single user message, matching the SDK's documented shape.
+        def _prompt_stream(text: str):
+            async def _gen():
+                yield {
+                    "type": "user",
+                    "message": {"role": "user", "content": text},
+                    "parent_tool_use_id": None,
+                    "session_id": "default",
+                }
+            return _gen()
+
+        try:
+            for attempt in range(1, retries + 1):
+                capture: dict = {}
+                capture_token = _stderr_capture_var.set(capture)
+                try:
+                    options = self._build_options(
+                        resume_session=resume_id,
+                        cwd=cwd_override,
+                        system_prompt_append=system_prompt_append,
+                    )
+                    async for message in query(
+                        prompt=_prompt_stream(effective_prompt), options=options,
+                    ):
+                        # Signal the stall watchdog that the SDK iterator is
+                        # alive — every yielded message resets the deadline.
+                        if progress_event is not None:
+                            progress_event.set()
+                        # Capture session_id from init (fires on every run) and
+                        # result (terminal, success only).  Init survives a CLI
+                        # crash mid-stream — ResultMessage doesn't fire if the
+                        # subprocess dies before completing, so relying on it
+                        # alone leaves crash-retry without a session to resume.
+                        if isinstance(message, SystemMessage) and message.subtype == "init":
+                            sid = message.data.get("session_id")
+                            if sid:
+                                last_session_id = sid
+                                if req.source == "telegram":
+                                    self._sessions.set_with_version(
+                                        req.chat_key, sid, self._persona_version,
+                                        branch=session_branch,
+                                    )
+                        elif isinstance(message, ResultMessage) and hasattr(message, "session_id"):
+                            sid = message.session_id
+                            if sid:
+                                last_session_id = sid
+                                if req.source == "telegram":
+                                    self._sessions.set_with_version(
+                                        req.chat_key, sid, self._persona_version,
+                                        branch=session_branch,
+                                    )
+
+                        text = self._extract_text(message)
+                        if text:
+                            full_text += text
+                            await streamer.append(text)
+
+                        tool_info = self._extract_tool_use(message)
+                        if tool_info:
+                            await streamer.send_tool_notification(*tool_info)
+
+                    await streamer.finish()
+
+                    if req.source == "superpos" and req.superpos_task_id and self._superpos:
+                        result = full_text[-2000:] if len(full_text) > 2000 else full_text
+                        elapsed = int(time.monotonic() - t0)
+                        summary = {
+                            "description": req.prompt[:200],
+                            "output_excerpt": full_text[:500] if full_text else None,
+                            "duration_seconds": elapsed,
+                        }
+                        try:
+                            await self._superpos.complete_task(
+                                req.superpos_task_id, result, summary=summary,
+                            )
+                        except Exception:
+                            log.warning(
+                                "Failed to complete superpos task %s — claim may have expired",
+                                req.superpos_task_id, exc_info=True,
+                            )
+                        self._recent_tasks.record(
+                            req.chat_id,
+                            TaskSummary(
+                                task_id=req.superpos_task_id,
+                                description=req.prompt[:200],
+                                outcome="succeeded",
+                                detail=full_text[:500] if full_text else "",
+                            ),
+                        )
+                    return
+
+                except (ClaudeSDKError, Exception) as e:
+                    err_str = str(e)
+                    captured_stderr = _read_captured_stderr(capture.get("path"))
+                    is_rate_limit = "rate_limit" in err_str.lower()
+                    is_oauth_expired = (
+                        "OAuth token has expired" in err_str
+                        or ("oauth" in err_str.lower() and "expired" in err_str.lower())
+                    )
+                    is_auth_error = (
+                        is_oauth_expired
+                        or "authentication_error" in err_str
+                        or "Invalid authentication credentials" in err_str
+                    )
+
+                    if is_auth_error:
+                        if is_oauth_expired:
+                            log.critical(
+                                "Claude OAuth session expired. "
+                                "Re-run the OAuth flow then restart. Shutting down."
+                            )
+                        else:
+                            log.critical(
+                                "Claude authentication failed — API key invalid or OAuth not configured. "
+                                "Shutting down."
+                            )
+                        sys.exit(1)
+
+                    is_api_500 = (
+                        "internal server error" in err_str.lower()
+                        or "api_error" in err_str.lower()
+                        or "overloaded" in err_str.lower()
+                    )
+                    if is_api_500 and attempt < retries:
+                        wait = 30 * attempt
+                        log.warning(
+                            "API server error (attempt %d/%d), retrying in %ds: %s",
+                            attempt, retries, wait, err_str[:100],
+                        )
+                        await streamer.append(f"\n⏳ API error, retrying in {wait}s...\n")
+                        await self._backoff_sleep(wait, progress_event)
+                        continue
+
+                    # CLI subprocess crash — resume the session so completed tool
+                    # calls aren't re-run.
+                    is_cli_crash = (
+                        isinstance(e, ProcessError)
+                        or "Command failed with exit code" in err_str
+                    )
+                    if is_cli_crash and last_session_id and attempt < retries:
+                        wait = 5 * attempt
+                        exit_code = getattr(e, "exit_code", "?")
+                        log.warning(
+                            "Claude CLI crashed (exit %s, attempt %d/%d); "
+                            "resuming session %s in %ds. CLI stderr:\n%s",
+                            exit_code, attempt, retries, last_session_id, wait,
+                            captured_stderr or "(no stderr captured)",
+                        )
+                        stderr_blurb = (
+                            f"\nCLI stderr tail:\n{captured_stderr}"
+                            if captured_stderr else ""
+                        )
+                        await streamer.append(
+                            f"\n⏳ CLI crashed (exit {exit_code}), "
+                            f"resuming session in {wait}s...{stderr_blurb}\n",
+                        )
+                        await self._backoff_sleep(wait, progress_event)
+                        resume_id = last_session_id
+                        effective_prompt = (
+                            "Your previous CLI invocation crashed before completing this task. "
+                            "Review your prior outputs in this session to see what was already done, "
+                            "then continue from where you left off and finish the task."
+                        )
+                        continue
+
+                    if full_text.strip():
+                        log.warning(
+                            "Execution produced output but failed (attempt %d/%d); "
+                            "not retrying to avoid duplicate side effects",
+                            attempt, retries,
+                        )
+                    elif is_rate_limit and attempt < retries:
+                        wait = 30 * attempt
+                        log.warning(
+                            "Rate limited (attempt %d/%d), retrying in %ds",
+                            attempt, retries, wait,
+                        )
+                        await streamer.append(f"\n⏳ Rate limited, retrying in {wait}s...\n")
+                        await self._backoff_sleep(wait, progress_event)
+                        continue
+                    elif resume_id and attempt < retries:
+                        log.warning("Session resume failed, retrying with fresh session")
+                        self._sessions.clear(req.chat_key)
+                        resume_id = None
+                        continue
+
+                    if isinstance(e, ClaudeSDKError):
+                        log.error("Claude SDK error: %s", e)
+                    else:
+                        log.exception("Unexpected error during execution")
+                    hint = ""
+                    if (
+                        isinstance(e, ProcessError)
+                        or "Command failed with exit code" in err_str
+                    ):
+                        if captured_stderr:
+                            hint = (
+                                f"\n💡 The Claude CLI subprocess crashed. "
+                                f"Captured stderr (tail):\n{captured_stderr}"
+                            )
+                        else:
+                            hint = (
+                                "\n💡 The Claude CLI subprocess crashed but wrote "
+                                "nothing to stderr (likely OOM-killed or signaled). "
+                                "Check `docker logs <agent>` and `dmesg` near this "
+                                "timestamp."
+                            )
+                    try:
+                        await streamer.error(f"Error: {e}{hint}")
+                    except asyncio.CancelledError:
+                        log.warning("CancelledError while sending error to Telegram (suppressed)")
+                    except Exception:
+                        log.warning("Failed to send error notification", exc_info=True)
+                    if req.source == "superpos" and req.superpos_task_id and self._superpos:
+                        elapsed = int(time.monotonic() - t0)
+                        summary = {
+                            "description": req.prompt[:200],
+                            "error": err_str[:500],
+                            "duration_seconds": elapsed,
+                        }
+                        if captured_stderr:
+                            summary["cli_stderr"] = captured_stderr[-2000:]
+                        try:
+                            await self._superpos.fail_task(
+                                req.superpos_task_id, err_str, summary=summary,
+                            )
+                        except Exception:
+                            log.warning(
+                                "Failed to mark superpos task %s as failed",
+                                req.superpos_task_id,
+                            )
+                        self._recent_tasks.record(
+                            req.chat_id,
+                            TaskSummary(
+                                task_id=req.superpos_task_id,
+                                description=req.prompt[:200],
+                                outcome="failed",
+                                detail=err_str[:500],
+                            ),
+                        )
+                    return
+
+                finally:
+                    # CancelledError (BaseException) bypasses the except clause
+                    # above, so without finally the delete=False tempfiles leak —
+                    # claim-expiry/timeout cancellation would accumulate orphans.
+                    try:
+                        _stderr_capture_var.reset(capture_token)
+                    except (ValueError, LookupError):
+                        pass
+                    _cleanup_captured_stderr(capture.get("path"))
+
+        finally:
+            # Run isolation already scopes the contextvar per task, but
+            # reset explicitly so direct callers (tests) don't leak the
+            # ask context across invocations.
             try:
-                options = self._build_options(
-                    resume_session=resume_id,
-                    cwd=cwd_override,
-                    system_prompt_append=system_prompt_append,
-                )
-                async for message in query(prompt=effective_prompt, options=options):
-                    # Signal the stall watchdog that the SDK iterator is
-                    # alive — every yielded message resets the deadline.
-                    if progress_event is not None:
-                        progress_event.set()
-                    # Capture session_id from init (fires on every run) and
-                    # result (terminal, success only).  Init survives a CLI
-                    # crash mid-stream — ResultMessage doesn't fire if the
-                    # subprocess dies before completing, so relying on it
-                    # alone leaves crash-retry without a session to resume.
-                    if isinstance(message, SystemMessage) and message.subtype == "init":
-                        sid = message.data.get("session_id")
-                        if sid:
-                            last_session_id = sid
-                            if req.source == "telegram":
-                                self._sessions.set_with_version(
-                                    req.chat_key, sid, self._persona_version,
-                                    branch=session_branch,
-                                )
-                    elif isinstance(message, ResultMessage) and hasattr(message, "session_id"):
-                        sid = message.session_id
-                        if sid:
-                            last_session_id = sid
-                            if req.source == "telegram":
-                                self._sessions.set_with_version(
-                                    req.chat_key, sid, self._persona_version,
-                                    branch=session_branch,
-                                )
-
-                    text = self._extract_text(message)
-                    if text:
-                        full_text += text
-                        await streamer.append(text)
-
-                    tool_info = self._extract_tool_use(message)
-                    if tool_info:
-                        await streamer.send_tool_notification(*tool_info)
-
-                await streamer.finish()
-
-                if req.source == "superpos" and req.superpos_task_id and self._superpos:
-                    result = full_text[-2000:] if len(full_text) > 2000 else full_text
-                    elapsed = int(time.monotonic() - t0)
-                    summary = {
-                        "description": req.prompt[:200],
-                        "output_excerpt": full_text[:500] if full_text else None,
-                        "duration_seconds": elapsed,
-                    }
-                    try:
-                        await self._superpos.complete_task(
-                            req.superpos_task_id, result, summary=summary,
-                        )
-                    except Exception:
-                        log.warning(
-                            "Failed to complete superpos task %s — claim may have expired",
-                            req.superpos_task_id, exc_info=True,
-                        )
-                    self._recent_tasks.record(
-                        req.chat_id,
-                        TaskSummary(
-                            task_id=req.superpos_task_id,
-                            description=req.prompt[:200],
-                            outcome="succeeded",
-                            detail=full_text[:500] if full_text else "",
-                        ),
-                    )
-                return
-
-            except (ClaudeSDKError, Exception) as e:
-                err_str = str(e)
-                captured_stderr = _read_captured_stderr(capture.get("path"))
-                is_rate_limit = "rate_limit" in err_str.lower()
-                is_oauth_expired = (
-                    "OAuth token has expired" in err_str
-                    or ("oauth" in err_str.lower() and "expired" in err_str.lower())
-                )
-                is_auth_error = (
-                    is_oauth_expired
-                    or "authentication_error" in err_str
-                    or "Invalid authentication credentials" in err_str
-                )
-
-                if is_auth_error:
-                    if is_oauth_expired:
-                        log.critical(
-                            "Claude OAuth session expired. "
-                            "Re-run the OAuth flow then restart. Shutting down."
-                        )
-                    else:
-                        log.critical(
-                            "Claude authentication failed — API key invalid or OAuth not configured. "
-                            "Shutting down."
-                        )
-                    sys.exit(1)
-
-                is_api_500 = (
-                    "internal server error" in err_str.lower()
-                    or "api_error" in err_str.lower()
-                    or "overloaded" in err_str.lower()
-                )
-                if is_api_500 and attempt < retries:
-                    wait = 30 * attempt
-                    log.warning(
-                        "API server error (attempt %d/%d), retrying in %ds: %s",
-                        attempt, retries, wait, err_str[:100],
-                    )
-                    await streamer.append(f"\n⏳ API error, retrying in {wait}s...\n")
-                    await self._backoff_sleep(wait, progress_event)
-                    continue
-
-                # CLI subprocess crash — resume the session so completed tool
-                # calls aren't re-run.
-                is_cli_crash = (
-                    isinstance(e, ProcessError)
-                    or "Command failed with exit code" in err_str
-                )
-                if is_cli_crash and last_session_id and attempt < retries:
-                    wait = 5 * attempt
-                    exit_code = getattr(e, "exit_code", "?")
-                    log.warning(
-                        "Claude CLI crashed (exit %s, attempt %d/%d); "
-                        "resuming session %s in %ds. CLI stderr:\n%s",
-                        exit_code, attempt, retries, last_session_id, wait,
-                        captured_stderr or "(no stderr captured)",
-                    )
-                    stderr_blurb = (
-                        f"\nCLI stderr tail:\n{captured_stderr}"
-                        if captured_stderr else ""
-                    )
-                    await streamer.append(
-                        f"\n⏳ CLI crashed (exit {exit_code}), "
-                        f"resuming session in {wait}s...{stderr_blurb}\n",
-                    )
-                    await self._backoff_sleep(wait, progress_event)
-                    resume_id = last_session_id
-                    effective_prompt = (
-                        "Your previous CLI invocation crashed before completing this task. "
-                        "Review your prior outputs in this session to see what was already done, "
-                        "then continue from where you left off and finish the task."
-                    )
-                    continue
-
-                if full_text.strip():
-                    log.warning(
-                        "Execution produced output but failed (attempt %d/%d); "
-                        "not retrying to avoid duplicate side effects",
-                        attempt, retries,
-                    )
-                elif is_rate_limit and attempt < retries:
-                    wait = 30 * attempt
-                    log.warning(
-                        "Rate limited (attempt %d/%d), retrying in %ds",
-                        attempt, retries, wait,
-                    )
-                    await streamer.append(f"\n⏳ Rate limited, retrying in {wait}s...\n")
-                    await self._backoff_sleep(wait, progress_event)
-                    continue
-                elif resume_id and attempt < retries:
-                    log.warning("Session resume failed, retrying with fresh session")
-                    self._sessions.clear(req.chat_key)
-                    resume_id = None
-                    continue
-
-                if isinstance(e, ClaudeSDKError):
-                    log.error("Claude SDK error: %s", e)
-                else:
-                    log.exception("Unexpected error during execution")
-                hint = ""
-                if (
-                    isinstance(e, ProcessError)
-                    or "Command failed with exit code" in err_str
-                ):
-                    if captured_stderr:
-                        hint = (
-                            f"\n💡 The Claude CLI subprocess crashed. "
-                            f"Captured stderr (tail):\n{captured_stderr}"
-                        )
-                    else:
-                        hint = (
-                            "\n💡 The Claude CLI subprocess crashed but wrote "
-                            "nothing to stderr (likely OOM-killed or signaled). "
-                            "Check `docker logs <agent>` and `dmesg` near this "
-                            "timestamp."
-                        )
-                try:
-                    await streamer.error(f"Error: {e}{hint}")
-                except asyncio.CancelledError:
-                    log.warning("CancelledError while sending error to Telegram (suppressed)")
-                except Exception:
-                    log.warning("Failed to send error notification", exc_info=True)
-                if req.source == "superpos" and req.superpos_task_id and self._superpos:
-                    elapsed = int(time.monotonic() - t0)
-                    summary = {
-                        "description": req.prompt[:200],
-                        "error": err_str[:500],
-                        "duration_seconds": elapsed,
-                    }
-                    if captured_stderr:
-                        summary["cli_stderr"] = captured_stderr[-2000:]
-                    try:
-                        await self._superpos.fail_task(
-                            req.superpos_task_id, err_str, summary=summary,
-                        )
-                    except Exception:
-                        log.warning(
-                            "Failed to mark superpos task %s as failed",
-                            req.superpos_task_id,
-                        )
-                    self._recent_tasks.record(
-                        req.chat_id,
-                        TaskSummary(
-                            task_id=req.superpos_task_id,
-                            description=req.prompt[:200],
-                            outcome="failed",
-                            detail=err_str[:500],
-                        ),
-                    )
-                return
-
-            finally:
-                # CancelledError (BaseException) bypasses the except clause
-                # above, so without finally the delete=False tempfiles leak —
-                # claim-expiry/timeout cancellation would accumulate orphans.
-                try:
-                    _stderr_capture_var.reset(capture_token)
-                except (ValueError, LookupError):
-                    pass
-                _cleanup_captured_stderr(capture.get("path"))
+                _ask_context_var.reset(ask_ctx_token)
+            except (ValueError, LookupError):
+                pass
 
     # ── Message parsing ──────────────────────────────────────────────────
 
