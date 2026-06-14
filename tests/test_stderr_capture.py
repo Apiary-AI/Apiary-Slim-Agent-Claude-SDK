@@ -6,7 +6,10 @@ These tests pin that the reader surfaces the API/stream/error/teardown
 lines that actually explain a crash, while never losing information.
 """
 
-from superpos_agent_claude.claude_executor import _read_captured_stderr
+from superpos_agent_claude.claude_executor import (
+    _STDERR_EXIT_TAIL_LINES,
+    _read_captured_stderr,
+)
 
 
 # A realistic slice of CLI --debug-to-stderr output around a mid-stream
@@ -85,6 +88,25 @@ def test_connection_teardown_is_surfaced_past_exit_tail(tmp_path):
     # raw exit tail is pure noise and cannot account for the teardown line.
     assert "connection closed after 964s (cleanly)" in out
     assert out.startswith("…(filtered to signal lines")
+
+
+def test_connection_closed_teardown_is_signal(tmp_path):
+    # A "connection closed after Ns" teardown line must survive even when
+    # more than the 6-line raw exit tail of bookkeeping follows it, so it
+    # can only be preserved by the signal filter, not the exit tail.
+    teardown = (
+        '2026-06-14T10:36:36.485Z [DEBUG] MCP server "claude.ai Gmail": '
+        "CLAUDEAI-PROXY connection closed after 964s (cleanly)"
+    )
+    path = _write(tmp_path, _NOISE + "\n" + teardown + "\n" + _NOISE)
+    out = _read_captured_stderr(path)
+    assert "connection closed after 964s" in out
+    # The teardown survives via the signal filter, not the raw exit tail: it
+    # sits above the trailing bookkeeping rather than within the last few
+    # always-kept lines.  The bulk noise that floods the firehose is dropped
+    # (only the small exit tail of context may survive).
+    assert out.index("connection closed after 964s") < out.index("LSP Diagnostics")
+    assert out.count("LSP Diagnostics") <= _STDERR_EXIT_TAIL_LINES
 
 
 def test_result_is_clamped_to_max_bytes(tmp_path):
