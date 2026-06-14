@@ -21,6 +21,11 @@ class ClaudeConfig(BaseConfig):
     # to survive long Bash tool calls — the per-tool SDK timeout will fire
     # first under normal conditions and advance the iterator.
     claude_stall_timeout: int = 900
+    # Max seconds to wait for the user to answer an interactive
+    # AskUserQuestion (rendered as a Telegram inline keyboard) before the
+    # tool returns a "no response" result so the run can wrap up rather than
+    # hang.  The stall/claim watchdogs are paused/extended for this window.
+    claude_ask_timeout: int = 600
 
     # When the Claude CLI is pointed at an Anthropic-compatible *shim*
     # (e.g. MiniMax via ANTHROPIC_BASE_URL), Anthropic's hosted server tools
@@ -97,6 +102,7 @@ class ClaudeConfig(BaseConfig):
             claude_model=os.environ.get("CLAUDE_MODEL", "claude-opus-4-8"),
             claude_effort=os.environ.get("CLAUDE_EFFORT", "high"),
             claude_stall_timeout=int(os.environ.get("CLAUDE_STALL_TIMEOUT", "900")),
+            claude_ask_timeout=int(os.environ.get("CLAUDE_ASK_TIMEOUT", "600")),
             # The CLI consumes ANTHROPIC_BASE_URL itself; we read it only to
             # detect a non-Anthropic shim and adjust tooling accordingly.
             anthropic_base_url=os.environ.get("ANTHROPIC_BASE_URL", ""),

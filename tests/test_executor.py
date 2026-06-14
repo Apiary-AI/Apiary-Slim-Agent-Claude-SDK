@@ -92,7 +92,7 @@ async def test_execute_timeout_calls_fail_task(executor, mock_superpos, mock_con
         # Just keep the coroutine alive — we never set claim_expired.
         await asyncio.sleep(5)
 
-    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None):
+    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None, **kwargs):
         # Simulate a Claude SDK iterator that hangs forever.
         # Pulse progress_event so the stall watchdog doesn't fire before the
         # overall timeout — this test exercises the timeout path, not stall.
@@ -134,7 +134,7 @@ async def test_execute_timeout_skips_fail_when_claim_already_expired(
         # Mimic the real reporter detecting a 409 immediately.
         claim_expired.set()
 
-    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None):
+    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None, **kwargs):
         if progress_event is not None:
             progress_event.set()
         await asyncio.sleep(10)
@@ -167,7 +167,7 @@ async def test_execute_timeout_records_recent_task(executor, mock_superpos, mock
     async def fake_report_progress(client, task_id, claim_expired, **kwargs):
         await asyncio.sleep(5)
 
-    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None):
+    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None, **kwargs):
         # Pulse progress_event so the stall watchdog doesn't fire before the
         # overall timeout — this test exercises the timeout path, not stall.
         if progress_event is not None:
@@ -202,7 +202,7 @@ async def test_execute_removes_task_after_claim_expiry(executor):
     async def fake_report_progress(client, task_id, claim_expired, **kwargs):
         claim_expired.set()
 
-    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None):
+    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None, **kwargs):
         await asyncio.sleep(10)  # blocks until cancelled
 
     req = ExecutionRequest(
@@ -242,22 +242,26 @@ def test_build_options_cwd_override(executor, mock_config):
 
 def test_build_options_injects_persona_when_set(executor_with_persona):
     opts = executor_with_persona._build_options()
-    assert opts.append_system_prompt == "You are a helpful assistant."
+    # Persona leads the system prompt; the always-on ask-tool steer follows.
+    assert opts.append_system_prompt.startswith("You are a helpful assistant.")
+    assert "Asking the user a question" in opts.append_system_prompt
 
 
 def test_build_options_no_system_prompt_when_persona_none(executor):
+    # Even with no persona, the ask-tool steer note is always appended.
     opts = executor._build_options()
-    assert opts.append_system_prompt is None
+    assert "Asking the user a question" in (opts.append_system_prompt or "")
 
 
 def test_build_options_combines_persona_and_system_prompt_append(executor_with_persona):
     opts = executor_with_persona._build_options(system_prompt_append="## Extra\nDo stuff.")
-    assert opts.append_system_prompt == "You are a helpful assistant.\n\n## Extra\nDo stuff."
+    assert opts.append_system_prompt.startswith("You are a helpful assistant.")
+    assert "## Extra\nDo stuff." in opts.append_system_prompt
 
 
 def test_build_options_system_prompt_append_only(executor):
     opts = executor._build_options(system_prompt_append="## Hint\nDo worktree.")
-    assert opts.append_system_prompt == "## Hint\nDo worktree."
+    assert "## Hint\nDo worktree." in opts.append_system_prompt
 
 
 # --- _execute_inner calls ensure_worktree when branch + isolation enabled ---
@@ -520,7 +524,7 @@ async def test_status_busy_on_first_task_only(executor, mock_superpos, mock_conf
     mock_config.executor_worktree_isolation = True
     mock_config.executor_working_dir = "/workspace"
 
-    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None):
+    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None, **kwargs):
         await asyncio.sleep(0.1)
 
     with patch.object(executor, "_execute_inner", fake_execute_inner), \
@@ -549,7 +553,7 @@ async def test_status_online_when_all_done(executor, mock_superpos, mock_config)
     mock_config.executor_worktree_isolation = True
     mock_config.executor_working_dir = "/workspace"
 
-    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None):
+    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None, **kwargs):
         await asyncio.sleep(0.1)
 
     with patch.object(executor, "_execute_inner", fake_execute_inner), \
@@ -583,7 +587,7 @@ async def test_same_branch_tasks_serialize(executor, mock_config):
 
     execution_log = []
 
-    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None):
+    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None, **kwargs):
         execution_log.append(f"start-{req.prompt}")
         await asyncio.sleep(0.05)
         execution_log.append(f"end-{req.prompt}")
@@ -2350,7 +2354,7 @@ async def test_resumed_telegram_serialises_with_explicit_branch_on_same_branch(
 
     log_events: list[str] = []
 
-    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None):
+    async def fake_execute_inner(req, streamer, retries, *, pre_resolved=None, progress_event=None, **kwargs):
         log_events.append(f"start-{req.chat_id}")
         await asyncio.sleep(0.05)
         log_events.append(f"end-{req.chat_id}")

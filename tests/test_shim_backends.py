@@ -58,7 +58,9 @@ def test_from_env_reads_web_search_mcp(monkeypatch):
 def test_native_keeps_hosted_tools_and_no_search_mcp(executor):
     """Default (native Anthropic) — hosted tools stay, no replacement MCP."""
     opts = executor._build_options()
-    assert opts.disallowed_tools == []
+    # AskUserQuestion is always disabled (steered to the MCP tool); the
+    # hosted web tools stay enabled on native Anthropic.
+    assert opts.disallowed_tools == ["AskUserQuestion"]
     assert "minimax" not in (opts.mcp_servers or {})
     assert "web_search" not in (opts.mcp_servers or {})
 
@@ -72,7 +74,7 @@ def test_native_ignores_web_search_mcp(
     ex = ClaudeExecutor(mock_config, mock_runtime, mock_superpos, mock_gateway)
     opts = ex._build_options()
 
-    assert opts.disallowed_tools == []
+    assert opts.disallowed_tools == ["AskUserQuestion"]
     assert "web_search" not in (opts.mcp_servers or {})
 
 
@@ -87,7 +89,7 @@ def test_shim_disables_hosted_tools_and_adds_minimax_mcp(
     ex = ClaudeExecutor(mock_config, mock_runtime, mock_superpos, mock_gateway)
     opts = ex._build_options()
 
-    assert opts.disallowed_tools == ["WebSearch", "WebFetch"]
+    assert opts.disallowed_tools == ["AskUserQuestion", "WebSearch", "WebFetch"]
     assert "minimax" in opts.mcp_servers
     mm = opts.mcp_servers["minimax"]
     assert mm["command"] == "uvx"
@@ -112,7 +114,7 @@ def test_shim_with_custom_search_mcp(
     ex = ClaudeExecutor(mock_config, mock_runtime, mock_superpos, mock_gateway)
     opts = ex._build_options()
 
-    assert opts.disallowed_tools == ["WebSearch", "WebFetch"]
+    assert opts.disallowed_tools == ["AskUserQuestion", "WebSearch", "WebFetch"]
     assert "minimax" not in opts.mcp_servers
     ws = opts.mcp_servers["web_search"]
     assert ws["type"] == "stdio"  # defaulted when absent from the JSON
@@ -158,7 +160,7 @@ def test_invalid_web_search_mcp_adds_no_server(
     opts = ex._build_options()
 
     # Dead hosted tools are still disabled; the broken config is dropped.
-    assert opts.disallowed_tools == ["WebSearch", "WebFetch"]
+    assert opts.disallowed_tools == ["AskUserQuestion", "WebSearch", "WebFetch"]
     assert "web_search" not in (opts.mcp_servers or {})
 
 
@@ -172,7 +174,7 @@ def test_shim_without_key_disables_tools_but_adds_no_mcp(
     opts = ex._build_options()
 
     # Dead hosted tools are still disabled even without a search MCP configured.
-    assert opts.disallowed_tools == ["WebSearch", "WebFetch"]
+    assert opts.disallowed_tools == ["AskUserQuestion", "WebSearch", "WebFetch"]
     assert "minimax" not in (opts.mcp_servers or {})
     assert "web_search" not in (opts.mcp_servers or {})
 
