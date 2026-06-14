@@ -11,6 +11,7 @@ run in CI.
 
 import json
 
+import mcp.types as _mcp_types
 import pytest
 
 from superpos_agent_core import AskAlreadyPending
@@ -23,6 +24,35 @@ from superpos_agent_claude.claude_executor import (
     _AskContext,
     _ask_context_var,
 )
+
+
+@pytest.fixture
+def call_tool(executor):
+    """Drive the ask_user tool through the *real* SDK MCP adapter path.
+
+    Unlike the ``handler`` fixture (which calls the in-process handler
+    directly and sees its raw return/raised exception), this builds the actual
+    ``create_sdk_mcp_server`` instance and invokes its registered
+    CallToolRequest handler — the same path Claude exercises at runtime.  This
+    is what catches the regression: ``create_sdk_mcp_server`` forwards only
+    ``content`` and drops a returned ``is_error`` flag, so an error must be
+    surfaced by *raising* for ``CallToolResult.isError`` to come back True.
+    """
+    config = executor._build_ask_mcp_server()
+    server = config["instance"] if isinstance(config, dict) else config.instance
+    request_handler = server.request_handlers[_mcp_types.CallToolRequest]
+
+    async def _invoke(arguments):
+        req = _mcp_types.CallToolRequest(
+            method="tools/call",
+            params=_mcp_types.CallToolRequestParams(
+                name=_ASK_MCP_TOOL, arguments=arguments
+            ),
+        )
+        server_result = await request_handler(req)
+        return server_result.root  # CallToolResult
+
+    return _invoke
 
 
 @pytest.fixture
@@ -166,7 +196,7 @@ async def test_handler_passes_executor_gateway(executor, monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_handler_already_pending_returns_tool_error(handler, monkeypatch):
+async def test_handler_already_pending_raises_tool_error(handler, monkeypatch):
     async def fake_ask(*a, **k):
         raise AskAlreadyPending("busy")
 
@@ -174,12 +204,14 @@ async def test_handler_already_pending_returns_tool_error(handler, monkeypatch):
 
     _, calls, token = _set_ctx()
     try:
-        result = await handler({"questions": QUESTIONS})
+        # The handler raises so the SDK MCP adapter surfaces isError=True
+        # (a returned is_error dict would be silently dropped — see the
+        # call_tool adapter-path regression tests below).
+        with pytest.raises(RuntimeError, match="already pending"):
+            await handler({"questions": QUESTIONS})
     finally:
         _ask_context_var.reset(token)
 
-    assert result["is_error"] is True
-    assert "already pending" in result["content"][0]["text"].lower()
     # still resumes the watchdog even on the error path
     assert calls["pause"] == 1
     assert calls["resume"] == 1
@@ -220,11 +252,76 @@ async def test_handler_without_context_fails_closed(handler, monkeypatch):
     # ensure no context is set
     token = _ask_context_var.set(None)
     try:
-        result = await handler({"questions": QUESTIONS})
+        # Raises so the error survives the SDK MCP adapter (see call_tool
+        # adapter-path regression tests below).
+        with pytest.raises(RuntimeError, match="no active conversation context"):
+            await handler({"questions": QUESTIONS})
     finally:
         _ask_context_var.reset(token)
 
-    assert result["is_error"] is True
+
+# ── SDK MCP adapter path: error state must survive create_sdk_mcp_server ───
+#
+# create_sdk_mcp_server (claude-code-sdk 0.0.25) forwards only the handler's
+# ``content`` and never reads a returned ``is_error`` flag, so the bundled mcp
+# low-level server builds CallToolResult(isError=False) and the error is lost.
+# The only SDK-supported channel is to *raise*: the mcp call_tool decorator
+# wraps a raised exception into CallToolResult(isError=True) preserving the
+# message.  These tests drive the real request handler so they would fail
+# against the old "return {... 'is_error': True}" code.
+
+
+@pytest.mark.asyncio
+async def test_adapter_no_context_yields_iserror(call_tool, monkeypatch):
+    async def fake_ask(*a, **k):  # pragma: no cover - must not be called
+        raise AssertionError("ask_user_question should not be called")
+
+    monkeypatch.setattr(ce, "ask_user_question", fake_ask)
+
+    token = _ask_context_var.set(None)
+    try:
+        result = await call_tool({"questions": QUESTIONS})
+    finally:
+        _ask_context_var.reset(token)
+
+    assert result.isError is True
+    assert "no active conversation context" in result.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_adapter_already_pending_yields_iserror(call_tool, monkeypatch):
+    async def fake_ask(*a, **k):
+        raise AskAlreadyPending("busy")
+
+    monkeypatch.setattr(ce, "ask_user_question", fake_ask)
+
+    _, _, token = _set_ctx()
+    try:
+        result = await call_tool({"questions": QUESTIONS})
+    finally:
+        _ask_context_var.reset(token)
+
+    assert result.isError is True
+    assert "already pending" in result.content[0].text.lower()
+
+
+@pytest.mark.asyncio
+async def test_adapter_success_is_not_iserror(call_tool, monkeypatch):
+    """Sanity check: the happy path stays isError=False through the adapter."""
+    async def fake_ask(chat_id, thread_id, questions, *, gateway, timeout, **kw):
+        return {"answers": [{"selected": ["Yes"]}], "timed_out": False}
+
+    monkeypatch.setattr(ce, "ask_user_question", fake_ask)
+
+    _, _, token = _set_ctx()
+    try:
+        result = await call_tool({"questions": QUESTIONS})
+    finally:
+        _ask_context_var.reset(token)
+
+    assert result.isError is False
+    payload = json.loads(result.content[0].text)
+    assert payload["answers"][0]["selected"] == ["Yes"]
 
 
 # ── Registration / steering ───────────────────────────────────────────────
@@ -301,9 +398,10 @@ async def test_concurrent_ask_second_already_pending_keeps_watchdog_paused(
         await asyncio.wait_for(first_parked.wait(), timeout=1)
         assert paused.is_set()  # first question paused the watchdog
 
-        # Second concurrent call fails fast with AskAlreadyPending.
-        second_result = await handler({"questions": QUESTIONS})
-        assert second_result["is_error"] is True
+        # Second concurrent call fails fast with AskAlreadyPending, surfaced
+        # as a raised tool error.
+        with pytest.raises(RuntimeError, match="already pending"):
+            await handler({"questions": QUESTIONS})
 
         # CRITICAL: the second call's pause/resume must net to zero and leave
         # the first call's pause in effect — watchdog still paused.

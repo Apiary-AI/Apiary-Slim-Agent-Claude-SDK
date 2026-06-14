@@ -459,17 +459,14 @@ class ClaudeExecutor(Executor):
             ctx = _ask_context_var.get()
             if ctx is None:
                 # No live run context — shouldn't happen during a real query;
-                # fail closed rather than send to an unknown chat.
-                return {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "ask_user is unavailable: no active "
-                            "conversation context.",
-                        }
-                    ],
-                    "is_error": True,
-                }
+                # fail closed rather than send to an unknown chat.  Raise so the
+                # error survives the SDK MCP adapter: create_sdk_mcp_server only
+                # forwards ``content`` and drops a returned ``is_error`` flag,
+                # whereas the mcp low-level server wraps a raised exception into
+                # a CallToolResult(isError=True) with the message preserved.
+                raise RuntimeError(
+                    "ask_user is unavailable: no active conversation context."
+                )
 
             questions = args.get("questions") or []
             # Pause the stall watchdog while a question is parked.  pause/resume
@@ -488,18 +485,15 @@ class ClaudeExecutor(Executor):
                     gateway=self._gateway,
                     timeout=ask_timeout,
                 )
-            except AskAlreadyPending:
-                return {
-                    "content": [
-                        {
-                            "type": "text",
-                            "text": "A question is already pending in this "
-                            "chat. Wait for the user to answer it before "
-                            "asking another.",
-                        }
-                    ],
-                    "is_error": True,
-                }
+            except AskAlreadyPending as exc:
+                # Re-raise as a tool error: the SDK adapter drops a returned
+                # ``is_error`` flag, so only a raised exception reaches Claude
+                # as CallToolResult(isError=True).  The ``finally`` below still
+                # balances the pause/resume; it does not suppress the raise.
+                raise RuntimeError(
+                    "A question is already pending in this chat. Wait for the "
+                    "user to answer it before asking another."
+                ) from exc
             finally:
                 ctx.resume()
 
