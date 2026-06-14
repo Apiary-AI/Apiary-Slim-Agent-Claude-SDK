@@ -264,6 +264,65 @@ def test_build_options_system_prompt_append_only(executor):
     assert "## Hint\nDo worktree." in opts.append_system_prompt
 
 
+# --- _build_options enable_ask gating (interactive vs background) ---
+
+def test_build_options_no_ask_path_omits_ask_server_and_steer(executor):
+    """enable_ask=False (background) gives a plain no-ask path: no superpos_ask
+    MCP server, no AskUserQuestion-disable, no steering note."""
+    from superpos_agent_claude.claude_executor import _ASK_MCP_SERVER
+
+    opts = executor._build_options(enable_ask=False)
+    # ask MCP server not registered
+    assert _ASK_MCP_SERVER not in (opts.mcp_servers or {})
+    # native AskUserQuestion left enabled (not shadowed/disabled)
+    assert "AskUserQuestion" not in (opts.disallowed_tools or [])
+    # no steering note in the system prompt
+    assert "Asking the user a question" not in (opts.append_system_prompt or "")
+
+
+def test_build_options_ask_path_still_registers_ask(executor):
+    """enable_ask defaults to True — the interactive path keeps the full ask
+    wiring (regression guard so the gating didn't disable it everywhere)."""
+    from superpos_agent_claude.claude_executor import _ASK_MCP_SERVER
+
+    opts = executor._build_options()
+    assert _ASK_MCP_SERVER in opts.mcp_servers
+    assert "AskUserQuestion" in opts.disallowed_tools
+    assert "Asking the user a question" in (opts.append_system_prompt or "")
+
+
+@pytest.mark.asyncio
+async def test_run_background_uses_no_ask_options(executor):
+    """Background tasks must run on the plain no-ask path: run_background builds
+    options with enable_ask=False so a parked question can't fail/hang without
+    an _AskContext or streaming."""
+    from superpos_agent_claude.claude_executor import _ASK_MCP_SERVER
+
+    captured = {}
+
+    async def _empty():
+        if False:  # pragma: no cover - never yields
+            yield None
+
+    real_build = executor._build_options
+
+    def _capture_build(*args, **kwargs):
+        captured["enable_ask"] = kwargs.get("enable_ask", True)
+        opts = real_build(*args, **kwargs)
+        captured["opts"] = opts
+        return opts
+
+    with patch.object(executor, "_build_options", side_effect=_capture_build), \
+         patch("superpos_agent_claude.claude_executor.query", return_value=_empty()):
+        await executor.run_background("task-1", "do a dream", task_type="dream")
+
+    assert captured["enable_ask"] is False
+    opts = captured["opts"]
+    assert _ASK_MCP_SERVER not in (opts.mcp_servers or {})
+    assert "AskUserQuestion" not in (opts.disallowed_tools or [])
+    assert "Asking the user a question" not in (opts.append_system_prompt or "")
+
+
 # --- _execute_inner calls ensure_worktree when branch + isolation enabled ---
 
 async def test_execute_inner_calls_ensure_worktree_for_superpos_with_branch(

@@ -472,6 +472,13 @@ class ClaudeExecutor(Executor):
                 }
 
             questions = args.get("questions") or []
+            # Pause the stall watchdog while a question is parked.  pause/resume
+            # are reference-counted (see _execute), so concurrent ask calls
+            # nest safely: the watchdog only un-pauses once every parked
+            # question has resolved.  A call that hits AskAlreadyPending still
+            # balances its own pause/resume here, and because the owning call's
+            # pause is still outstanding the count never reaches zero while a
+            # valid question is pending.
             ctx.pause()
             try:
                 result = await ask_user_question(
@@ -1110,12 +1117,17 @@ class ClaudeExecutor(Executor):
         watcher_task: asyncio.Task | None = None
         stall_watchdog: asyncio.Task | None = None
         progress_event = asyncio.Event()
-        # Set while an interactive AskUserQuestion is parked awaiting a human
-        # reply.  No SDK messages flow during that window, so the stall
-        # watchdog must not treat the silence as a deadlock; the claim/zombie
-        # guards likewise tolerate the wait.  _execute_inner pulses this via
-        # the pause/resume callbacks threaded into the ask MCP tool context.
+        # Set while one or more interactive AskUserQuestions are parked
+        # awaiting a human reply.  No SDK messages flow during that window, so
+        # the stall watchdog must not treat the silence as a deadlock; the
+        # claim/zombie guards likewise tolerate the wait.  _execute_inner
+        # pulses this via the pause/resume callbacks threaded into the ask MCP
+        # tool context.  Reference-counted (not a bare flag) so concurrent ask
+        # calls nest: if Claude emits two ask tool calls and the second fails
+        # fast with AskAlreadyPending, its resume must not un-pause the
+        # watchdog while the first question is still legitimately waiting.
         ask_pending = asyncio.Event()
+        ask_pending_count = 0
         stalled = False
 
         async def _watch_claim_expiry() -> None:
@@ -1152,15 +1164,26 @@ class ClaudeExecutor(Executor):
         def _pause_watchdog() -> None:
             """Suspend the stall watchdog while a question is parked.
 
-            Also pulses ``progress_event`` (and, for superpos tasks, lets the
-            claim-expiry watcher's heartbeat keep flowing) so neither the
-            stall timer nor the claim watchdog fires during the human wait.
+            Reference-counted: the watchdog pauses on the 0→1 transition and
+            stays paused until every parked question has resumed.  Also pulses
+            ``progress_event`` (and, for superpos tasks, lets the claim-expiry
+            watcher's heartbeat keep flowing) so neither the stall timer nor
+            the claim watchdog fires during the human wait.
             """
+            nonlocal ask_pending_count
+            ask_pending_count += 1
             ask_pending.set()
             progress_event.set()
 
         def _resume_watchdog() -> None:
-            ask_pending.clear()
+            nonlocal ask_pending_count
+            if ask_pending_count > 0:
+                ask_pending_count -= 1
+            # Only un-pause once the last outstanding question resolves — a
+            # second, AskAlreadyPending-failing call decrements its own
+            # increment but leaves the owning question's pause in effect.
+            if ask_pending_count == 0:
+                ask_pending.clear()
             # Treat the answer as fresh progress so the stall deadline resets
             # from now rather than from before the (long) human pause.
             progress_event.set()
@@ -1329,7 +1352,11 @@ class ClaudeExecutor(Executor):
 
         async def _run_inner() -> None:
             nonlocal full_text
-            options = self._build_options()
+            # Background tasks have no Telegram round-trip context and don't
+            # stream, so the interactive ask path can't route a question.
+            # Disable it: plain no-ask options (no superpos_ask server, no
+            # steering note, native AskUserQuestion left enabled).
+            options = self._build_options(enable_ask=False)
             async for message in query(prompt=prompt, options=options):
                 text = self._extract_text(message)
                 if text:
@@ -1421,7 +1448,20 @@ class ClaudeExecutor(Executor):
         resume_session: str | None = None,
         cwd: str | None = None,
         system_prompt_append: str | None = None,
+        *,
+        enable_ask: bool = True,
     ) -> ClaudeCodeOptions:
+        """Assemble ``ClaudeCodeOptions`` for a query.
+
+        ``enable_ask`` controls the interactive AskUserQuestion-over-Telegram
+        wiring.  When True (interactive ``_execute_inner`` path) the in-process
+        ``superpos_ask`` MCP server is registered, the native AskUserQuestion
+        tool is disabled, and a steering note nudges the model toward the MCP
+        tool.  Background tasks (``run_background``) pass False: they never
+        publish an ``_AskContext`` and don't stream, so a parked question could
+        not be routed — they get a plain no-ask path instead (no ask server, no
+        steering note, native AskUserQuestion left untouched).
+        """
         opts: dict = {
             "model": self._runtime.model,
             "max_turns": self._config.executor_max_turns,
@@ -1445,30 +1485,45 @@ class ClaudeExecutor(Executor):
                 "debug-to-stderr": None,
             },
         }
-        if self._mcp:
-            opts["mcp_servers"] = self._mcp
+        # The interactive ask path needs the in-process superpos_ask MCP
+        # server; background tasks (enable_ask=False) get the plain server set
+        # without it so the native AskUserQuestion is never shadowed by a tool
+        # that can't route its question (no _AskContext, no streaming).
+        if enable_ask:
+            mcp_servers = self._mcp
+        else:
+            mcp_servers = {
+                k: v for k, v in self._mcp.items() if k != _ASK_MCP_SERVER
+            }
+        if mcp_servers:
+            opts["mcp_servers"] = mcp_servers
         if resume_session:
             opts["resume"] = resume_session
         # Steer the model away from the native AskUserQuestion tool (handled
         # opaquely inside the CLI subprocess, so it never reaches Telegram)
         # toward our in-process MCP tool, which renders an inline keyboard and
-        # feeds the answer back as the tool result.
-        disallowed = ["AskUserQuestion"]
+        # feeds the answer back as the tool result.  Only on the interactive
+        # path — background tasks leave AskUserQuestion enabled and skip the
+        # steering note.
+        disallowed: list[str] = []
         parts = []
         if self._persona:
             parts.append(self._persona)
-        parts.append(
-            "## Asking the user a question\n"
-            "When you need the user to choose between options or confirm a "
-            f"direction, call the `{_ASK_MCP_TOOL_FQN}` tool (NOT the native "
-            "AskUserQuestion tool, which is disabled). It renders interactive "
-            "buttons in the chat and returns the user's selection. Pass a "
-            "`questions` array, each with a `header`, the `question` text, and "
-            "1-4 `options` (each `{label, description, preview?}`); set "
-            "`multiSelect: true` to allow multiple picks. If the result is "
-            "marked `timed_out`, the user did not respond — proceed sensibly "
-            "without their input."
-        )
+        if enable_ask:
+            disallowed.append("AskUserQuestion")
+            parts.append(
+                "## Asking the user a question\n"
+                "When you need the user to choose between options or confirm a "
+                f"direction, call the `{_ASK_MCP_TOOL_FQN}` tool (NOT the "
+                "native AskUserQuestion tool, which is disabled). It renders "
+                "interactive buttons in the chat and returns the user's "
+                "selection. Pass a `questions` array, each with a `header`, "
+                "the `question` text, and 1-4 `options` (each "
+                "`{label, description, preview?}`); set `multiSelect: true` to "
+                "allow multiple picks. If the result is marked `timed_out`, "
+                "the user did not respond — proceed sensibly without their "
+                "input."
+            )
         # On a shim backend, Anthropic's hosted WebSearch/WebFetch 400.
         # Disable them so the model stops calling dead tools, and point it
         # at the replacement search MCP when one was wired at startup.

@@ -249,6 +249,80 @@ def test_build_options_steers_to_mcp_tool_in_system_prompt(executor):
 
 
 @pytest.mark.asyncio
+async def test_concurrent_ask_second_already_pending_keeps_watchdog_paused(
+    handler, monkeypatch
+):
+    """Two concurrent ask calls must not let the second (which fails fast with
+    AskAlreadyPending) un-pause the stall watchdog while the first question is
+    still parked.
+
+    The watchdog pause is reference-counted in _execute via the pause/resume
+    callbacks; here we replicate that counter and drive two handler calls
+    through it.  The pause must stay engaged (count > 0) the whole time the
+    first, still-valid question is pending.
+    """
+    import asyncio
+
+    # Reference-counted pause mirroring _execute's _pause_watchdog/_resume.
+    paused = asyncio.Event()
+    count = {"n": 0}
+    pause_max = {"n": 0}  # high-water mark, to confirm both calls nested
+
+    def _pause():
+        count["n"] += 1
+        pause_max["n"] = max(pause_max["n"], count["n"])
+        paused.set()
+
+    def _resume():
+        if count["n"] > 0:
+            count["n"] -= 1
+        if count["n"] == 0:
+            paused.clear()
+
+    # First call parks until we release it; second call raises AskAlreadyPending
+    # (a question is already pending for the chat).
+    first_parked = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def fake_ask(chat_id, thread_id, questions, *, gateway, timeout, **kw):
+        if not first_parked.is_set():
+            first_parked.set()
+            await release_first.wait()
+            return {"answers": [], "timed_out": False}
+        raise AskAlreadyPending("busy")
+
+    monkeypatch.setattr(ce, "ask_user_question", fake_ask)
+
+    ctx = _AskContext(chat_id=1, thread_id=None, pause=_pause, resume=_resume)
+    token = _ask_context_var.set(ctx)
+    try:
+        # Start the first (parking) call.
+        first = asyncio.create_task(handler({"questions": QUESTIONS}))
+        await asyncio.wait_for(first_parked.wait(), timeout=1)
+        assert paused.is_set()  # first question paused the watchdog
+
+        # Second concurrent call fails fast with AskAlreadyPending.
+        second_result = await handler({"questions": QUESTIONS})
+        assert second_result["is_error"] is True
+
+        # CRITICAL: the second call's pause/resume must net to zero and leave
+        # the first call's pause in effect — watchdog still paused.
+        assert paused.is_set(), (
+            "watchdog wrongly un-paused while first question still pending"
+        )
+        assert count["n"] == 1
+        assert pause_max["n"] == 2  # both calls did nest the pause
+
+        # Releasing the first question finally un-pauses the watchdog.
+        release_first.set()
+        await asyncio.wait_for(first, timeout=1)
+        assert not paused.is_set()
+        assert count["n"] == 0
+    finally:
+        _ask_context_var.reset(token)
+
+
+@pytest.mark.asyncio
 async def test_stall_watchdog_paused_while_question_pending(
     executor, mock_config, monkeypatch
 ):
