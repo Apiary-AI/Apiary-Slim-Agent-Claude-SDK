@@ -63,6 +63,24 @@ def test_exit_tail_preserved_even_when_pure_noise(tmp_path):
     assert "dispatch_end" in out or "Hooks" in out
 
 
+def test_connection_closed_teardown_surfaces_when_buried(tmp_path):
+    # The MCP connector teardown ("connection closed after ...") is a key
+    # signal, but it can be followed by more than the 6 raw exit-tail lines.
+    # It must be matched by the signal filter so it is never dropped.
+    teardown = (
+        '2026-06-14T10:36:36.485Z [DEBUG] MCP server "claude.ai Gmail": '
+        "CLAUDEAI-PROXY connection closed after 964s (cleanly)"
+    )
+    # _NOISE is 18 lines, far more than the 6-line exit tail, so the
+    # teardown can only appear if the signal filter matched it.
+    path = _write(tmp_path, _SIGNAL + "\n" + teardown + "\n" + _NOISE)
+    out = _read_captured_stderr(path)
+    # The signal path was taken (other _SIGNAL lines matched)...
+    assert "…(filtered to signal lines; full debug elided)…" in out
+    # ...and the teardown line, buried beyond the raw exit tail, survived.
+    assert "connection closed after 964s" in out
+
+
 def test_error_keywords_are_treated_as_signal(tmp_path):
     text = _NOISE + "\n2026-06-14T10:36:40Z [ERROR] overloaded_error: 529\n" + _NOISE
     out = _read_captured_stderr(_write(tmp_path, text))
