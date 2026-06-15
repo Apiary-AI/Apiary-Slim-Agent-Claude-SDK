@@ -236,12 +236,18 @@ _STDERR_READ_WINDOW = 256 * 1024
 # human wants even when it doesn't match the signal filter.
 _STDERR_EXIT_TAIL_LINES = 6
 
-# ``BaseExceptionGroup`` is a builtin only on Py3.11+.  On Py3.10 there is no
-# group type, so ``_flatten_exception`` simply treats every exception as a leaf.
+# ``BaseExceptionGroup`` is a builtin only on Py3.11+.  On Py3.10 AnyIO still
+# raises group-wrapped failures during TaskGroup teardown, but it uses the
+# ``exceptiongroup`` backport rather than a builtin — so fall back to that so
+# the Py3.10 path recognizes groups too instead of treating them as opaque
+# leaves.
 try:
     _BASE_EXCEPTION_GROUP: type[BaseException] | None = BaseExceptionGroup
 except NameError:  # pragma: no cover - Py3.10 fallback
-    _BASE_EXCEPTION_GROUP = None
+    try:
+        from exceptiongroup import BaseExceptionGroup as _BASE_EXCEPTION_GROUP  # py3.10 backport
+    except ImportError:  # pragma: no cover - backport not installed
+        _BASE_EXCEPTION_GROUP = None
 
 
 def _flatten_exception(e: BaseException) -> list[BaseException]:
@@ -255,9 +261,10 @@ def _flatten_exception(e: BaseException) -> list[BaseException]:
     leaves rather than the top-level wrapper.
     """
     # ``BaseExceptionGroup`` is the Py3.11 builtin (``ExceptionGroup`` is its
-    # narrower subclass); both expose ``.exceptions``.  ``_BASE_EXCEPTION_GROUP``
-    # is ``None`` on Py3.10 where the builtin doesn't exist — there are no
-    # exception groups there, so every exception is simply its own leaf.
+    # narrower subclass); both expose ``.exceptions``.  On Py3.10
+    # ``_BASE_EXCEPTION_GROUP`` is the ``exceptiongroup`` backport class that
+    # AnyIO actually raises.  It is only ``None`` if the backport is missing,
+    # in which case every exception is simply its own leaf.
     is_group = (
         _BASE_EXCEPTION_GROUP is not None and isinstance(e, _BASE_EXCEPTION_GROUP)
     )

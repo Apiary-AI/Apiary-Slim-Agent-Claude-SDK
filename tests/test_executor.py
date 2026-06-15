@@ -2711,18 +2711,21 @@ async def test_low_stall_timeout_does_not_false_cancel_during_backoff(
 # a TaskGroup". The real CLIConnectionError/ProcessError signal lives in the
 # leaves, so the executor must flatten the group before classifying.
 
-import builtins  # noqa: E402
-
 from claude_code_sdk import CLIConnectionError, ProcessError  # noqa: E402
 from claude_code_sdk.types import SystemMessage  # noqa: E402
-from superpos_agent_claude.claude_executor import _flatten_exception  # noqa: E402
+from superpos_agent_claude.claude_executor import (  # noqa: E402
+    _BASE_EXCEPTION_GROUP,
+    _flatten_exception,
+)
 
-# ``BaseExceptionGroup`` is a Py3.11+ builtin; fetch it indirectly so the
-# group-wrapping tests are skipped (rather than failing to collect) on Py3.10,
-# matching the runtime fallback in claude_executor._flatten_exception.
-_ExcGroup = getattr(builtins, "BaseExceptionGroup", None)
+# Use the exact group type the module under test resolves: the Py3.11+ builtin
+# ``BaseExceptionGroup`` or, on Py3.10, the ``exceptiongroup`` backport AnyIO
+# actually raises. This exercises the Py3.10 path instead of skipping it. It is
+# only ``None`` if the backport is missing (a misconfigured Py3.10 env).
+_ExcGroup = _BASE_EXCEPTION_GROUP
 _needs_exc_group = pytest.mark.skipif(
-    _ExcGroup is None, reason="BaseExceptionGroup requires Python 3.11+",
+    _ExcGroup is None,
+    reason="exceptiongroup backport required on Python 3.10",
 )
 
 
