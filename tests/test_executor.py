@@ -420,9 +420,9 @@ async def test_execute_inner_falls_back_when_worktree_fails(executor, mock_confi
     captured_cwd = []
     original_build = executor._build_options
 
-    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None, **kwargs):
         captured_cwd.append(cwd)
-        return original_build(resume_session=resume_session, cwd=cwd, system_prompt_append=system_prompt_append)
+        return original_build(resume_session=resume_session, cwd=cwd, system_prompt_append=system_prompt_append, **kwargs)
 
     async def _empty():
         return
@@ -455,9 +455,9 @@ async def test_execute_inner_injects_worktree_hint_for_telegram_with_isolation(
     captured_appends = []
     original_build = executor._build_options
 
-    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None, **kwargs):
         captured_appends.append(system_prompt_append)
-        return original_build(resume_session=resume_session, cwd=cwd, system_prompt_append=system_prompt_append)
+        return original_build(resume_session=resume_session, cwd=cwd, system_prompt_append=system_prompt_append, **kwargs)
 
     async def _empty():
         return
@@ -486,9 +486,9 @@ async def test_execute_inner_git_branching_hint_when_isolation_disabled(executor
     captured_appends = []
     original_build = executor._build_options
 
-    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None, **kwargs):
         captured_appends.append(system_prompt_append)
-        return original_build(resume_session=resume_session, cwd=cwd, system_prompt_append=system_prompt_append)
+        return original_build(resume_session=resume_session, cwd=cwd, system_prompt_append=system_prompt_append, **kwargs)
 
     async def _empty():
         return
@@ -689,9 +689,9 @@ async def test_execute_inner_injects_worktree_hint_for_superpos_without_branch(
     captured_appends = []
     original_build = executor._build_options
 
-    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None, **kwargs):
         captured_appends.append(system_prompt_append)
-        return original_build(resume_session=resume_session, cwd=cwd, system_prompt_append=system_prompt_append)
+        return original_build(resume_session=resume_session, cwd=cwd, system_prompt_append=system_prompt_append, **kwargs)
 
     async def _empty():
         return
@@ -737,11 +737,11 @@ async def test_execute_inner_resumes_session_after_cli_crash(
     captured_resumes = []
     original_build = executor._build_options
 
-    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None, **kwargs):
         captured_resumes.append(resume_session)
         return original_build(
             resume_session=resume_session, cwd=cwd,
-            system_prompt_append=system_prompt_append,
+            system_prompt_append=system_prompt_append, **kwargs,
         )
 
     result_msg = ResultMessage(
@@ -975,11 +975,11 @@ async def test_execute_inner_resumes_session_from_init_message(
     captured_resumes = []
     original_build = executor._build_options
 
-    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None, **kwargs):
         captured_resumes.append(resume_session)
         return original_build(
             resume_session=resume_session, cwd=cwd,
-            system_prompt_append=system_prompt_append,
+            system_prompt_append=system_prompt_append, **kwargs,
         )
 
     init_msg = SystemMessage(
@@ -1111,11 +1111,11 @@ async def test_telegram_request_sees_recent_superpos_task_in_system_prompt(
     captured_appends: list[str | None] = []
     original_build = executor._build_options
 
-    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None, **kwargs):
         captured_appends.append(system_prompt_append)
         return original_build(
             resume_session=resume_session, cwd=cwd,
-            system_prompt_append=system_prompt_append,
+            system_prompt_append=system_prompt_append, **kwargs,
         )
 
     async def succeed():
@@ -1591,11 +1591,11 @@ async def test_resume_kept_when_stored_version_older_than_current(
     captured_resumes: list[str | None] = []
     original_build = executor._build_options
 
-    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None, **kwargs):
         captured_resumes.append(resume_session)
         return original_build(
             resume_session=resume_session, cwd=cwd,
-            system_prompt_append=system_prompt_append,
+            system_prompt_append=system_prompt_append, **kwargs,
         )
 
     async def succeed():
@@ -1637,11 +1637,11 @@ async def test_resume_kept_when_versions_match(executor, mock_config):
     captured_resumes: list[str | None] = []
     original_build = executor._build_options
 
-    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None, **kwargs):
         captured_resumes.append(resume_session)
         return original_build(
             resume_session=resume_session, cwd=cwd,
-            system_prompt_append=system_prompt_append,
+            system_prompt_append=system_prompt_append, **kwargs,
         )
 
     async def succeed():
@@ -1688,11 +1688,11 @@ async def test_unversioned_session_kept_once_persona_version_known(
     captured_resumes: list[str | None] = []
     original_build = executor._build_options
 
-    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None, **kwargs):
         captured_resumes.append(resume_session)
         return original_build(
             resume_session=resume_session, cwd=cwd,
-            system_prompt_append=system_prompt_append,
+            system_prompt_append=system_prompt_append, **kwargs,
         )
 
     async def succeed():
@@ -1733,11 +1733,11 @@ async def test_unversioned_session_kept_when_persona_version_not_known(
     captured_resumes: list[str | None] = []
     original_build = executor._build_options
 
-    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None, **kwargs):
         captured_resumes.append(resume_session)
         return original_build(
             resume_session=resume_session, cwd=cwd,
-            system_prompt_append=system_prompt_append,
+            system_prompt_append=system_prompt_append, **kwargs,
         )
 
     async def succeed():
@@ -2771,11 +2771,11 @@ async def test_group_wrapped_cli_crash_resumes_with_session(executor, mock_confi
     resume_sessions: list = []
     original_build = executor._build_options
 
-    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None, **kwargs):
         resume_sessions.append(resume_session)
         return original_build(
             resume_session=resume_session, cwd=cwd,
-            system_prompt_append=system_prompt_append,
+            system_prompt_append=system_prompt_append, **kwargs,
         )
 
     def query_side_effect(*args, **kwargs):
@@ -2809,7 +2809,12 @@ async def test_group_wrapped_cli_crash_resumes_with_session(executor, mock_confi
 async def test_group_wrapped_pre_init_crash_retries_fresh(executor, mock_config):
     """A group-wrapped crash before init (no session id, no output) retries
     from scratch: resume_id stays None and the original prompt is reused (no
-    'continue your previous session' framing)."""
+    'continue your previous session' framing).
+
+    On a native backend the first attempt streams with the ask MCP server, so
+    the first pre-init crash trips the degrade safeguard: the second attempt
+    drops the optional MCPs and falls back to the bare string prompt.  Either
+    way the prompt content is the original (no resume framing)."""
     mock_config.executor_worktree_isolation = False
 
     req = ExecutionRequest(prompt="ORIGINAL PROMPT", chat_id="123", source="telegram")
@@ -2835,15 +2840,19 @@ async def test_group_wrapped_pre_init_crash_retries_fresh(executor, mock_config)
     resume_sessions: list = []
     original_build = executor._build_options
 
-    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None, **kwargs):
         resume_sessions.append(resume_session)
         return original_build(
             resume_session=resume_session, cwd=cwd,
-            system_prompt_append=system_prompt_append,
+            system_prompt_append=system_prompt_append, **kwargs,
         )
 
-    async def collect_prompt(it):
-        async for m in it:
+    async def collect_prompt(p):
+        # The prompt is either the streaming AsyncIterable (native, attempt 1)
+        # or the bare string (degraded fallback, attempt 2).
+        if isinstance(p, str):
+            return p
+        async for m in p:
             return m["message"]["content"]
         return None
 
@@ -2857,10 +2866,134 @@ async def test_group_wrapped_pre_init_crash_retries_fresh(executor, mock_config)
     # Never resumed (no session to resume) — fresh retry path.
     assert resume_sessions == [None, None]
     # Both invocations reuse the original prompt, not the resume framing.
-    contents = [await collect_prompt(it) for it in prompts_seen]
+    contents = [await collect_prompt(p) for p in prompts_seen]
     assert len(contents) == 2
     assert all(c == "ORIGINAL PROMPT" for c in contents), contents
     assert all("continue from where you left off" not in c for c in contents)
+
+
+@_needs_exc_group
+async def test_pre_init_crash_degrades_strips_optional_mcps_then_succeeds(
+    executor, mock_config,
+):
+    """A pre-init crash with optional MCP servers present (regression #34)
+    degrades on retry: the second attempt strips the ask/search MCP servers,
+    drops streaming back to the bare string prompt, and emits the one-time
+    degraded message. The degraded attempt then succeeds."""
+    from superpos_agent_claude.claude_executor import _ASK_MCP_SERVER
+
+    mock_config.executor_worktree_isolation = False
+    req = ExecutionRequest(prompt="DO WORK", chat_id="123", source="telegram")
+
+    crash = _ExcGroup(
+        "unhandled errors in a TaskGroup (1 sub-exception)",
+        [CLIConnectionError("CLI crashed before starting (exit ?)")],
+    )
+
+    captured_opts: list = []
+    captured_prompts: list = []
+    original_build = executor._build_options
+
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None, **kwargs):
+        opts = original_build(
+            resume_session=resume_session, cwd=cwd,
+            system_prompt_append=system_prompt_append, **kwargs,
+        )
+        captured_opts.append(opts)
+        return opts
+
+    calls = {"n": 0}
+
+    def query_side_effect(*args, **kwargs):
+        calls["n"] += 1
+        captured_prompts.append(kwargs.get("prompt") or (args[0] if args else None))
+
+        async def _gen():
+            if calls["n"] == 1:
+                # Pre-init crash: no init message emitted before the crash.
+                raise crash
+            # Degraded attempt: emit init, then complete cleanly.
+            yield SystemMessage(subtype="init", data={"session_id": "sess-ok"})
+        return _gen()
+
+    with patch("superpos_agent_claude.claude_executor.query", side_effect=query_side_effect), \
+         patch.object(executor, "_build_options", side_effect=capture_build), \
+         patch.object(executor, "_backoff_sleep", new_callable=AsyncMock), \
+         patch("superpos_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = _wired_streamer(MockStreamer)
+        await executor._execute_inner(req, streamer, retries=3)
+
+    # Exactly two query attempts: crash, then the degraded success.
+    assert calls["n"] == 2
+
+    # Attempt 1 (native): streaming + ask server present.
+    assert _ASK_MCP_SERVER in (captured_opts[0].mcp_servers or {})
+    # Attempt 2 (degraded): optional MCPs stripped.
+    assert _ASK_MCP_SERVER not in (captured_opts[1].mcp_servers or {})
+
+    # Attempt 1 used the streaming iterable; attempt 2 fell back to a string.
+    assert not isinstance(captured_prompts[0], str)
+    assert captured_prompts[1] == "DO WORK"
+
+    # The one-time degraded message was surfaced to the user.
+    appended = " ".join(
+        c.args[0] for c in streamer.append.await_args_list if c.args
+    )
+    assert "running without ask/search" in appended
+
+
+@_needs_exc_group
+async def test_pre_init_crash_degrade_is_bounded_no_infinite_loop(
+    executor, mock_config,
+):
+    """If a degraded attempt STILL crashes pre-init, the run does not strip-
+    and-re-add forever: degrade fires at most once, then it falls through to
+    the plain pre-init retry/backoff and finally surfaces an error. Bounded by
+    ``retries``."""
+    from superpos_agent_claude.claude_executor import _ASK_MCP_SERVER
+
+    mock_config.executor_worktree_isolation = False
+    req = ExecutionRequest(prompt="DO WORK", chat_id="123", source="telegram")
+
+    crash = _ExcGroup(
+        "unhandled errors in a TaskGroup (1 sub-exception)",
+        [CLIConnectionError("CLI crashed before starting (exit ?)")],
+    )
+
+    captured_opts: list = []
+    original_build = executor._build_options
+
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None, **kwargs):
+        opts = original_build(
+            resume_session=resume_session, cwd=cwd,
+            system_prompt_append=system_prompt_append, **kwargs,
+        )
+        captured_opts.append(opts)
+        return opts
+
+    def query_side_effect(*args, **kwargs):
+        async def _gen():
+            raise crash
+            yield  # pragma: no cover
+        return _gen()
+
+    with patch("superpos_agent_claude.claude_executor.query", side_effect=query_side_effect), \
+         patch.object(executor, "_build_options", side_effect=capture_build), \
+         patch.object(executor, "_backoff_sleep", new_callable=AsyncMock), \
+         patch("superpos_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = _wired_streamer(MockStreamer)
+        await executor._execute_inner(req, streamer, retries=3)
+
+    # Bounded by retries — exactly 3 attempts, then it surfaces an error
+    # (no infinite loop).
+    assert len(captured_opts) == 3
+    # Attempt 1 had the ask server; the degrade fires once for attempt 2,
+    # and attempt 3 stays degraded (never re-adds the optional MCPs).
+    assert _ASK_MCP_SERVER in (captured_opts[0].mcp_servers or {})
+    assert _ASK_MCP_SERVER not in (captured_opts[1].mcp_servers or {})
+    assert _ASK_MCP_SERVER not in (captured_opts[2].mcp_servers or {})
+    # The run terminated by surfacing an error rather than looping.
+    assert streamer.error.await_count == 1
 
 
 @_needs_exc_group

@@ -89,7 +89,14 @@ def test_shim_disables_hosted_tools_and_adds_minimax_mcp(
     ex = ClaudeExecutor(mock_config, mock_runtime, mock_superpos, mock_gateway)
     opts = ex._build_options()
 
-    assert opts.disallowed_tools == ["AskUserQuestion", "WebSearch", "WebFetch"]
+    # Regression (#34 fix): on a shim/minimax backend the interactive ask
+    # wiring is gated off — no superpos_ask server, AskUserQuestion is NOT
+    # disabled (nothing to steer toward). Only the dead hosted web tools are
+    # disallowed. The minimax search MCP stays.
+    from superpos_agent_claude.claude_executor import _ASK_MCP_SERVER
+
+    assert opts.disallowed_tools == ["WebSearch", "WebFetch"]
+    assert _ASK_MCP_SERVER not in (opts.mcp_servers or {})
     assert "minimax" in opts.mcp_servers
     mm = opts.mcp_servers["minimax"]
     assert mm["command"] == "uvx"
@@ -114,7 +121,7 @@ def test_shim_with_custom_search_mcp(
     ex = ClaudeExecutor(mock_config, mock_runtime, mock_superpos, mock_gateway)
     opts = ex._build_options()
 
-    assert opts.disallowed_tools == ["AskUserQuestion", "WebSearch", "WebFetch"]
+    assert opts.disallowed_tools == ["WebSearch", "WebFetch"]
     assert "minimax" not in opts.mcp_servers
     ws = opts.mcp_servers["web_search"]
     assert ws["type"] == "stdio"  # defaulted when absent from the JSON
@@ -160,7 +167,7 @@ def test_invalid_web_search_mcp_adds_no_server(
     opts = ex._build_options()
 
     # Dead hosted tools are still disabled; the broken config is dropped.
-    assert opts.disallowed_tools == ["AskUserQuestion", "WebSearch", "WebFetch"]
+    assert opts.disallowed_tools == ["WebSearch", "WebFetch"]
     assert "web_search" not in (opts.mcp_servers or {})
 
 
@@ -174,9 +181,71 @@ def test_shim_without_key_disables_tools_but_adds_no_mcp(
     opts = ex._build_options()
 
     # Dead hosted tools are still disabled even without a search MCP configured.
-    assert opts.disallowed_tools == ["AskUserQuestion", "WebSearch", "WebFetch"]
+    assert opts.disallowed_tools == ["WebSearch", "WebFetch"]
     assert "minimax" not in (opts.mcp_servers or {})
     assert "web_search" not in (opts.mcp_servers or {})
+
+
+# --- ask-MCP / streaming gating to native Anthropic (regression from #34) ---
+
+def test_shim_gates_off_ask_mcp_even_when_enable_ask_true(
+    mock_config, mock_runtime, mock_superpos, mock_gateway,
+):
+    """Regression (#34): on a shim/minimax backend, even the interactive path
+    (enable_ask=True, the default) must NOT include the superpos_ask SDK MCP
+    server or disable AskUserQuestion — the in-process SDK server + external
+    stdio MCP under the streaming control protocol crash the CLI handshake.
+    The minimax search MCP must still be present."""
+    from superpos_agent_claude.claude_executor import _ASK_MCP_SERVER
+
+    mock_config.is_native_anthropic = False
+    mock_config.minimax_api_key = "mm-key"
+    mock_config.anthropic_base_url = "https://api.minimax.io/anthropic"
+
+    ex = ClaudeExecutor(mock_config, mock_runtime, mock_superpos, mock_gateway)
+
+    # _ask_enabled is False regardless of the caller's enable_ask on a shim.
+    assert ex._ask_enabled(True) is False
+
+    opts = ex._build_options(enable_ask=True)
+    assert _ASK_MCP_SERVER not in (opts.mcp_servers or {})
+    assert "AskUserQuestion" not in (opts.disallowed_tools or [])
+    assert "Asking the user a question" not in (opts.append_system_prompt or "")
+    # The proven minimax-only search MCP survives.
+    assert "minimax" in opts.mcp_servers
+
+
+def test_native_keeps_ask_mcp_and_streaming_flag(executor):
+    """Native Anthropic keeps the #34 behavior: superpos_ask server registered,
+    AskUserQuestion disabled, steering note present, and _ask_enabled True so
+    _execute_inner uses streaming."""
+    from superpos_agent_claude.claude_executor import _ASK_MCP_SERVER
+
+    assert executor._ask_enabled(True) is True
+    opts = executor._build_options(enable_ask=True)
+    assert _ASK_MCP_SERVER in opts.mcp_servers
+    assert "AskUserQuestion" in opts.disallowed_tools
+    assert "Asking the user a question" in (opts.append_system_prompt or "")
+
+
+def test_strip_optional_mcp_drops_ask_and_search(
+    mock_config, mock_runtime, mock_superpos, mock_gateway,
+):
+    """strip_optional_mcp drops the optional MCP servers (ask + shim search)
+    while leaving the rest of the config intact (degrade safeguard)."""
+    from superpos_agent_claude.claude_executor import _ASK_MCP_SERVER
+
+    mock_config.minimax_api_key = "mm-key"
+    mock_config.is_native_anthropic = False
+    mock_config.anthropic_base_url = "https://api.minimax.io/anthropic"
+    ex = ClaudeExecutor(mock_config, mock_runtime, mock_superpos, mock_gateway)
+
+    opts = ex._build_options(enable_ask=True, strip_optional_mcp=True)
+    servers = opts.mcp_servers or {}
+    assert _ASK_MCP_SERVER not in servers
+    assert "minimax" not in servers
+    # Essential config (model/cwd/debug flags) is untouched.
+    assert opts.extra_args.get("debug-to-stderr", "MISSING") is None
 
 
 # --- CLI crash diagnostics ---

@@ -183,6 +183,13 @@ _ASK_MCP_SERVER = "superpos_ask"
 _ASK_MCP_TOOL = "ask_user"
 _ASK_MCP_TOOL_FQN = f"mcp__{_ASK_MCP_SERVER}__{_ASK_MCP_TOOL}"
 
+# MCP servers that are *optional* — nice-to-have tooling (the interactive ask
+# server and the shim web-search replacement) rather than load-bearing config.
+# When the CLI crashes before init with these present, the degrade safeguard in
+# ``_execute_inner`` strips them and retries without ask/search rather than
+# looping the identical failing config forever.
+_OPTIONAL_MCP_SERVERS = frozenset({_ASK_MCP_SERVER, "minimax", "web_search"})
+
 _original_open_process = anyio.open_process
 
 
@@ -221,6 +228,10 @@ anyio.open_process = _patched_open_process
 _STDERR_SIGNAL_RE = re.compile(
     r"\[API|Stream |first byte|Cleared connection cache|"
     r"connection closed|closed after|"
+    # MCP startup is the #34 crash site: keep any MCP/server/connection line so
+    # the fatal line right after `MCP server "minimax": Starting connection…`
+    # is captured instead of scrolling out of the tail window.
+    r"mcp|server|connection|"
     r"error|fail|fatal|exception|abort|disconnect|timeout|reset|"
     r"overload|rate.?limit|unauthorized|forbidden|"
     r"\b(?:401|403|429|500|502|503|529)\b|"
@@ -1477,6 +1488,20 @@ class ClaudeExecutor(Executor):
 
     # ── Options construction & inner execute ─────────────────────────────
 
+    def _ask_enabled(self, enable_ask: bool) -> bool:
+        """Whether the interactive ask wiring is actually active for a run.
+
+        The AskUserQuestion-over-Telegram feature requires the streaming
+        control protocol plus the in-process ``superpos_ask`` SDK MCP server.
+        That combination only works on a *native* Anthropic backend: on an
+        Anthropic-compatible shim (MiniMax/Kimi) the in-process SDK server +
+        external stdio MCP under the streaming control protocol fails the
+        CLI startup handshake (pre-init ``CLIConnectionError`` → crash-loop;
+        regression from #34).  Ask also makes no sense without a caller that
+        opted in (``enable_ask``), so both must hold.
+        """
+        return enable_ask and self._config.is_native_anthropic
+
     def _build_options(
         self,
         resume_session: str | None = None,
@@ -1484,18 +1509,28 @@ class ClaudeExecutor(Executor):
         system_prompt_append: str | None = None,
         *,
         enable_ask: bool = True,
+        strip_optional_mcp: bool = False,
     ) -> ClaudeCodeOptions:
         """Assemble ``ClaudeCodeOptions`` for a query.
 
         ``enable_ask`` controls the interactive AskUserQuestion-over-Telegram
-        wiring.  When True (interactive ``_execute_inner`` path) the in-process
+        wiring.  When True (interactive ``_execute_inner`` path) *and* the
+        backend is native Anthropic (see :meth:`_ask_enabled`), the in-process
         ``superpos_ask`` MCP server is registered, the native AskUserQuestion
         tool is disabled, and a steering note nudges the model toward the MCP
-        tool.  Background tasks (``run_background``) pass False: they never
-        publish an ``_AskContext`` and don't stream, so a parked question could
-        not be routed — they get a plain no-ask path instead (no ask server, no
-        steering note, native AskUserQuestion left untouched).
+        tool.  Background tasks (``run_background``) pass False, and shim/
+        minimax backends are gated off regardless: they never publish an
+        ``_AskContext`` / can't survive the streaming handshake, so a parked
+        question could not be routed — they get a plain no-ask path instead
+        (no ask server, no steering note, native AskUserQuestion left
+        untouched, string-prompt mode).
+
+        ``strip_optional_mcp`` (degrade safeguard) drops every optional MCP
+        server (ask + shim search) so a pre-init MCP startup crash can retry
+        without the tooling that failed the handshake instead of looping the
+        identical config forever.
         """
+        ask_active = self._ask_enabled(enable_ask)
         opts: dict = {
             "model": self._runtime.model,
             "max_turns": self._config.executor_max_turns,
@@ -1520,14 +1555,24 @@ class ClaudeExecutor(Executor):
             },
         }
         # The interactive ask path needs the in-process superpos_ask MCP
-        # server; background tasks (enable_ask=False) get the plain server set
-        # without it so the native AskUserQuestion is never shadowed by a tool
-        # that can't route its question (no _AskContext, no streaming).
-        if enable_ask:
-            mcp_servers = self._mcp
+        # server; background tasks (enable_ask=False) and shim/minimax backends
+        # get the plain server set without it so the native AskUserQuestion is
+        # never shadowed by a tool that can't route its question (no
+        # _AskContext, no streaming) — and so the SDK control-protocol startup
+        # handshake doesn't choke on the in-process server on a shim backend.
+        if ask_active:
+            mcp_servers = dict(self._mcp)
         else:
             mcp_servers = {
                 k: v for k, v in self._mcp.items() if k != _ASK_MCP_SERVER
+            }
+        # Degrade safeguard: a pre-init MCP startup crash retries with every
+        # optional MCP server stripped (ask + shim search) rather than looping
+        # the identical failing config.
+        if strip_optional_mcp:
+            mcp_servers = {
+                k: v for k, v in mcp_servers.items()
+                if k not in _OPTIONAL_MCP_SERVERS
             }
         if mcp_servers:
             opts["mcp_servers"] = mcp_servers
@@ -1543,7 +1588,7 @@ class ClaudeExecutor(Executor):
         parts = []
         if self._persona:
             parts.append(self._persona)
-        if enable_ask:
+        if ask_active:
             disallowed.append("AskUserQuestion")
             parts.append(
                 "## Asking the user a question\n"
@@ -1703,12 +1748,31 @@ class ClaudeExecutor(Executor):
         last_session_id: str | None = None
         effective_prompt = prompt_text
 
+        # The interactive ask wiring (in-process superpos_ask SDK MCP server +
+        # streaming control protocol) only works on a native Anthropic backend;
+        # on a shim/minimax backend it fails the CLI startup handshake (pre-init
+        # CLIConnectionError → crash-loop; regression from #34).  Gate streaming
+        # on the same flag _build_options uses for the ask server so the two
+        # stay in lockstep: native → streaming + ask, shim → string prompt + no
+        # ask (the proven pre-#34 path).
+        ask_active = self._ask_enabled(True)
+
+        # Attempt-scoped degrade flag for the durable safeguard (B): set once
+        # after a pre-init MCP startup crash so the next attempt strips the
+        # optional MCP servers (ask/search) and runs degraded.  Bounded — only
+        # flips False→True a single time; if a degraded attempt still crashes
+        # pre-init it falls through to the normal retry/backoff below rather
+        # than oscillating strip/re-add.
+        degraded = False
+
         # Streaming-input mode: ``query`` takes an ``AsyncIterable[dict]`` of
         # user messages rather than a bare string.  This is required for the
         # in-process MCP round-trip (the ask_user tool) and the SDK control
         # protocol — under the old one-shot string form the CLI owns tool
         # execution end-to-end and our tool handler never runs.  We yield the
-        # single user message, matching the SDK's documented shape.
+        # single user message, matching the SDK's documented shape.  Only used
+        # when ask is active; otherwise we pass the bare string (lighter, and
+        # what shim backends ran on healthily pre-#34).
         def _prompt_stream(text: str):
             async def _gen():
                 yield {
@@ -1724,13 +1788,23 @@ class ClaudeExecutor(Executor):
                 capture: dict = {}
                 capture_token = _stderr_capture_var.set(capture)
                 try:
+                    # Streaming is only safe/needed when ask is active; a
+                    # degraded retry (optional MCPs stripped) has no ask server,
+                    # so drop back to the string prompt too.
+                    stream_mode = ask_active and not degraded
                     options = self._build_options(
                         resume_session=resume_id,
                         cwd=cwd_override,
                         system_prompt_append=system_prompt_append,
+                        enable_ask=stream_mode,
+                        strip_optional_mcp=degraded,
+                    )
+                    query_prompt = (
+                        _prompt_stream(effective_prompt)
+                        if stream_mode else effective_prompt
                     )
                     async for message in query(
-                        prompt=_prompt_stream(effective_prompt), options=options,
+                        prompt=query_prompt, options=options,
                     ):
                         # Signal the stall watchdog that the SDK iterator is
                         # alive — every yielded message resets the deadline.
@@ -1899,6 +1973,53 @@ class ClaudeExecutor(Executor):
                             "Review your prior outputs in this session to see what was already done, "
                             "then continue from where you left off and finish the task."
                         )
+                        continue
+
+                    # Durable safeguard (B): a pre-init crash while optional MCP
+                    # servers were in play (the ask SDK server and/or the shim
+                    # search MCP) is most likely the MCP/streaming startup
+                    # handshake choking — exactly the #34 regression.  Rather
+                    # than loop the identical failing config forever, degrade
+                    # once: strip the optional MCP servers (and drop streaming,
+                    # which was only needed for the ask server) and retry from
+                    # scratch.  ``degraded`` is attempt-scoped and flips
+                    # False→True a single time; if the degraded attempt still
+                    # crashes pre-init it falls through to the plain pre-init
+                    # retry below, so we never oscillate strip↔re-add.
+                    optional_mcp_present = (
+                        not degraded
+                        and bool(
+                            (ask_active and _ASK_MCP_SERVER in self._mcp)
+                            or (set(self._mcp) & _OPTIONAL_MCP_SERVERS)
+                        )
+                    )
+                    if (
+                        is_cli_crash
+                        and not last_session_id
+                        and attempt < retries
+                        and not full_text.strip()
+                        and optional_mcp_present
+                    ):
+                        degraded = True
+                        wait = 5 * attempt
+                        log.warning(
+                            "Claude CLI crashed before init (exit %s, attempt "
+                            "%d/%d) with optional MCP servers present; retrying "
+                            "WITHOUT ask/search MCPs in %ds. CLI stderr:\n%s",
+                            exit_code, attempt, retries, wait,
+                            captured_stderr or "(no stderr captured)",
+                        )
+                        stderr_blurb = (
+                            f"\nCLI stderr tail:\n{captured_stderr}"
+                            if captured_stderr else ""
+                        )
+                        await streamer.append(
+                            "\n⚠️ MCP failed at startup; running without "
+                            f"ask/search this attempt.{stderr_blurb}\n",
+                        )
+                        await self._backoff_sleep(wait, progress_event)
+                        resume_id = None
+                        effective_prompt = prompt_text
                         continue
 
                     # Pre-``init`` crash: the CLI died before emitting a session
