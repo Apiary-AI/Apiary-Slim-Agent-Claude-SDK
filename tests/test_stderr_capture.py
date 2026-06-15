@@ -109,6 +109,24 @@ def test_connection_closed_teardown_is_signal(tmp_path):
     assert out.count("LSP Diagnostics") <= _STDERR_EXIT_TAIL_LINES
 
 
+def test_mcp_startup_fatal_line_is_surfaced(tmp_path):
+    # The #34 crash site: the fatal line lands right after the MCP server's
+    # "Starting connection…" log, then a flood of bookkeeping follows. The
+    # widened filter must keep the MCP/connection lines so the real cause is
+    # captured instead of scrolling out of the small raw exit tail.
+    mcp_seq = (
+        '2026-06-14T10:36:36.000Z [DEBUG] MCP server "minimax": Starting connection…\n'
+        '2026-06-14T10:36:36.100Z [DEBUG] MCP server "minimax": connection failed: '
+        "ProcessTransport is not ready for writing"
+    )
+    path = _write(tmp_path, mcp_seq + "\n" + _NOISE)
+    out = _read_captured_stderr(path)
+    assert 'MCP server "minimax": Starting connection' in out
+    assert "connection failed: ProcessTransport is not ready" in out
+    # It survives via the signal allowlist, above the trailing bookkeeping.
+    assert out.startswith("…(filtered to signal lines")
+
+
 def test_result_is_clamped_to_max_bytes(tmp_path):
     big = "\n".join(f"[API:timing] request {i} first byte after 10ms" for i in range(5000))
     out = _read_captured_stderr(_write(tmp_path, big), max_bytes=2048)
