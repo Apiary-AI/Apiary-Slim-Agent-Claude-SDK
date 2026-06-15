@@ -2702,3 +2702,220 @@ async def test_low_stall_timeout_does_not_false_cancel_during_backoff(
         "backoff_sleep should complete first; if the watcher finished "
         "first, it means the heartbeat was too slow"
     )
+
+
+# --- ExceptionGroup-wrapped CLI crash classification (unwrap → retry + hint) ---
+#
+# The SDK surfaces a CLI subprocess crash wrapped in a BaseExceptionGroup from
+# the anyio TaskGroup teardown, whose str() is the opaque "unhandled errors in
+# a TaskGroup". The real CLIConnectionError/ProcessError signal lives in the
+# leaves, so the executor must flatten the group before classifying.
+
+import builtins  # noqa: E402
+
+from claude_code_sdk import CLIConnectionError, ProcessError  # noqa: E402
+from claude_code_sdk.types import SystemMessage  # noqa: E402
+from superpos_agent_claude.claude_executor import _flatten_exception  # noqa: E402
+
+# ``BaseExceptionGroup`` is a Py3.11+ builtin; fetch it indirectly so the
+# group-wrapping tests are skipped (rather than failing to collect) on Py3.10,
+# matching the runtime fallback in claude_executor._flatten_exception.
+_ExcGroup = getattr(builtins, "BaseExceptionGroup", None)
+_needs_exc_group = pytest.mark.skipif(
+    _ExcGroup is None, reason="BaseExceptionGroup requires Python 3.11+",
+)
+
+
+def _wired_streamer(MockStreamer):
+    """Return a streamer whose awaited methods are AsyncMocks."""
+    streamer = MockStreamer.return_value
+    streamer.start = AsyncMock()
+    streamer.append = AsyncMock()
+    streamer.finish = AsyncMock()
+    streamer.error = AsyncMock()
+    streamer.send_tool_notification = AsyncMock()
+    return streamer
+
+
+@_needs_exc_group
+def test_flatten_exception_recurses_into_groups():
+    leaf = CLIConnectionError("ProcessTransport is not ready for writing")
+    group = _ExcGroup("unhandled errors in a TaskGroup", [leaf])
+    assert _flatten_exception(group) == [leaf]
+    # Nested groups flatten fully.
+    nested = _ExcGroup("outer", [group])
+    assert _flatten_exception(nested) == [leaf]
+    # A plain exception is its own only leaf.
+    plain = RuntimeError("boom")
+    assert _flatten_exception(plain) == [plain]
+
+
+@_needs_exc_group
+async def test_group_wrapped_cli_crash_resumes_with_session(executor, mock_config):
+    """A BaseExceptionGroup wrapping CLIConnectionError('ProcessTransport is
+    not ready') is a CLI crash: with a captured session id it resumes+retries,
+    and when retries are exhausted the surfaced error carries the OOM/crash hint
+    rather than the bare 'unhandled errors in a TaskGroup'."""
+    mock_config.executor_worktree_isolation = False
+
+    req = ExecutionRequest(prompt="do work", chat_id="123", source="telegram")
+
+    crash = _ExcGroup(
+        "unhandled errors in a TaskGroup (1 sub-exception)",
+        [CLIConnectionError("ProcessTransport is not ready for writing")],
+    )
+
+    resume_sessions: list = []
+    original_build = executor._build_options
+
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+        resume_sessions.append(resume_session)
+        return original_build(
+            resume_session=resume_session, cwd=cwd,
+            system_prompt_append=system_prompt_append,
+        )
+
+    def query_side_effect(*args, **kwargs):
+        async def _gen():
+            # Emit init so last_session_id is captured, then crash.
+            yield SystemMessage(subtype="init", data={"session_id": "sess-1"})
+            raise crash
+        return _gen()
+
+    with patch("superpos_agent_claude.claude_executor.query", side_effect=query_side_effect), \
+         patch.object(executor, "_build_options", side_effect=capture_build), \
+         patch.object(executor, "_backoff_sleep", new_callable=AsyncMock), \
+         patch("superpos_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = _wired_streamer(MockStreamer)
+        await executor._execute_inner(req, streamer, retries=2)
+
+    # First attempt resumes with no session; second attempt resumes the
+    # session captured from init (crash-resume path fired).
+    assert resume_sessions == [None, "sess-1"]
+
+    # Retries exhausted → error surfaced with OOM/crash hint, not the bare
+    # TaskGroup string.
+    assert streamer.error.await_count == 1
+    msg = streamer.error.await_args.args[0]
+    assert "unhandled errors in a TaskGroup" != msg
+    assert "OOM-killed or signaled" in msg or "Captured stderr" in msg
+    assert "ProcessTransport is not ready" in msg
+
+
+@_needs_exc_group
+async def test_group_wrapped_pre_init_crash_retries_fresh(executor, mock_config):
+    """A group-wrapped crash before init (no session id, no output) retries
+    from scratch: resume_id stays None and the original prompt is reused (no
+    'continue your previous session' framing)."""
+    mock_config.executor_worktree_isolation = False
+
+    req = ExecutionRequest(prompt="ORIGINAL PROMPT", chat_id="123", source="telegram")
+
+    crash = _ExcGroup(
+        "unhandled errors in a TaskGroup (1 sub-exception)",
+        [CLIConnectionError("ProcessTransport is not ready for writing")],
+    )
+
+    prompts_seen: list = []
+
+    def query_side_effect(*args, **kwargs):
+        # The prompt is yielded by the AsyncIterable passed as ``prompt``.
+        prompt_iter = kwargs.get("prompt") or (args[0] if args else None)
+        prompts_seen.append(prompt_iter)
+
+        async def _gen():
+            raise crash
+            yield  # pragma: no cover
+
+        return _gen()
+
+    resume_sessions: list = []
+    original_build = executor._build_options
+
+    def capture_build(resume_session=None, cwd=None, system_prompt_append=None):
+        resume_sessions.append(resume_session)
+        return original_build(
+            resume_session=resume_session, cwd=cwd,
+            system_prompt_append=system_prompt_append,
+        )
+
+    async def collect_prompt(it):
+        async for m in it:
+            return m["message"]["content"]
+        return None
+
+    with patch("superpos_agent_claude.claude_executor.query", side_effect=query_side_effect), \
+         patch.object(executor, "_build_options", side_effect=capture_build), \
+         patch.object(executor, "_backoff_sleep", new_callable=AsyncMock), \
+         patch("superpos_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = _wired_streamer(MockStreamer)
+        await executor._execute_inner(req, streamer, retries=2)
+
+    # Never resumed (no session to resume) — fresh retry path.
+    assert resume_sessions == [None, None]
+    # Both invocations reuse the original prompt, not the resume framing.
+    contents = [await collect_prompt(it) for it in prompts_seen]
+    assert len(contents) == 2
+    assert all(c == "ORIGINAL PROMPT" for c in contents), contents
+    assert all("continue from where you left off" not in c for c in contents)
+
+
+@_needs_exc_group
+async def test_group_wrapped_process_error_triggers_hint(executor, mock_config):
+    """A group wrapping a ProcessError triggers the stderr/OOM hint."""
+    mock_config.executor_worktree_isolation = False
+
+    req = ExecutionRequest(prompt="do work", chat_id="123", source="telegram")
+
+    crash = _ExcGroup(
+        "unhandled errors in a TaskGroup (1 sub-exception)",
+        [ProcessError("Command failed with exit code 137", exit_code=137)],
+    )
+
+    def query_side_effect(*args, **kwargs):
+        async def _gen():
+            raise crash
+            yield  # pragma: no cover
+        return _gen()
+
+    with patch("superpos_agent_claude.claude_executor.query", side_effect=query_side_effect), \
+         patch.object(executor, "_backoff_sleep", new_callable=AsyncMock), \
+         patch("superpos_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = _wired_streamer(MockStreamer)
+        await executor._execute_inner(req, streamer, retries=1)
+
+    assert streamer.error.await_count == 1
+    msg = streamer.error.await_args.args[0]
+    assert "OOM-killed or signaled" in msg or "Captured stderr" in msg
+    assert "Command failed with exit code 137" in msg
+
+
+async def test_non_group_rate_limit_still_classified(executor, mock_config):
+    """Regression: a plain (non-group) rate-limit error still retries on the
+    rate-limit path with backoff."""
+    mock_config.executor_worktree_isolation = False
+
+    req = ExecutionRequest(prompt="do work", chat_id="123", source="telegram")
+
+    def query_side_effect(*args, **kwargs):
+        async def _gen():
+            raise Exception("rate_limit exceeded, slow down")
+            yield  # pragma: no cover
+        return _gen()
+
+    with patch("superpos_agent_claude.claude_executor.query", side_effect=query_side_effect), \
+         patch.object(executor, "_backoff_sleep", new_callable=AsyncMock) as mock_sleep, \
+         patch("superpos_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = _wired_streamer(MockStreamer)
+        await executor._execute_inner(req, streamer, retries=2)
+
+    # Rate-limit retry backoff fired on the first attempt.
+    assert mock_sleep.await_count >= 1
+    rate_msgs = [
+        c.args[0] for c in streamer.append.await_args_list
+        if c.args and "Rate limited" in c.args[0]
+    ]
+    assert rate_msgs, "rate-limit retry note should have been streamed"
+    # Final surfaced error must not carry a CLI-crash hint (not a crash).
+    msg = streamer.error.await_args.args[0]
+    assert "OOM-killed" not in msg

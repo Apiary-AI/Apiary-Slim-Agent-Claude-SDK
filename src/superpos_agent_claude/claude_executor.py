@@ -23,6 +23,7 @@ import time
 import anyio
 from claude_code_sdk import (
     ClaudeCodeOptions,
+    CLIConnectionError,
     ClaudeSDKError,
     Message,
     ProcessError,
@@ -234,6 +235,38 @@ _STDERR_READ_WINDOW = 256 * 1024
 # Always keep this many trailing raw lines — the exit/teardown context a
 # human wants even when it doesn't match the signal filter.
 _STDERR_EXIT_TAIL_LINES = 6
+
+# ``BaseExceptionGroup`` is a builtin only on Py3.11+.  On Py3.10 there is no
+# group type, so ``_flatten_exception`` simply treats every exception as a leaf.
+try:
+    _BASE_EXCEPTION_GROUP: type[BaseException] | None = BaseExceptionGroup
+except NameError:  # pragma: no cover - Py3.10 fallback
+    _BASE_EXCEPTION_GROUP = None
+
+
+def _flatten_exception(e: BaseException) -> list[BaseException]:
+    """Return all leaf exceptions, recursing into ``(Base)ExceptionGroup``.
+
+    The SDK frequently surfaces a CLI subprocess crash wrapped in a
+    ``BaseExceptionGroup`` from the anyio TaskGroup teardown (``query.close()``),
+    whose ``str()`` is just ``"unhandled errors in a TaskGroup (...)"``.  The
+    real signal (``CLIConnectionError``/``ProcessError`` and exit-code text)
+    lives in the nested sub-exceptions, so classification must inspect the
+    leaves rather than the top-level wrapper.
+    """
+    # ``BaseExceptionGroup`` is the Py3.11 builtin (``ExceptionGroup`` is its
+    # narrower subclass); both expose ``.exceptions``.  ``_BASE_EXCEPTION_GROUP``
+    # is ``None`` on Py3.10 where the builtin doesn't exist — there are no
+    # exception groups there, so every exception is simply its own leaf.
+    is_group = (
+        _BASE_EXCEPTION_GROUP is not None and isinstance(e, _BASE_EXCEPTION_GROUP)
+    )
+    if is_group:
+        leaves: list[BaseException] = []
+        for sub in e.exceptions:  # type: ignore[attr-defined]
+            leaves.extend(_flatten_exception(sub))
+        return leaves
+    return [e]
 
 
 def _read_captured_stderr(path: str | None, max_bytes: int = 16384) -> str:
@@ -1760,7 +1793,17 @@ class ClaudeExecutor(Executor):
                     return
 
                 except (ClaudeSDKError, Exception) as e:
-                    err_str = str(e)
+                    # A CLI subprocess crash often arrives wrapped in a
+                    # ``BaseExceptionGroup`` from the anyio TaskGroup teardown,
+                    # whose ``str()`` is just "unhandled errors in a TaskGroup".
+                    # Flatten to the leaves and build a combined message (top
+                    # level + every leaf's str() and type name) so the substring
+                    # classifications below match signals living in a leaf.
+                    leaves = _flatten_exception(e)
+                    err_str = "\n".join(
+                        [str(e)]
+                        + [f"{type(leaf).__name__}: {leaf}" for leaf in leaves]
+                    )
                     captured_stderr = _read_captured_stderr(capture.get("path"))
                     is_rate_limit = "rate_limit" in err_str.lower()
                     is_oauth_expired = (
@@ -1802,14 +1845,32 @@ class ClaudeExecutor(Executor):
                         continue
 
                     # CLI subprocess crash — resume the session so completed tool
-                    # calls aren't re-run.
-                    is_cli_crash = (
+                    # calls aren't re-run.  Test the leaves too: the SDK wraps
+                    # the real CLIConnectionError/ProcessError inside an
+                    # ExceptionGroup, so a top-level isinstance check misses it.
+                    is_process_error = (
                         isinstance(e, ProcessError)
+                        or any(isinstance(x, ProcessError) for x in leaves)
+                    )
+                    is_connection_error = (
+                        isinstance(e, CLIConnectionError)
+                        or any(isinstance(x, CLIConnectionError) for x in leaves)
+                    )
+                    is_cli_crash = (
+                        is_process_error
+                        or is_connection_error
+                        or "ProcessTransport is not ready" in err_str
                         or "Command failed with exit code" in err_str
                     )
+                    # The exit code may live on a ProcessError leaf when the
+                    # crash is group-wrapped, so fall back to scanning leaves.
+                    process_leaf = next(
+                        (x for x in leaves if isinstance(x, ProcessError)),
+                        e if isinstance(e, ProcessError) else None,
+                    )
+                    exit_code = getattr(process_leaf, "exit_code", "?")
                     if is_cli_crash and last_session_id and attempt < retries:
                         wait = 5 * attempt
-                        exit_code = getattr(e, "exit_code", "?")
                         log.warning(
                             "Claude CLI crashed (exit %s, attempt %d/%d); "
                             "resuming session %s in %ds. CLI stderr:\n%s",
@@ -1831,6 +1892,37 @@ class ClaudeExecutor(Executor):
                             "Review your prior outputs in this session to see what was already done, "
                             "then continue from where you left off and finish the task."
                         )
+                        continue
+
+                    # Pre-``init`` crash: the CLI died before emitting a session
+                    # id (e.g. OOM at startup), so there's nothing to resume.
+                    # With no output produced yet there are no side effects to
+                    # duplicate, so retry from scratch with the original prompt
+                    # (no resume, no "continue your session" framing).
+                    if (
+                        is_cli_crash
+                        and not last_session_id
+                        and attempt < retries
+                        and not full_text.strip()
+                    ):
+                        wait = 5 * attempt
+                        log.warning(
+                            "Claude CLI crashed before init (exit %s, attempt %d/%d); "
+                            "retrying from scratch in %ds. CLI stderr:\n%s",
+                            exit_code, attempt, retries, wait,
+                            captured_stderr or "(no stderr captured)",
+                        )
+                        stderr_blurb = (
+                            f"\nCLI stderr tail:\n{captured_stderr}"
+                            if captured_stderr else ""
+                        )
+                        await streamer.append(
+                            f"\n⏳ CLI crashed before starting (exit {exit_code}), "
+                            f"retrying in {wait}s...{stderr_blurb}\n",
+                        )
+                        await self._backoff_sleep(wait, progress_event)
+                        resume_id = None
+                        effective_prompt = prompt_text
                         continue
 
                     if full_text.strip():
@@ -1859,10 +1951,11 @@ class ClaudeExecutor(Executor):
                     else:
                         log.exception("Unexpected error during execution")
                     hint = ""
-                    if (
-                        isinstance(e, ProcessError)
-                        or "Command failed with exit code" in err_str
-                    ):
+                    # Fire for the wrapped case too: ``is_cli_crash`` already
+                    # accounts for ProcessError/CLIConnectionError leaves and the
+                    # exit-code/ProcessTransport signatures, so the OOM guidance
+                    # reaches the user even when the crash is group-wrapped.
+                    if is_cli_crash:
                         if captured_stderr:
                             hint = (
                                 f"\n💡 The Claude CLI subprocess crashed. "
@@ -1875,8 +1968,12 @@ class ClaudeExecutor(Executor):
                                 "Check `docker logs <agent>` and `dmesg` near this "
                                 "timestamp."
                             )
+                    # The raw top-level ``str(e)`` for a group-wrapped crash is
+                    # the opaque "unhandled errors in a TaskGroup" — surface the
+                    # flattened message instead so the real cause is visible.
+                    surfaced = err_str if is_cli_crash else str(e)
                     try:
-                        await streamer.error(f"Error: {e}{hint}")
+                        await streamer.error(f"Error: {surfaced}{hint}")
                     except asyncio.CancelledError:
                         log.warning("CancelledError while sending error to Telegram (suppressed)")
                     except Exception:
