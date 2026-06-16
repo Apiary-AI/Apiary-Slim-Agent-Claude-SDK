@@ -30,8 +30,8 @@ Fill in your `.env`:
 | `CLAUDE_EFFORT` | No | Effort level: low, medium, high, max (default: high) |
 | `CLAUDE_MAX_TURNS` | No | Default: 30 |
 | `CLAUDE_WORKING_DIR` | No | Default: /workspace |
-| `ANTHROPIC_BASE_URL` | No | Route through an Anthropic-compatible backend (MiniMax, Kimi, …) |
-| `WEB_SEARCH_MCP` | No | JSON MCP server config replacing web search on non-Anthropic backends |
+| `ANTHROPIC_BASE_URL` | No | Route through an Anthropic-compatible backend (MiniMax, Kimi, GLM, …) |
+| `WEB_SEARCH_MCP` | No | JSON MCP server config (stdio or remote http/sse) replacing web search on non-Anthropic backends |
 
 Superpos variables are optional — if omitted, only the Telegram bot runs.
 
@@ -173,7 +173,55 @@ docker run --env-file .env superpos-claude-agent
 
 Kimi ships no web-search MCP of its own, so a Kimi-backed agent has no web access out of the box — coding tasks work fine, but for web lookups set `WEB_SEARCH_MCP` (next section).
 
+### Alternative: GLM / Z.ai (Anthropic-compatible endpoint)
+
+[GLM](https://docs.z.ai/scenario-example/develop-tools/claude) (Zhipu AI, via Z.ai) exposes an Anthropic-compatible endpoint too, so it routes through the bundled `claude` CLI with no code changes. Get an API key from the [Z.ai console](https://z.ai/manage-apikey/apikey-list); `GLM-4.7` is the current coding default, with `GLM-4.5-Air` for lighter tasks.
+
+Skip OAuth and put these in your `.env`:
+
+```bash
+ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic   # or open.bigmodel.cn/api/anthropic for mainland China
+ANTHROPIC_AUTH_TOKEN=your-zai-api-key
+CLAUDE_MODEL=GLM-4.7
+API_TIMEOUT_MS=3000000   # recommended by Z.ai's docs for long coding turns
+ANTHROPIC_DEFAULT_SONNET_MODEL=GLM-4.7
+ANTHROPIC_DEFAULT_OPUS_MODEL=GLM-4.7
+ANTHROPIC_DEFAULT_HAIKU_MODEL=GLM-4.5-Air
+```
+
+Then run as normal:
+
+```bash
+docker run --env-file .env superpos-claude-agent
+```
+
+Unlike Kimi, Z.ai ships its **own** web-search MCP (`web_search_prime`), included with a GLM Coding Plan — wire it via `WEB_SEARCH_MCP` using the remote-server form shown in the next section.
+
 ### Web search on alternative backends
+
+Anthropic's hosted WebSearch/WebFetch tools exist only on Anthropic's own API — on any other `ANTHROPIC_BASE_URL` they fail with HTTP 400. The agent detects the shim from the base URL, disables the dead hosted tools, and wires a replacement web-search MCP chosen by precedence:
+
+1. **`WEB_SEARCH_MCP` set** — that server is mounted (as `web_search`) and the model is pointed at it. Works on any shim backend. The value is a JSON MCP server config, in one of two forms:
+
+   - **Local stdio server** (`command` + `args`) — any stdio search provider, e.g. [Tavily](https://github.com/tavily-ai/tavily-mcp) (free tier ~1k queries/month):
+
+     ```bash
+     WEB_SEARCH_MCP={"command":"npx","args":["-y","tavily-mcp"],"env":{"TAVILY_API_KEY":"tvly-your-key"}}
+     ```
+
+   - **Remote HTTP/SSE server** (`url` + optional `headers`) — e.g. GLM / Z.ai's own [`web_search_prime`](https://docs.z.ai/devpack/mcp/search-mcp-server) (no local install; metered against your GLM Coding Plan):
+
+     ```bash
+     WEB_SEARCH_MCP={"url":"https://api.z.ai/api/mcp/web_search_prime/mcp","headers":{"Authorization":"Bearer your-zai-api-key"}}
+     ```
+
+   `type` defaults to `http` when a `url` is given and `stdio` when a `command` is given; set it explicitly (e.g. `"type":"sse"`) to override.
+
+2. **else `MINIMAX_API_KEY` set** — MiniMax's own web-search MCP (`uvx minimax-coding-plan-mcp`) is mounted. The natural default for a MiniMax backend.
+
+3. **else** — no web access; a warning is logged at startup.
+
+On a native Anthropic backend none of this applies: the hosted tools are used and `WEB_SEARCH_MCP` is ignored.
 
 Anthropic's hosted WebSearch/WebFetch tools exist only on Anthropic's own API — on any other `ANTHROPIC_BASE_URL` they fail with HTTP 400. The agent detects the shim from the base URL, disables the dead hosted tools, and wires a replacement web-search MCP chosen by precedence:
 
