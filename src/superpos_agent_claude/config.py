@@ -37,9 +37,12 @@ class ClaudeConfig(BaseConfig):
     # is kept separate from the model auth token on purpose.
     minimax_api_key: str = ""
     minimax_api_host: str = "https://api.minimax.io"
-    # Replacement web-search MCP for shim backends that don't ship their own
-    # (e.g. Kimi): a JSON stdio-server config such as
-    # {"command": "npx", "args": ["-y", "tavily-mcp"], "env": {...}}.
+    # Replacement web-search MCP for shim backends whose hosted WebSearch is
+    # dead. A JSON MCP server config, either a local stdio server, e.g.
+    # {"command": "npx", "args": ["-y", "tavily-mcp"], "env": {...}}  (Kimi),
+    # or a remote HTTP/SSE server, e.g.
+    # {"url": "https://api.z.ai/api/mcp/web_search_prime/mcp",
+    #  "headers": {"Authorization": "Bearer <key>"}}  (GLM / Z.ai).
     # Takes precedence over the MiniMax MCP when both are set; ignored on
     # native Anthropic where the hosted WebSearch/WebFetch tools are used.
     web_search_mcp: str = ""
