@@ -223,20 +223,6 @@ Anthropic's hosted WebSearch/WebFetch tools exist only on Anthropic's own API �
 
 On a native Anthropic backend none of this applies: the hosted tools are used and `WEB_SEARCH_MCP` is ignored.
 
-Anthropic's hosted WebSearch/WebFetch tools exist only on Anthropic's own API — on any other `ANTHROPIC_BASE_URL` they fail with HTTP 400. The agent detects the shim from the base URL, disables the dead hosted tools, and wires a replacement web-search MCP chosen by precedence:
-
-1. **`WEB_SEARCH_MCP` set** — that server is mounted (as `web_search`) and the model is pointed at it. Works on any shim backend. The value is a JSON stdio-server config; any MCP search provider works, e.g. [Tavily](https://github.com/tavily-ai/tavily-mcp) (free tier ~1k queries/month):
-
-   ```bash
-   WEB_SEARCH_MCP={"command":"npx","args":["-y","tavily-mcp"],"env":{"TAVILY_API_KEY":"tvly-your-key"}}
-   ```
-
-2. **else `MINIMAX_API_KEY` set** — MiniMax's own web-search MCP (`uvx minimax-coding-plan-mcp`) is mounted. The natural default for a MiniMax backend.
-
-3. **else** — no web access; a warning is logged at startup.
-
-On a native Anthropic backend none of this applies: the hosted tools are used and `WEB_SEARCH_MCP` is ignored.
-
 ## Multi-agent setup (Docker Compose)
 
 Run multiple independent agents, each with its own Telegram bot and Superpos registration.
