@@ -65,7 +65,7 @@ superpos-tracks patch foo --title "Foo (revised)"
 
 # Issue (issue_id is positional; patch only the fields you pass):
 superpos-issues update <issue-ULID> --description 'Updated [[proposal-foo]] reference'
-superpos-issues transition <issue-ULID> <state>    # drive the state machine
+superpos-issues transition <issue-ULID> --to <state>  # drive the state machine
 superpos-issues close <issue-ULID>                 # policy-aware close
 
 # Knowledge page (resolve by --type+--slug, or pass exact --id for older pages):
