@@ -1023,6 +1023,7 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "claude-code-sdk" },
+    { name = "exceptiongroup", marker = "python_full_version < '3.11'" },
     { name = "httpx" },
     { name = "python-telegram-bot" },
     { name = "pyyaml" },
@@ -1038,27 +1039,28 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "claude-code-sdk", specifier = ">=0.0.25" },
+    { name = "exceptiongroup", marker = "python_full_version < '3.11'" },
     { name = "httpx", specifier = ">=0.27.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "python-telegram-bot", specifier = ">=21.0" },
     { name = "pyyaml", specifier = ">=6.0" },
-    { name = "superpos-agent-core", specifier = "~=0.1.7" },
+    { name = "superpos-agent-core", specifier = "~=0.1.12" },
 ]
 provides-extras = ["dev"]
 
 [[package]]
 name = "superpos-agent-core"
-version = "0.1.8"
+version = "0.1.12"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
     { name = "python-telegram-bot" },
     { name = "pyyaml" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/50/cf/22bb384d005f4d8ad32f54cd7290da2acda9f4bdab454f78f85078b0f462/superpos_agent_core-0.1.8.tar.gz", hash = "sha256:449aeec0c44e544a80c4d04675814b987baf10ddd72958727212038b8729dbcc", size = 188957, upload-time = "2026-06-11T16:56:57.345Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/67/82/8900b1b2d154262229008422643716d74a9b54599fdd9a0ab6711f8b7a89/superpos_agent_core-0.1.12.tar.gz", hash = "sha256:875f9706559bd377a067da384630b1e43a4d71a63028b20ff40a4c0827292899", size = 214758, upload-time = "2026-06-14T16:37:21.821Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e6/22/5151fd47fc936c32f309684cb12bc93bb4829415a91b3c579aa6fd6c0f56/superpos_agent_core-0.1.8-py3-none-any.whl", hash = "sha256:5bf7906c9800895cf45d440fc0a17ccdffe433d4734a30b0dd5783657a5b70ca", size = 144298, upload-time = "2026-06-11T16:56:56.136Z" },
+    { url = "https://files.pythonhosted.org/packages/a8/38/797eeb6b7cce8a7e2b53af4bac9be3ca8c2b2a9bd1a6ec165e164fc5803c/superpos_agent_core-0.1.12-py3-none-any.whl", hash = "sha256:5cbbaac3081e1f551586639a7ff7b8dcf3bc2515e5aa30a1c2585bd03a8cff40", size = 161552, upload-time = "2026-06-14T16:37:20.24Z" },
 ]
 
 [[package]]
