@@ -51,10 +51,19 @@ python3 -m superpos_agent_core.github_auth setup \
 # build-time symlinks to workspace scripts, and the core-bundled
 # fallback block below re-links scripts from the installed package, so
 # both workspace and core-bundled tools stay callable from PATH.
+#
+# --skills-dir makes the registry SKILLS overlay run (and warms the
+# last-good /registry/resolved cache on a successful fetch). Without it,
+# module_setup overlays registry *modules* only and silently skips the
+# skills half, so agents run on baked-in skills alone. Registry skills
+# materialise into $WORKING_DIR/.claude/skills (registry wins on slug
+# collision); the baked-in *.md files stay as the fallback that the
+# overlay degrades to when the registry fetch fails.
 python3 -m superpos_agent_core.module_setup \
     --modules-dir "$WORKING_DIR/.claude/modules" \
     --agents-md "$WORKING_DIR/CLAUDE.md" \
     --bin-dir "$WORKING_DIR/.claude/modules-bin" \
+    --skills-dir "$WORKING_DIR/.claude/skills" \
     || echo "Warning: module setup failed (build-time workspace symlinks remain in place)"
 
 # Fallback: ensure core-bundled module scripts survive a module_setup
