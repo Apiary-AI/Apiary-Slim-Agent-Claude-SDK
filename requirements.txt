@@ -1,5 +1,10 @@
 superpos-agent-core~=0.1.12
-claude-code-sdk>=0.0.25
+# Pinned exactly: must match the CLI pin in Dockerfile (@anthropic-ai/claude-code@2.0.14).
+# 0.0.25 is the last release under this (now-deprecated) package name; migrating to
+# claude-agent-sdk is deferred (see issue #40) because the executor monkeypatches
+# private SDK internals. An open-ended >= here silently resolves to whatever is latest
+# and drifts from the pinned CLI.
+claude-code-sdk==0.0.25
 python-telegram-bot>=21.0
 httpx>=0.27.0
 pyyaml>=6.0
