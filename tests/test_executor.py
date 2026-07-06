@@ -444,6 +444,82 @@ async def test_execute_inner_falls_back_when_worktree_fails(executor, mock_confi
     assert captured_cwd[0] is None
 
 
+# --- backstop: a pre-init 'unknown option --effort' crash drops --effort ---
+
+async def test_execute_inner_drops_effort_after_unknown_option_crash(
+    executor, mock_config
+):
+    """A MiniMax/older-CLI agent crash-looped: the executor passed --effort,
+    the CLI rejected it (``error: unknown option '--effort'``) before init, and
+    the identical failing command retried forever.
+
+    The backstop must: detect the rejection, retry once WITHOUT --effort, set
+    the sticky ``_effort_unsupported`` flag, and let the run complete — never
+    loop the identical failing command.
+    """
+    from claude_agent_sdk._errors import ProcessError
+    from claude_agent_sdk.types import ResultMessage, SystemMessage
+
+    mock_config.executor_worktree_isolation = False
+
+    req = ExecutionRequest(
+        prompt="do the thing", chat_id="123", source="superpos",
+        superpos_task_id="task-effort",
+    )
+
+    # Record the ``drop_effort`` value each attempt is built with.
+    build_drop_effort: list[bool] = []
+    original_build = executor._build_options
+
+    def capture_build(*args, **kwargs):
+        build_drop_effort.append(bool(kwargs.get("drop_effort", False)))
+        return original_build(*args, **kwargs)
+
+    # Attempt 1 raises the effort rejection pre-init; attempt 2 succeeds.
+    effort_err = ProcessError(
+        "Command failed with exit code 1",
+        exit_code=1,
+        stderr="error: unknown option '--effort'",
+    )
+
+    async def _ok_stream():
+        yield SystemMessage(subtype="init", data={"session_id": "sess-1"})
+        yield ResultMessage(
+            subtype="success", duration_ms=1, duration_api_ms=1,
+            is_error=False, num_turns=1, session_id="sess-1",
+            result="done",
+        )
+
+    calls = {"n": 0}
+
+    def fake_query(*, prompt, options):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise effort_err
+        return _ok_stream()
+
+    with patch.object(executor, "_build_options", side_effect=capture_build), \
+         patch.object(executor, "_backoff_sleep", new_callable=AsyncMock), \
+         patch("superpos_agent_claude.claude_executor.query", side_effect=fake_query), \
+         patch("superpos_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = MockStreamer.return_value
+        streamer.append = AsyncMock()
+        streamer.finish = AsyncMock()
+        streamer.send_tool_notification = AsyncMock()
+        await executor._execute_inner(req, streamer, retries=5)
+
+    # Exactly two query attempts — it did NOT loop the identical command.
+    assert calls["n"] == 2
+    # First attempt still carried --effort; the retry dropped it.
+    assert build_drop_effort[0] is False
+    assert build_drop_effort[1] is True
+    # Sticky flag latched so every future run in this process skips --effort too.
+    assert executor._effort_unsupported is True
+    # And the run actually completed on the second attempt.
+    mock_config_superpos = executor._superpos
+    mock_config_superpos.complete_task.assert_awaited()
+
+
 # --- _execute_inner injects worktree hint for Telegram without branch ---
 
 async def test_execute_inner_injects_worktree_hint_for_telegram_with_isolation(

@@ -307,3 +307,29 @@ def test_build_options_passes_debug_to_stderr(executor):
     # debug_stderr is truthy; leaving it at sys.stderr would route crash
     # output to the container stderr and defeat the open_process capture.
     assert opts.debug_stderr is None
+
+
+# --- --effort gating (MiniMax/older-CLI crash-loop backstop) ---
+
+def test_build_options_drops_effort_when_requested(executor):
+    """The ``drop_effort`` param omits --effort — the retry a pre-init
+    'unknown option --effort' crash uses to escape the crash-loop."""
+    opts = executor._build_options(drop_effort=True)
+    assert "effort" not in opts.extra_args
+    # Everything else (including the debug flag) is untouched.
+    assert opts.extra_args.get("debug-to-stderr", "MISSING") is None
+
+
+def test_build_options_drops_effort_when_sticky_flag_set(executor):
+    """Once the backstop learns the CLI rejects --effort it sets a sticky
+    flag; every subsequent build must omit --effort without needing the param."""
+    executor._effort_unsupported = True
+    opts = executor._build_options()
+    assert "effort" not in opts.extra_args
+
+
+def test_build_options_keeps_effort_by_default(executor):
+    """A CLI that supports --effort (the pinned 2.1.x) still gets it — native
+    reasoning agents keep the feature; only the unsupported case drops it."""
+    opts = executor._build_options()
+    assert opts.extra_args["effort"] == executor._runtime.effort

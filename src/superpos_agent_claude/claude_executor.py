@@ -492,6 +492,15 @@ class ClaudeExecutor(Executor):
         if self._shim_backend:
             self._wire_shim_search(config)
 
+        # Durable backstop state: flipped True once we observe a pre-init CLI
+        # crash whose stderr rejects ``--effort`` (an older CLI, or a
+        # backend/model that doesn't accept it — ``error: unknown option
+        # '--effort'``).  Once set, ``_build_options`` stops emitting the flag
+        # for every subsequent run so the agent can never crash-loop on it
+        # again.  Process-scoped: a fresh container with a CLI that supports
+        # ``--effort`` starts clean and keeps the feature.
+        self._effort_unsupported = False
+
     def _build_ask_mcp_server(self):
         """Build the in-process SDK MCP server exposing ``ask_user``.
 
@@ -1564,6 +1573,7 @@ class ClaudeExecutor(Executor):
         *,
         enable_ask: bool = True,
         strip_optional_mcp: bool = False,
+        drop_effort: bool = False,
     ) -> ClaudeAgentOptions:
         """Assemble ``ClaudeAgentOptions`` for a query.
 
@@ -1583,8 +1593,22 @@ class ClaudeExecutor(Executor):
         server (ask + shim search) so a pre-init MCP startup crash can retry
         without the tooling that failed the handshake instead of looping the
         identical config forever.
+
+        ``drop_effort`` (or the sticky ``self._effort_unsupported`` flag set by
+        the backstop) omits the ``--effort`` CLI flag.  ``--effort`` is only
+        understood by newer Claude CLIs (added ~2.1.x); an older pinned CLI —
+        or a backend/model that doesn't accept it — rejects it before init with
+        ``error: unknown option '--effort'``, which would otherwise crash-loop
+        the agent forever.
         """
         ask_active = self._ask_enabled(enable_ask)
+        extra_args: dict = {"debug-to-stderr": None}
+        # ``--effort`` is an optional reasoning-effort flag understood only by
+        # newer CLIs.  Drop it when the backstop has learned the current CLI
+        # rejects it (sticky flag) or on the attempt that retries after such a
+        # rejection, so an unsupported optional flag can never brick the agent.
+        if not (drop_effort or self._effort_unsupported):
+            extra_args["effort"] = self._runtime.effort
         opts: dict = {
             "model": self._runtime.model,
             "max_turns": self._config.executor_max_turns,
@@ -1604,10 +1628,7 @@ class ClaudeExecutor(Executor):
             # (defined but no longer read by the transport); we keep passing
             # ``None`` for behavioral continuity and to make the intent explicit.
             "debug_stderr": None,
-            "extra_args": {
-                "effort": self._runtime.effort,
-                "debug-to-stderr": None,
-            },
+            "extra_args": extra_args,
         }
         # The interactive ask path needs the in-process superpos_ask MCP
         # server; background tasks (enable_ask=False) and shim/minimax backends
@@ -1830,6 +1851,14 @@ class ClaudeExecutor(Executor):
         # than oscillating strip/re-add.
         degraded = False
 
+        # Attempt-scoped backstop flag: set once after a pre-init crash whose
+        # stderr rejects ``--effort`` (``unknown option '--effort'``), so the
+        # next attempt is built WITHOUT the flag.  We also set the sticky
+        # ``self._effort_unsupported`` so every future run in this process skips
+        # it too — a bad/unsupported optional CLI flag can never crash-loop the
+        # agent again.  Bounded: flips False→True once per run.
+        drop_effort = self._effort_unsupported
+
         # Streaming-input mode: ``query`` takes an ``AsyncIterable[dict]`` of
         # user messages rather than a bare string.  This is required for the
         # in-process MCP round-trip (the ask_user tool) and the SDK control
@@ -1863,6 +1892,7 @@ class ClaudeExecutor(Executor):
                         system_prompt_append=system_prompt_append,
                         enable_ask=stream_mode,
                         strip_optional_mcp=degraded,
+                        drop_effort=drop_effort,
                     )
                     query_prompt = (
                         _prompt_stream(effective_prompt)
@@ -2036,6 +2066,46 @@ class ClaudeExecutor(Executor):
                             "Review your prior outputs in this session to see what was already done, "
                             "then continue from where you left off and finish the task."
                         )
+                        continue
+
+                    # Durable backstop (C): a pre-init crash whose stderr
+                    # rejects an optional CLI flag (``error: unknown option
+                    # '--effort'``) would loop the identical failing command
+                    # forever — stripping MCP servers (safeguard B below) does
+                    # NOT help because the offending flag is still emitted.
+                    # Detect it, drop ``--effort`` for the retry, and set the
+                    # sticky ``self._effort_unsupported`` so every future run in
+                    # this process skips it too.  Bounded: only fires while the
+                    # flag is still being sent (``not drop_effort``); once
+                    # dropped it can't re-trigger, so we never oscillate.
+                    crash_text = f"{err_str}\n{captured_stderr}"
+                    effort_rejected = (
+                        "unknown option" in crash_text
+                        and "--effort" in crash_text
+                    )
+                    if (
+                        is_cli_crash
+                        and not last_session_id
+                        and attempt < retries
+                        and not full_text.strip()
+                        and not drop_effort
+                        and effort_rejected
+                    ):
+                        drop_effort = True
+                        self._effort_unsupported = True
+                        wait = 5 * attempt
+                        log.warning(
+                            "Claude CLI rejected --effort before init (exit %s, "
+                            "attempt %d/%d): 'unknown option --effort'. The "
+                            "pinned CLI/backend does not support it; retrying "
+                            "WITHOUT --effort in %ds and disabling it for the "
+                            "rest of this process. CLI stderr:\n%s",
+                            exit_code, attempt, retries, wait,
+                            captured_stderr or "(no stderr captured)",
+                        )
+                        await self._backoff_sleep(wait, progress_event)
+                        resume_id = None
+                        effective_prompt = prompt_text
                         continue
 
                     # Durable safeguard (B): a pre-init crash while optional MCP
