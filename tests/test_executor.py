@@ -3067,3 +3067,187 @@ async def test_non_group_rate_limit_still_classified(executor, mock_config):
     # Final surfaced error must not carry a CLI-crash hint (not a crash).
     msg = streamer.error.await_args.args[0]
     assert "OOM-killed" not in msg
+
+
+# --- ENABLE_CLAUDEAI_MCP_SERVERS: drop operator account-level connectors ---
+#
+# The executor authenticates with the operator's OAuth account, which drags in
+# their personal account-level claude.ai connectors (Gmail, Calendar, Notion,
+# …).  __init__ disables that fetch at the source by setting
+# ENABLE_CLAUDEAI_MCP_SERVERS=false via os.environ.setdefault — so the default
+# is "off" but an operator can still opt back in by exporting the var.
+
+
+def test_init_defaults_enable_claudeai_mcp_servers_to_false(
+    mock_config, mock_runtime, mock_superpos, mock_gateway, monkeypatch
+):
+    """Constructing the executor with no operator override must default
+    ENABLE_CLAUDEAI_MCP_SERVERS to "false" so account-level claude.ai
+    connectors are never fetched."""
+    import os
+
+    # setdefault mutates the real process env — isolate with monkeypatch so we
+    # start from a clean slate and don't leak state to sibling tests.
+    monkeypatch.delenv("ENABLE_CLAUDEAI_MCP_SERVERS", raising=False)
+
+    ClaudeExecutor(mock_config, mock_runtime, mock_superpos, mock_gateway)
+
+    assert os.environ["ENABLE_CLAUDEAI_MCP_SERVERS"] == "false"
+
+
+def test_init_preserves_operator_enable_claudeai_mcp_servers(
+    mock_config, mock_runtime, mock_superpos, mock_gateway, monkeypatch
+):
+    """If the operator has explicitly exported ENABLE_CLAUDEAI_MCP_SERVERS,
+    __init__ must NOT overwrite it — setdefault only fills the unset case, so an
+    operator can opt account connectors back in."""
+    import os
+
+    monkeypatch.setenv("ENABLE_CLAUDEAI_MCP_SERVERS", "true")
+
+    ClaudeExecutor(mock_config, mock_runtime, mock_superpos, mock_gateway)
+
+    assert os.environ["ENABLE_CLAUDEAI_MCP_SERVERS"] == "true"
+
+
+# --- Captured CLI stderr must never leak into retry/degrade progress notes ---
+#
+# --debug-to-stderr turns the CLI's stderr into a verbose firehose.  We log it
+# and put it in the final failure summary, but the retry progress messages
+# streamed to the user mid-run must NOT contain it.
+
+# Unique sentinel: if this string ever appears in a streamed progress message,
+# the debug firehose has leaked to the user.
+_STDERR_SENTINEL = "LEAKED_MCP_DEBUG_FIREHOSE_abc123"
+
+
+def _write_stderr_tempfile():
+    """Write a fresh captured-stderr tempfile carrying the sentinel.
+
+    The executor's finally-block unlinks the capture path after every attempt,
+    so a stub that must survive several attempts writes a new one each time."""
+    import tempfile
+
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".log", delete=False) as f:
+        f.write("[debug] mcp handshake ...\n" + _STDERR_SENTINEL + "\nclaude: aborted\n")
+        return f.name
+
+
+def _populate_stderr_capture():
+    """Point the active _stderr_capture_var at a fresh sentinel tempfile, as
+    the real anyio.open_process patch does."""
+    from superpos_agent_claude.claude_executor import _stderr_capture_var
+
+    capture = _stderr_capture_var.get()
+    if capture is not None:
+        capture["path"] = _write_stderr_tempfile()
+        capture["pid"] = 4242
+
+
+# The SDK's wrapped exit-code-1 message classifies as a CLI crash via the
+# "Command failed with exit code" substring in err_str.
+_CLI_CRASH_EXC = Exception(
+    "Command failed with exit code 1 (exit code: 1)\n"
+    "Error output: Check stderr output for details"
+)
+
+
+async def test_degrade_path_is_log_only_and_excludes_captured_stderr(
+    executor, mock_superpos, mock_config, monkeypatch
+):
+    """The MCP-startup degrade path is now log-only: it must NOT stream a
+    '⚠️ MCP failed at startup' / 'running without ask/search' note to the user
+    (commit 9625727). It must also never leak the captured --debug-to-stderr
+    firehose into any streamed progress message. The captured stderr is still
+    kept for the final failure summary."""
+    monkeypatch.delenv("ENABLE_CLAUDEAI_MCP_SERVERS", raising=False)
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
+
+    req = ExecutionRequest(
+        prompt="do work", chat_id="123", source="superpos",
+        superpos_task_id="task-degrade-stderr",
+    )
+
+    # Every attempt: populate a fresh captured-stderr sentinel, then a pre-init
+    # crash (no init emitted). Attempt 1 hits the degrade branch (log-only);
+    # subsequent attempts fall through to the plain pre-init retry / final fail.
+    def query_side_effect(*args, **kwargs):
+        async def _gen():
+            _populate_stderr_capture()
+            raise _CLI_CRASH_EXC
+            yield  # pragma: no cover — make this an async generator
+        return _gen()
+
+    with patch("superpos_agent_claude.claude_executor.is_git_repo", return_value=False), \
+         patch("superpos_agent_claude.claude_executor.query", side_effect=query_side_effect), \
+         patch.object(executor, "_backoff_sleep", new_callable=AsyncMock), \
+         patch("superpos_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = _wired_streamer(MockStreamer)
+        await executor._execute_inner(req, streamer, retries=3)
+
+    appended = [c.args[0] for c in streamer.append.await_args_list if c.args]
+    # Degrade note is log-only now — it is NOT streamed to the user.
+    for m in appended:
+        assert "MCP failed at startup" not in m
+        assert "running without ask/search" not in m
+    # No streamed progress message carries the stderr firehose.
+    for m in appended:
+        assert _STDERR_SENTINEL not in m, f"stderr leaked into progress note: {m!r}"
+
+    # The final failure summary STILL includes the captured stderr — this guards
+    # against someone stripping stderr everywhere, not just the notes.
+    assert mock_superpos.fail_task.await_count == 1
+    summary = mock_superpos.fail_task.await_args.kwargs["summary"]
+    assert "cli_stderr" in summary
+    assert _STDERR_SENTINEL in summary["cli_stderr"]
+    # The final user-facing error hint still surfaces the stderr tail.
+    sent = streamer.error.await_args.args[0]
+    assert "Captured stderr (tail)" in sent
+    assert _STDERR_SENTINEL in sent
+
+
+async def test_crash_resume_progress_message_excludes_captured_stderr(
+    executor, mock_superpos, mock_config, monkeypatch
+):
+    """The crash-resume path streams a '⏳ CLI crashed ... resuming session'
+    note after a mid-task crash.  That progress message must NOT contain the
+    captured stderr firehose (it is logged + kept for the summary instead)."""
+    from claude_code_sdk.types import SystemMessage
+
+    monkeypatch.delenv("ENABLE_CLAUDEAI_MCP_SERVERS", raising=False)
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
+
+    req = ExecutionRequest(
+        prompt="do work", chat_id="123", source="superpos",
+        superpos_task_id="task-resume-stderr",
+    )
+
+    def query_side_effect(*args, **kwargs):
+        async def _gen():
+            # Emit init so last_session_id is captured → the crash-resume
+            # branch (not the degrade branch) fires next.
+            yield SystemMessage(subtype="init", data={"session_id": "sess-crash"})
+            _populate_stderr_capture()
+            raise _CLI_CRASH_EXC
+        return _gen()
+
+    with patch("superpos_agent_claude.claude_executor.is_git_repo", return_value=False), \
+         patch("superpos_agent_claude.claude_executor.query", side_effect=query_side_effect), \
+         patch.object(executor, "_backoff_sleep", new_callable=AsyncMock), \
+         patch("superpos_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = _wired_streamer(MockStreamer)
+        await executor._execute_inner(req, streamer, retries=2)
+
+    appended = [c.args[0] for c in streamer.append.await_args_list if c.args]
+    # The resume note was streamed (proves we took the crash-resume branch)...
+    assert any("resuming session" in m for m in appended), \
+        "crash-resume path should have streamed the resume note"
+    # ...and no streamed progress message carries the stderr firehose.
+    for m in appended:
+        assert _STDERR_SENTINEL not in m, f"stderr leaked into progress note: {m!r}"
+
+    # The captured stderr is still surfaced in the final failure hint.
+    sent = streamer.error.await_args.args[0]
+    assert _STDERR_SENTINEL in sent
