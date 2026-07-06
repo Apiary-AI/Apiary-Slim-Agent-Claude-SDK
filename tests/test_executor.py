@@ -2874,13 +2874,19 @@ async def test_group_wrapped_pre_init_crash_retries_fresh(executor, mock_config)
 
 @_needs_exc_group
 async def test_pre_init_crash_degrades_strips_optional_mcps_then_succeeds(
-    executor, mock_config,
+    executor, mock_config, caplog,
 ):
     """A pre-init crash with optional MCP servers present (regression #34)
     degrades on retry: the second attempt strips the ask/search MCP servers,
-    drops streaming back to the bare string prompt, and emits the one-time
-    degraded message. The degraded attempt then succeeds."""
+    drops streaming back to the bare string prompt, and logs the one-time
+    degraded notice (log-only, not surfaced to the user). The degraded attempt
+    then succeeds."""
+    import logging
     from superpos_agent_claude.claude_executor import _ASK_MCP_SERVER
+
+    caplog.set_level(
+        logging.WARNING, logger="superpos_agent_claude.claude_executor",
+    )
 
     mock_config.executor_worktree_isolation = False
     req = ExecutionRequest(prompt="DO WORK", chat_id="123", source="telegram")
@@ -2935,11 +2941,17 @@ async def test_pre_init_crash_degrades_strips_optional_mcps_then_succeeds(
     assert not isinstance(captured_prompts[0], str)
     assert captured_prompts[1] == "DO WORK"
 
-    # The one-time degraded message was surfaced to the user.
+    # The degrade notice is log-only: it's an internal recovery step, so it is
+    # logged (full detail) but NOT surfaced to the user.
+    assert any(
+        "WITHOUT ask/search MCPs" in r.message
+        for r in caplog.records
+        if r.levelno >= logging.WARNING
+    )
     appended = " ".join(
         c.args[0] for c in streamer.append.await_args_list if c.args
     )
-    assert "running without ask/search" in appended
+    assert "running without ask/search" not in appended
 
 
 @_needs_exc_group
