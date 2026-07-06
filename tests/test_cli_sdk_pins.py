@@ -33,6 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCKERFILE = REPO_ROOT / "Dockerfile"
 REQUIREMENTS = REPO_ROOT / "requirements.txt"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
+UV_LOCK = REPO_ROOT / "uv.lock"
 
 # The known-compatible pair. claude-agent-sdk 0.2.110 is the renamed successor
 # to the frozen claude-code-sdk 0.0.25; it speaks the CLI 2.1.x control protocol
@@ -86,4 +87,37 @@ def test_pyproject_pins_sdk_exactly():
     loose = re.search(r"claude-agent-sdk\s*>=", text)
     assert loose is None, (
         "claude-agent-sdk must be pinned with == in pyproject.toml, not >=."
+    )
+
+
+def test_uv_lock_pins_sdk_exactly():
+    """uv.lock must resolve the new SDK and not carry the frozen old one.
+
+    pyproject.toml pins the SDK, but a lockfile-based install
+    (``uv sync --locked``) reads uv.lock, not pyproject. If the lockfile is
+    stale it silently reinstalls the frozen ``claude-code-sdk==0.0.25`` while
+    the source imports ``claude_agent_sdk`` — the install fails at import time
+    instead of exercising the issue-#40 migration. Keep the lock regenerated.
+    """
+    text = UV_LOCK.read_text()
+
+    # The resolved package version block must be present…
+    assert re.search(
+        r'name = "claude-agent-sdk"\nversion = "0\.2\.110"', text
+    ), (
+        "uv.lock must resolve claude-agent-sdk==0.2.110; run `uv lock` after "
+        "bumping the pin in pyproject.toml so lockfile installs match."
+    )
+    # …and the editable root must depend on it with the exact specifier.
+    assert '{ name = "claude-agent-sdk", specifier = "==0.2.110" }' in text, (
+        "uv.lock requires-dist must pin claude-agent-sdk to ==0.2.110."
+    )
+
+    # The frozen predecessor must be fully gone (package block + specifier).
+    assert 'name = "claude-code-sdk"' not in text, (
+        "uv.lock still contains a claude-code-sdk package entry; regenerate it "
+        "with `uv lock` so the old SDK can't be reinstalled from the lockfile."
+    )
+    assert "claude-code-sdk==0.0.25" not in text, (
+        "uv.lock still pins claude-code-sdk==0.0.25; regenerate with `uv lock`."
     )
