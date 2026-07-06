@@ -2015,12 +2015,11 @@ class ClaudeExecutor(Executor):
                             exit_code, attempt, retries, wait,
                             captured_stderr or "(no stderr captured)",
                         )
-                        # Full CLI stderr is logged above; never paste the
-                        # --debug-to-stderr firehose into the user-facing stream.
-                        await streamer.append(
-                            "\n⚠️ MCP failed at startup; running without "
-                            "ask/search this attempt.\n",
-                        )
+                        # Log-only: the degrade is an internal recovery step
+                        # (retry without the optional MCP servers) and the task
+                        # still completes. Surfacing "MCP failed at startup" to
+                        # the user on every degrade is noise — full detail is in
+                        # the log.warning above.
                         await self._backoff_sleep(wait, progress_event)
                         resume_id = None
                         effective_prompt = prompt_text

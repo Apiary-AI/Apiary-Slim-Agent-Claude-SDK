@@ -12,7 +12,11 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     apt-get update && apt-get install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @anthropic-ai/claude-code
+# Pin the CLI: 2.1.201 races on the SDK-MCP control-protocol handshake
+# ("ProcessTransport is not ready for writing"), degrading the ask/search tools
+# on every task. 2.1.165 is the version the rest of the fleet runs without a
+# single such crash. Bump deliberately after verifying the ask-MCP round-trip.
+RUN npm install -g @anthropic-ai/claude-code@2.1.165
 
 # uv / uvx — used to launch MiniMax's web-search MCP (uvx minimax-coding-plan-mcp)
 # on shim backends. Harmless on native Anthropic (only invoked when configured).
