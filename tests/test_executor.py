@@ -3251,3 +3251,64 @@ async def test_crash_resume_progress_message_excludes_captured_stderr(
     # The captured stderr is still surfaced in the final failure hint.
     sent = streamer.error.await_args.args[0]
     assert _STDERR_SENTINEL in sent
+
+
+async def test_plain_pre_init_retry_note_is_streamed_and_excludes_captured_stderr(
+    executor, mock_superpos, mock_config, monkeypatch
+):
+    """The plain pre-init non-degrade retry branch (claude_executor.py:~2048)
+    streams a '⏳ CLI crashed before starting ... retrying' note when the CLI
+    dies pre-init with NO optional MCP servers to strip and NO resumable
+    session id.  This test POSITIVELY asserts that note is actually streamed —
+    closing the vacuous-pass gap where the stderr-leak check on this branch
+    could pass simply because the note stopped streaming — while still proving
+    the captured --debug-to-stderr firehose never leaks into any streamed
+    progress message (it is logged + kept for the final failure summary)."""
+    monkeypatch.delenv("ENABLE_CLAUDEAI_MCP_SERVERS", raising=False)
+    mock_config.executor_worktree_isolation = False
+    mock_config.executor_working_dir = "/workspace"
+
+    # No optional MCP servers present → the durable-safeguard degrade branch is
+    # skipped (optional_mcp_present is False), so a pre-init crash with no
+    # resumable session id falls straight through to the PLAIN retry branch.
+    executor._mcp = {}
+
+    req = ExecutionRequest(
+        prompt="do work", chat_id="123", source="superpos",
+        superpos_task_id="task-plain-preinit-stderr",
+    )
+
+    # Every attempt: populate a fresh captured-stderr sentinel, then a pre-init
+    # crash (no init message → no last_session_id). With no optional MCPs the
+    # degrade branch never fires, so attempt 1 already takes the plain branch.
+    def query_side_effect(*args, **kwargs):
+        async def _gen():
+            _populate_stderr_capture()
+            raise _CLI_CRASH_EXC
+            yield  # pragma: no cover — make this an async generator
+        return _gen()
+
+    with patch("superpos_agent_claude.claude_executor.is_git_repo", return_value=False), \
+         patch("superpos_agent_claude.claude_executor.query", side_effect=query_side_effect), \
+         patch.object(executor, "_backoff_sleep", new_callable=AsyncMock), \
+         patch("superpos_agent_claude.claude_executor.TelegramStreamer") as MockStreamer:
+        streamer = _wired_streamer(MockStreamer)
+        await executor._execute_inner(req, streamer, retries=2)
+
+    appended = [c.args[0] for c in streamer.append.await_args_list if c.args]
+    # The plain pre-init retry note WAS streamed (proves we took the plain
+    # branch — not the degrade branch, not the crash-resume branch).
+    assert any("CLI crashed before starting" in m for m in appended), \
+        "plain pre-init retry path should have streamed the retry note"
+    # ...and no streamed progress message carries the stderr firehose.
+    for m in appended:
+        assert _STDERR_SENTINEL not in m, f"stderr leaked into progress note: {m!r}"
+
+    # The captured stderr is still preserved for the log / final failure summary.
+    assert mock_superpos.fail_task.await_count == 1
+    summary = mock_superpos.fail_task.await_args.kwargs["summary"]
+    assert "cli_stderr" in summary
+    assert _STDERR_SENTINEL in summary["cli_stderr"]
+    # The final user-facing error hint still surfaces the stderr tail.
+    sent = streamer.error.await_args.args[0]
+    assert _STDERR_SENTINEL in sent
