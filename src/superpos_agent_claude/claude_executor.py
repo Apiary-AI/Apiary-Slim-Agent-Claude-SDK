@@ -408,6 +408,14 @@ class ClaudeExecutor(Executor):
         persona: str | None = None,
     ) -> None:
         super().__init__(max_parallel=config.executor_max_parallel)
+        # A headless worker authenticates with the operator's OAuth account,
+        # which drags in their personal account-level claude.ai connectors
+        # (Gmail, Calendar, Notion, …). The CLI fetches and connects to all of
+        # them on every query — pure latency and side surface a worker must
+        # never touch. Disable the fetch at the source; the SDK spawns the CLI
+        # as a child of this process, so it inherits os.environ. setdefault so
+        # an operator can still opt back in by exporting the var explicitly.
+        os.environ.setdefault("ENABLE_CLAUDEAI_MCP_SERVERS", "false")
         self._config = config
         self._runtime = runtime
         self._superpos = superpos
@@ -1958,13 +1966,11 @@ class ClaudeExecutor(Executor):
                             exit_code, attempt, retries, last_session_id, wait,
                             captured_stderr or "(no stderr captured)",
                         )
-                        stderr_blurb = (
-                            f"\nCLI stderr tail:\n{captured_stderr}"
-                            if captured_stderr else ""
-                        )
+                        # Full CLI stderr is logged above; never paste the
+                        # --debug-to-stderr firehose into the user-facing stream.
                         await streamer.append(
                             f"\n⏳ CLI crashed (exit {exit_code}), "
-                            f"resuming session in {wait}s...{stderr_blurb}\n",
+                            f"resuming session in {wait}s...\n",
                         )
                         await self._backoff_sleep(wait, progress_event)
                         resume_id = last_session_id
@@ -2009,13 +2015,11 @@ class ClaudeExecutor(Executor):
                             exit_code, attempt, retries, wait,
                             captured_stderr or "(no stderr captured)",
                         )
-                        stderr_blurb = (
-                            f"\nCLI stderr tail:\n{captured_stderr}"
-                            if captured_stderr else ""
-                        )
+                        # Full CLI stderr is logged above; never paste the
+                        # --debug-to-stderr firehose into the user-facing stream.
                         await streamer.append(
                             "\n⚠️ MCP failed at startup; running without "
-                            f"ask/search this attempt.{stderr_blurb}\n",
+                            "ask/search this attempt.\n",
                         )
                         await self._backoff_sleep(wait, progress_event)
                         resume_id = None
@@ -2040,13 +2044,11 @@ class ClaudeExecutor(Executor):
                             exit_code, attempt, retries, wait,
                             captured_stderr or "(no stderr captured)",
                         )
-                        stderr_blurb = (
-                            f"\nCLI stderr tail:\n{captured_stderr}"
-                            if captured_stderr else ""
-                        )
+                        # Full CLI stderr is logged above; never paste the
+                        # --debug-to-stderr firehose into the user-facing stream.
                         await streamer.append(
                             f"\n⏳ CLI crashed before starting (exit {exit_code}), "
-                            f"retrying in {wait}s...{stderr_blurb}\n",
+                            f"retrying in {wait}s...\n",
                         )
                         await self._backoff_sleep(wait, progress_event)
                         resume_id = None
