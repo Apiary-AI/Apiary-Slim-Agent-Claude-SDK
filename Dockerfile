@@ -13,12 +13,19 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     rm -rf /var/lib/apt/lists/*
 
 # Pin the CLI. The in-process superpos_ask MCP server + streaming control
-# protocol in claude_executor.py speak the protocol of claude-code-sdk 0.0.25,
-# which shipped alongside the CLI 2.0.x line. Leaving this unpinned pulled CLI
-# `latest` (2.1.x) on rebuild, whose handshake the pinned SDK no longer
-# survives → pre-init crash → ask/search permanently degraded (see issue #40).
-# Keep this in lockstep with the claude-code-sdk pin in requirements.txt.
-RUN npm install -g @anthropic-ai/claude-code@2.0.14
+# protocol in claude_executor.py are a matched pair with the Python SDK, which
+# is now `claude-agent-sdk` 0.2.x (the renamed successor to the frozen
+# claude-code-sdk 0.0.25). agent-sdk 0.2.110 speaks the CLI 2.1.x protocol and
+# declares 2.1.191 as its matched CLI (claude_agent_sdk/_cli_version.py), so
+# 2.1.191 is the pinned pair for agent-sdk 0.2.110 (verify the pairing at build
+# time via claude_agent_sdk._cli_version.__cli_version__). Leaving this
+# unpinned pulls CLI `latest`, whose handshake a pinned SDK may not survive →
+# pre-init crash → ask/search permanently degraded (issue #40, now migrated).
+# Bump deliberately, and only after verifying the ask-MCP round-trip against a
+# real task run. Keep this in lockstep with the claude-agent-sdk pin in
+# requirements.txt. (Supersedes the interim CLI 2.0.14 / claude-code-sdk 0.0.25
+# pin.)
+RUN npm install -g @anthropic-ai/claude-code@2.1.191
 
 # uv / uvx — used to launch MiniMax's web-search MCP (uvx minimax-coding-plan-mcp)
 # on shim backends. Harmless on native Anthropic (only invoked when configured).

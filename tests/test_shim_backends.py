@@ -5,6 +5,8 @@ import pytest
 from superpos_agent_claude.config import ClaudeConfig
 from superpos_agent_claude.claude_executor import ClaudeExecutor
 
+from .conftest import append_text
+
 
 # --- backend detection ---
 
@@ -106,7 +108,7 @@ def test_shim_disables_hosted_tools_and_adds_minimax_mcp(
     assert mm["env"]["MINIMAX_API_KEY"] == "mm-key"
     assert mm["env"]["MINIMAX_API_HOST"] == "https://api.minimax.io"
     # The model is told to use the MCP tool for search.
-    assert "web_search" in (opts.append_system_prompt or "")
+    assert "web_search" in append_text(opts)
 
 
 def test_shim_with_custom_search_mcp(
@@ -131,7 +133,7 @@ def test_shim_with_custom_search_mcp(
     assert ws["args"] == ["-y", "tavily-mcp"]
     assert ws["env"]["TAVILY_API_KEY"] == "tvly-key"
     # The model is pointed at the replacement server.
-    assert "web_search" in (opts.append_system_prompt or "")
+    assert "web_search" in append_text(opts)
 
 
 def test_shim_with_remote_http_search_mcp(
@@ -154,7 +156,7 @@ def test_shim_with_remote_http_search_mcp(
     assert ws["type"] == "http"  # defaulted from the presence of "url"
     assert ws["url"] == "https://api.z.ai/api/mcp/web_search_prime/mcp"
     assert ws["headers"]["Authorization"] == "Bearer zai-key"
-    assert "web_search" in (opts.append_system_prompt or "")
+    assert "web_search" in append_text(opts)
 
 
 def test_remote_search_mcp_honors_explicit_type(
@@ -252,7 +254,7 @@ def test_shim_gates_off_ask_mcp_even_when_enable_ask_true(
     opts = ex._build_options(enable_ask=True)
     assert _ASK_MCP_SERVER not in (opts.mcp_servers or {})
     assert "AskUserQuestion" not in (opts.disallowed_tools or [])
-    assert "Asking the user a question" not in (opts.append_system_prompt or "")
+    assert "Asking the user a question" not in append_text(opts)
     # The proven minimax-only search MCP survives.
     assert "minimax" in opts.mcp_servers
 
@@ -267,7 +269,7 @@ def test_native_keeps_ask_mcp_and_streaming_flag(executor):
     opts = executor._build_options(enable_ask=True)
     assert _ASK_MCP_SERVER in opts.mcp_servers
     assert "AskUserQuestion" in opts.disallowed_tools
-    assert "Asking the user a question" in (opts.append_system_prompt or "")
+    assert "Asking the user a question" in append_text(opts)
 
 
 def test_strip_optional_mcp_drops_ask_and_search(

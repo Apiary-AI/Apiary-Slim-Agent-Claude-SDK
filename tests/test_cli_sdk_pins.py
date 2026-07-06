@@ -6,10 +6,15 @@ is determined jointly by the bundled Claude CLI (installed in ``Dockerfile``)
 and the Python SDK (pinned in ``requirements.txt`` / ``pyproject.toml``).
 
 When the CLI was installed unpinned (``npm install -g @anthropic-ai/claude-code``)
-a rebuild silently pulled CLI ``latest`` (2.1.x), whose handshake the pinned
-SDK ``claude-code-sdk==0.0.25`` no longer survived. The CLI exited before the
-``init`` system message → the executor treated it as a pre-init crash with
-optional MCP present → stripped ask/search and degraded on every message.
+a rebuild silently pulled CLI ``latest``, whose handshake a mismatched pinned
+SDK no longer survived. The CLI exited before the ``init`` system message → the
+executor treated it as a pre-init crash with optional MCP present → stripped
+ask/search and degraded on every message.
+
+The SDK migrated (issue #40) from the frozen ``claude-code-sdk==0.0.25`` (a
+2.0.x-era protocol) to its renamed successor ``claude-agent-sdk==0.2.110``,
+which speaks the CLI 2.1.x protocol and declares 2.1.191 as its matched CLI
+(``claude_agent_sdk/_cli_version.py``). Both ends were bumped together.
 
 These tests assert that both ends stay pinned to the known-compatible pair so
 the skew cannot silently regress on a future edit or rebuild. A real boot
@@ -29,12 +34,14 @@ DOCKERFILE = REPO_ROOT / "Dockerfile"
 REQUIREMENTS = REPO_ROOT / "requirements.txt"
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 
-# The known-compatible pair. claude-code-sdk 0.0.25 (the last release under the
-# old package name) shipped 2025-09-29, alongside the CLI 2.0.x line; CLI 2.0.14
-# is a settled patch in that line verified against the streaming control
-# protocol the SDK implements. Keep these two in lockstep.
-EXPECTED_CLI_VERSION = "2.0.14"
-EXPECTED_SDK_SPEC = "claude-code-sdk==0.0.25"
+# The known-compatible pair. claude-agent-sdk 0.2.110 is the renamed successor
+# to the frozen claude-code-sdk 0.0.25; it speaks the CLI 2.1.x control protocol
+# and declares 2.1.191 as its matched CLI (claude_agent_sdk/_cli_version.py).
+# Keep these two in lockstep — bump BOTH only to a pair verified to boot to a
+# clean init (real boot needs OAuth + network + an image build, so CI verifies
+# the contract, not the handshake).
+EXPECTED_CLI_VERSION = "2.1.191"
+EXPECTED_SDK_SPEC = "claude-agent-sdk==0.2.110"
 
 
 def test_dockerfile_pins_cli_version():
@@ -63,9 +70,9 @@ def test_requirements_pins_sdk_exactly():
         "an open-ended >= drifts the SDK away from the pinned CLI."
     )
     # Guard against a stray loose specifier sneaking back in.
-    loose = re.search(r"claude-code-sdk\s*>=", text)
+    loose = re.search(r"claude-agent-sdk\s*>=", text)
     assert loose is None, (
-        "claude-code-sdk must be pinned with == in requirements.txt, not >=."
+        "claude-agent-sdk must be pinned with == in requirements.txt, not >=."
     )
 
 
@@ -76,7 +83,7 @@ def test_pyproject_pins_sdk_exactly():
         f"pyproject.toml must contain an exact pin {EXPECTED_SDK_SPEC!r} to "
         "match requirements.txt and the Dockerfile CLI pin."
     )
-    loose = re.search(r"claude-code-sdk\s*>=", text)
+    loose = re.search(r"claude-agent-sdk\s*>=", text)
     assert loose is None, (
-        "claude-code-sdk must be pinned with == in pyproject.toml, not >=."
+        "claude-agent-sdk must be pinned with == in pyproject.toml, not >=."
     )

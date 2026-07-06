@@ -25,6 +25,8 @@ from superpos_agent_claude.claude_executor import (
     _ask_context_var,
 )
 
+from .conftest import append_text
+
 
 @pytest.fixture
 def call_tool(executor):
@@ -262,7 +264,7 @@ async def test_handler_without_context_fails_closed(handler, monkeypatch):
 
 # ── SDK MCP adapter path: error state must survive create_sdk_mcp_server ───
 #
-# create_sdk_mcp_server (claude-code-sdk 0.0.25) forwards only the handler's
+# create_sdk_mcp_server (claude-agent-sdk 0.2.110) forwards only the handler's
 # ``content`` and never reads a returned ``is_error`` flag, so the bundled mcp
 # low-level server builds CallToolResult(isError=False) and the error is lost.
 # The only SDK-supported channel is to *raise*: the mcp call_tool decorator
@@ -339,7 +341,7 @@ def test_build_options_includes_ask_server_and_disallows_native(executor):
 
 def test_build_options_steers_to_mcp_tool_in_system_prompt(executor):
     opts = executor._build_options()
-    assert _ASK_MCP_TOOL_FQN in (opts.append_system_prompt or "")
+    assert _ASK_MCP_TOOL_FQN in append_text(opts)
 
 
 # ── Stall watchdog pause during a pending ask ──────────────────────────────

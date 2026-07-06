@@ -21,8 +21,8 @@ import tempfile as _tempfile
 import time
 
 import anyio
-from claude_code_sdk import (
-    ClaudeCodeOptions,
+from claude_agent_sdk import (
+    ClaudeAgentOptions,
     CLIConnectionError,
     ClaudeSDKError,
     Message,
@@ -31,9 +31,10 @@ from claude_code_sdk import (
     query,
     tool,
 )
-from claude_code_sdk._internal import client as _sdk_client
-from claude_code_sdk._internal import message_parser
-from claude_code_sdk.types import AssistantMessage, ResultMessage, SystemMessage
+from claude_agent_sdk._internal import client as _sdk_client
+from claude_agent_sdk._internal import message_parser
+from claude_agent_sdk._internal.transport import subprocess_cli as _sdk_transport
+from claude_agent_sdk.types import AssistantMessage, ResultMessage, SystemMessage
 
 from superpos_agent_core import (
     AskAlreadyPending,
@@ -94,8 +95,11 @@ _MAX_SLOT_RESOLVE_ATTEMPTS = 5
 #
 # These monkey-patches keep the Claude CLI bridge usable in our container:
 #   1. parse_message — tolerate unknown event types instead of crashing.
-#   2. _build_command — pass append_system_prompt via a file when it would
-#      otherwise blow ARG_MAX (persona can exceed 128KB).
+#   2. _build_command — pass the appended persona system prompt via a file
+#      (--append-system-prompt-file) when it would otherwise blow ARG_MAX
+#      (persona can exceed 128KB).  In claude-agent-sdk the persona rides on
+#      the ``system_prompt`` preset/append union, not the old flat
+#      ``append_system_prompt`` field.
 #   3. anyio.open_process — capture stderr to a tempfile so a CLI crash
 #      gives us a real error message instead of "exit code N (no stderr)".
 #      This only yields anything because _build_options passes the CLI
@@ -106,25 +110,62 @@ _MAX_SLOT_RESOLVE_ATTEMPTS = 5
 _original_parse = message_parser.parse_message
 
 
-def _patched_parse(data: dict) -> Message:
+def _patched_parse(data: dict) -> Message | None:
+    # claude-agent-sdk's parse_message returns ``Message | None`` (it already
+    # returns None for unknown *shapes* the internal client then skips — see
+    # _internal/client.py).  We keep wrapping it because the original still
+    # *raises* on malformed/partial event dicts; catching that and emitting a
+    # tolerant SystemMessage keeps the run alive instead of tearing down the
+    # whole query on one bad frame.  Passing None straight through is safe:
+    # the internal client yields only non-None messages.
     try:
         return _original_parse(data)
     except Exception:
         return SystemMessage(subtype=data.get("type", "unknown"), data=data)
 
 
+# Patch both bindings.  ``message_parser.parse_message`` is the source symbol
+# (ClaudeSDKClient in claude_agent_sdk/client.py re-imports it locally each
+# call, so this covers that path).  ``_sdk_client.parse_message`` is the
+# module-level binding the ``query()`` entrypoint actually calls through
+# (_internal/client.py does ``from .message_parser import parse_message`` at
+# import time), so it must be patched separately.
 message_parser.parse_message = _patched_parse
 _sdk_client.parse_message = _patched_parse
 
 
-_original_build_command = _sdk_client.SubprocessCLITransport._build_command
+# In claude-agent-sdk the transport moved to
+# ``_internal.transport.subprocess_cli.SubprocessCLITransport`` (was
+# ``_internal.client.SubprocessCLITransport`` in claude-code-sdk 0.0.25).
+# The append-system-prompt option also changed shape: there is no longer an
+# ``append_system_prompt`` field — instead ``options.system_prompt`` is a union
+# and ``{"type": "preset", "preset": "claude_code", "append": <text>}`` renders
+# ``--append-system-prompt <text>`` (see _build_command).  We build the persona
+# as that preset/append form in ``_build_options`` and here swap the inline
+# ``--append-system-prompt <text>`` for ``--append-system-prompt-file <tmp>``
+# to dodge ARG_MAX (persona can exceed 128KB; the combined argv must fit under
+# ~2MB).  The CLI 2.1.x help confirms ``--append-system-prompt[-file]`` is a
+# supported form.  The new SDK has no file-based *append* option in its public
+# ``system_prompt`` union (``{"type": "file", ...}`` maps to ``--system-prompt-
+# file`` which *replaces* rather than appends), so the arg-length dodge still
+# needs this transport patch.
+_SdkTransport = _sdk_transport.SubprocessCLITransport
+_original_build_command = _SdkTransport._build_command
 
 
-def _patched_build_command(self: _sdk_client.SubprocessCLITransport) -> list[str]:
-    saved = self._options.append_system_prompt
-    self._options.append_system_prompt = None
+def _patched_build_command(self: _sdk_transport.SubprocessCLITransport) -> list[str]:
+    # Pull the persona out of the preset/append system_prompt before the base
+    # command is built, so _build_command emits at most a bare preset (no huge
+    # inline ``--append-system-prompt`` arg), then re-attach it via a tempfile.
+    saved = None
+    sp = self._options.system_prompt
+    if isinstance(sp, dict) and sp.get("type") == "preset" and sp.get("append"):
+        saved = sp["append"]
+        stripped = {k: v for k, v in sp.items() if k != "append"}
+        self._options.system_prompt = stripped
+
     cmd = _original_build_command(self)
-    self._options.append_system_prompt = saved
+    self._options.system_prompt = sp
 
     if saved:
         f = _tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
@@ -138,7 +179,7 @@ def _patched_build_command(self: _sdk_client.SubprocessCLITransport) -> list[str
     return cmd
 
 
-_sdk_client.SubprocessCLITransport._build_command = _patched_build_command
+_SdkTransport._build_command = _patched_build_command
 
 
 _stderr_capture_var: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
@@ -733,7 +774,7 @@ class ClaudeExecutor(Executor):
         try:
             async for _ in query(
                 prompt="hi",
-                options=ClaudeCodeOptions(max_turns=1, permission_mode="default"),
+                options=ClaudeAgentOptions(max_turns=1, permission_mode="default"),
             ):
                 pass  # consume all messages — breaking early corrupts anyio cancel scopes
             log.info("Claude authentication OK")
@@ -1515,8 +1556,8 @@ class ClaudeExecutor(Executor):
         *,
         enable_ask: bool = True,
         strip_optional_mcp: bool = False,
-    ) -> ClaudeCodeOptions:
-        """Assemble ``ClaudeCodeOptions`` for a query.
+    ) -> ClaudeAgentOptions:
+        """Assemble ``ClaudeAgentOptions`` for a query.
 
         ``enable_ask`` controls the interactive AskUserQuestion-over-Telegram
         wiring.  When True (interactive ``_execute_inner`` path) *and* the
@@ -1546,13 +1587,14 @@ class ClaudeExecutor(Executor):
             # patch captures to a tempfile.  Without it a CLI crash exits 1
             # with an empty stderr and we can only log "exit code 1".
             #
-            # The SDK's SubprocessCLITransport passes options.debug_stderr to
-            # open_process whenever "debug-to-stderr" is in extra_args, and
-            # ClaudeCodeOptions.debug_stderr defaults to sys.stderr.  That
-            # would route the crash output straight to the container stderr,
-            # and our open_process patch only installs the tempfile capture
-            # when stderr is None.  Force debug_stderr=None so the SDK passes
-            # stderr=None and the capture (not the SDK) owns the fd.
+            # In claude-agent-sdk the transport pipes stderr only when a
+            # ``stderr`` *callback* is set on the options; otherwise it passes
+            # ``stderr=None`` to open_process (see subprocess_cli.connect),
+            # which is exactly the branch our open_process patch's tempfile
+            # capture keys off.  We never set the ``stderr`` callback, so the
+            # capture owns the fd.  ``debug_stderr`` is now a legacy no-op field
+            # (defined but no longer read by the transport); we keep passing
+            # ``None`` for behavioral continuity and to make the intent explicit.
             "debug_stderr": None,
             "extra_args": {
                 "effort": self._runtime.effort,
@@ -1626,8 +1668,18 @@ class ClaudeExecutor(Executor):
                     len(system_prompt) // 1024,
                 )
                 system_prompt = system_prompt[: self._MAX_CLI_BUDGET]
-            opts["append_system_prompt"] = system_prompt
-        return ClaudeCodeOptions(**opts)
+            # claude-agent-sdk replaced the flat ``append_system_prompt`` field
+            # with a ``system_prompt`` union.  The persona must *append* to
+            # Claude Code's default prompt (same as before), which is the
+            # preset+append form → ``--append-system-prompt``.  The
+            # _build_command transport patch then swaps that inline arg for a
+            # tempfile (``--append-system-prompt-file``) to dodge ARG_MAX.
+            opts["system_prompt"] = {
+                "type": "preset",
+                "preset": "claude_code",
+                "append": system_prompt,
+            }
+        return ClaudeAgentOptions(**opts)
 
     async def _execute_inner(
         self,

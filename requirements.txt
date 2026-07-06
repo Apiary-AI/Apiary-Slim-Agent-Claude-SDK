@@ -1,10 +1,14 @@
 superpos-agent-core~=0.1.12
-# Pinned exactly: must match the CLI pin in Dockerfile (@anthropic-ai/claude-code@2.0.14).
-# 0.0.25 is the last release under this (now-deprecated) package name; migrating to
-# claude-agent-sdk is deferred (see issue #40) because the executor monkeypatches
-# private SDK internals. An open-ended >= here silently resolves to whatever is latest
-# and drifts from the pinned CLI.
-claude-code-sdk==0.0.25
+# Pinned exactly: must match the CLI pin in Dockerfile (@anthropic-ai/claude-code@2.1.191).
+# The SDK + CLI are a matched control-protocol pair and must move in lockstep.
+# claude-agent-sdk is the renamed successor to the frozen claude-code-sdk (which
+# stopped at 0.0.25, a 2.0.x-era protocol); 0.2.110 speaks the CLI 2.1.x protocol
+# and declares its matched CLI as 2.1.191 (claude_agent_sdk/_cli_version.py). This
+# is the issue-#40 migration — now DONE. The executor still monkeypatches private
+# SDK internals (message_parser.parse_message + the SubprocessCLITransport command
+# builder), so an open-ended >= here would silently drift onto an untested protocol
+# and re-break the CLI handshake — keep the ==.
+claude-agent-sdk==0.2.110
 python-telegram-bot>=21.0
 httpx>=0.27.0
 pyyaml>=6.0
