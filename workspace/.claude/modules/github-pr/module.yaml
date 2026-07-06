@@ -1,5 +1,12 @@
 description: "GitHub PR workflow — clone repos, create branches, push changes, and open pull requests"
+# Auth is OPTIONAL: this module works with EITHER a static GITHUB_TOKEN (legacy /
+# PAT) OR a GitHub App service connection (the default). With an App connection,
+# entrypoint.sh runs `github_auth setup`, which registers a git credential helper
+# so clone/push authenticate automatically — no GITHUB_TOKEN required, no token
+# ever handled by the agent.
 env:
+  # Optional — only set for the legacy PAT path; unset when a github_app
+  # service connection exists (the credential helper handles auth instead).
   - GITHUB_TOKEN
 deps:
   python: []

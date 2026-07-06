@@ -481,3 +481,65 @@ class TestAgentCoreVersionPin:
             f"uv.lock pins agent-core {match.group(1)}, but the entrypoint's "
             "github_auth call needs >= 0.1.2"
         )
+
+
+class TestGithubPrModule:
+    """The github-pr module must clone/push over HTTPS via the credential helper
+    (GitHub App connection), not depend on a static GITHUB_TOKEN. Regression
+    guard: agents used to read SKILL.md's "GITHUB_TOKEN must be set" and fall
+    back to a read-only proxy tarball for cloning."""
+
+    MODULE_DIR = REPO_ROOT / "workspace" / ".claude" / "modules" / "github-pr"
+    SCRIPTS_DIR = MODULE_DIR / "scripts"
+
+    def test_scripts_parse(self):
+        """Both scripts must parse under bash -n."""
+        for script in ("clone-and-branch.sh", "push-and-pr.sh"):
+            path = self.SCRIPTS_DIR / script
+            result = subprocess.run(
+                ["bash", "-n", str(path)],
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 0, (
+                f"{script} failed bash -n: {result.stderr}"
+            )
+
+    def test_clone_and_branch_registers_credential_helper(self):
+        """clone-and-branch.sh must (re-)run github_auth setup before cloning so
+        the broker-backed credential helper is guaranteed registered even if
+        entrypoint setup was skipped."""
+        text = (self.SCRIPTS_DIR / "clone-and-branch.sh").read_text()
+        assert "superpos_agent_core.github_auth setup" in text, (
+            "clone-and-branch.sh must run github_auth setup before cloning"
+        )
+        # Must be idempotent/non-fatal — the clone still proceeds if setup fails
+        # (e.g. a PAT-only agent with GITHUB_TOKEN already set).
+        setup_line = next(
+            line for line in text.splitlines()
+            if "github_auth setup" in line
+        )
+        assert "|| true" in setup_line, (
+            "github_auth setup must be non-fatal (|| true) so the clone still "
+            "proceeds when setup fails on a PAT-only agent"
+        )
+
+    def test_clone_uses_plain_https_clone(self):
+        """The clone must be a plain HTTPS clone (which the credential helper
+        authenticates), not a token-in-URL or proxy fetch."""
+        text = (self.SCRIPTS_DIR / "clone-and-branch.sh").read_text()
+        assert "git clone" in text and "https://github.com/" in text, (
+            "clone-and-branch.sh must clone over plain HTTPS from github.com"
+        )
+
+    def test_skill_does_not_require_github_token(self):
+        """SKILL.md must not tell agents GITHUB_TOKEN is mandatory — that made
+        App-connection agents fall back to the read-only proxy tarball."""
+        text = (self.MODULE_DIR / "SKILL.md").read_text()
+        assert "GITHUB_TOKEN` must be set" not in text, (
+            "SKILL.md still says GITHUB_TOKEN must be set — App-connection "
+            "agents will wrongly fall back to the proxy tarball"
+        )
+        assert "github_auth setup" in text, (
+            "SKILL.md must document the github_auth setup credential-helper path"
+        )
