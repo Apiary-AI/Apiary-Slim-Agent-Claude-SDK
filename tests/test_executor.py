@@ -10,6 +10,8 @@ from superpos_agent_claude.claude_executor import (
 )
 from superpos_agent_claude.config import ClaudeConfig as Config
 
+from .conftest import append_text as _append_text
+
 
 # --- Dedup method unit tests (pure sync logic) ---
 
@@ -243,25 +245,25 @@ def test_build_options_cwd_override(executor, mock_config):
 def test_build_options_injects_persona_when_set(executor_with_persona):
     opts = executor_with_persona._build_options()
     # Persona leads the system prompt; the always-on ask-tool steer follows.
-    assert opts.append_system_prompt.startswith("You are a helpful assistant.")
-    assert "Asking the user a question" in opts.append_system_prompt
+    assert _append_text(opts).startswith("You are a helpful assistant.")
+    assert "Asking the user a question" in _append_text(opts)
 
 
 def test_build_options_no_system_prompt_when_persona_none(executor):
     # Even with no persona, the ask-tool steer note is always appended.
     opts = executor._build_options()
-    assert "Asking the user a question" in (opts.append_system_prompt or "")
+    assert "Asking the user a question" in _append_text(opts)
 
 
 def test_build_options_combines_persona_and_system_prompt_append(executor_with_persona):
     opts = executor_with_persona._build_options(system_prompt_append="## Extra\nDo stuff.")
-    assert opts.append_system_prompt.startswith("You are a helpful assistant.")
-    assert "## Extra\nDo stuff." in opts.append_system_prompt
+    assert _append_text(opts).startswith("You are a helpful assistant.")
+    assert "## Extra\nDo stuff." in _append_text(opts)
 
 
 def test_build_options_system_prompt_append_only(executor):
     opts = executor._build_options(system_prompt_append="## Hint\nDo worktree.")
-    assert "## Hint\nDo worktree." in opts.append_system_prompt
+    assert "## Hint\nDo worktree." in _append_text(opts)
 
 
 # --- _build_options enable_ask gating (interactive vs background) ---
@@ -277,7 +279,7 @@ def test_build_options_no_ask_path_omits_ask_server_and_steer(executor):
     # native AskUserQuestion left enabled (not shadowed/disabled)
     assert "AskUserQuestion" not in (opts.disallowed_tools or [])
     # no steering note in the system prompt
-    assert "Asking the user a question" not in (opts.append_system_prompt or "")
+    assert "Asking the user a question" not in _append_text(opts)
 
 
 def test_build_options_ask_path_still_registers_ask(executor):
@@ -288,7 +290,7 @@ def test_build_options_ask_path_still_registers_ask(executor):
     opts = executor._build_options()
     assert _ASK_MCP_SERVER in opts.mcp_servers
     assert "AskUserQuestion" in opts.disallowed_tools
-    assert "Asking the user a question" in (opts.append_system_prompt or "")
+    assert "Asking the user a question" in _append_text(opts)
 
 
 @pytest.mark.asyncio
@@ -320,7 +322,7 @@ async def test_run_background_uses_no_ask_options(executor):
     opts = captured["opts"]
     assert _ASK_MCP_SERVER not in (opts.mcp_servers or {})
     assert "AskUserQuestion" not in (opts.disallowed_tools or [])
-    assert "Asking the user a question" not in (opts.append_system_prompt or "")
+    assert "Asking the user a question" not in _append_text(opts)
 
 
 # --- _execute_inner calls ensure_worktree when branch + isolation enabled ---
@@ -724,7 +726,7 @@ async def test_execute_inner_resumes_session_after_cli_crash(
     (query.py:491), so the agent's catch block sees `Exception`, not
     `ProcessError`. This test mirrors that real production path.
     """
-    from claude_code_sdk.types import ResultMessage
+    from claude_agent_sdk.types import ResultMessage
 
     mock_config.executor_worktree_isolation = False
     mock_config.executor_working_dir = "/workspace"
@@ -962,7 +964,7 @@ async def test_execute_inner_resumes_session_from_init_message(
     — relying on the terminal ResultMessage alone leaves crash-retry without
     a session to resume in the exact failure mode this code is meant to fix.
     """
-    from claude_code_sdk.types import SystemMessage
+    from claude_agent_sdk.types import SystemMessage
 
     mock_config.executor_worktree_isolation = False
     mock_config.executor_working_dir = "/workspace"
@@ -1148,7 +1150,7 @@ async def test_superpos_task_completion_records_summary(
 ):
     """A successfully completed Superpos task must land in the recent-tasks
     log so the next Telegram message in the same chat picks it up."""
-    from claude_code_sdk.types import AssistantMessage, TextBlock, ResultMessage
+    from claude_agent_sdk.types import AssistantMessage, TextBlock, ResultMessage
 
     mock_config.executor_worktree_isolation = False
     mock_config.executor_working_dir = "/workspace"
@@ -1765,7 +1767,7 @@ async def test_new_session_id_stored_with_current_persona_version(
     """After a successful run, the session_id should be saved with the
     *current* `_persona_version` so the next message can compare against
     a future persona bump."""
-    from claude_code_sdk.types import SystemMessage
+    from claude_agent_sdk.types import SystemMessage
 
     mock_config.executor_worktree_isolation = False
     mock_config.executor_working_dir = "/workspace"
@@ -1950,7 +1952,7 @@ async def test_session_save_records_effective_branch(
     Otherwise a resume that fell back to a stored branch would overwrite
     the entry with branch=None and the next message would lose context
     again."""
-    from claude_code_sdk.types import SystemMessage
+    from claude_agent_sdk.types import SystemMessage
 
     mock_config.executor_worktree_isolation = True
     mock_config.executor_working_dir = "/workspace"
@@ -2175,7 +2177,7 @@ async def test_session_save_pins_branch_only_when_worktree_used(
     a future resume would restore cwd to the worktree path and Claude
     CLI would silently fail to find the transcript (then start fresh).
     """
-    from claude_code_sdk.types import SystemMessage
+    from claude_agent_sdk.types import SystemMessage
 
     mock_config.executor_worktree_isolation = True
     mock_config.executor_working_dir = "/workspace"
@@ -2711,8 +2713,8 @@ async def test_low_stall_timeout_does_not_false_cancel_during_backoff(
 # a TaskGroup". The real CLIConnectionError/ProcessError signal lives in the
 # leaves, so the executor must flatten the group before classifying.
 
-from claude_code_sdk import CLIConnectionError, ProcessError  # noqa: E402
-from claude_code_sdk.types import SystemMessage  # noqa: E402
+from claude_agent_sdk import CLIConnectionError, ProcessError  # noqa: E402
+from claude_agent_sdk.types import SystemMessage  # noqa: E402
 from superpos_agent_claude.claude_executor import (  # noqa: E402
     _BASE_EXCEPTION_GROUP,
     _flatten_exception,

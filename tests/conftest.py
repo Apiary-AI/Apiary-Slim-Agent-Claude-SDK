@@ -6,6 +6,21 @@ from superpos_agent_claude.claude_executor import ClaudeExecutor
 from superpos_agent_claude.runtime_config import ClaudeRuntimeConfig as RuntimeConfig
 
 
+def append_text(opts) -> str:
+    """Return the appended persona/steer text from a built options object.
+
+    claude-agent-sdk replaced the flat ``append_system_prompt`` field with a
+    ``system_prompt`` union; the executor builds the persona as
+    ``{"type": "preset", "preset": "claude_code", "append": <text>}``.  This
+    helper pulls that append text back out (or "" when no persona/steer note
+    was set) so the persona-injection assertions stay backend-agnostic.
+    """
+    sp = getattr(opts, "system_prompt", None)
+    if isinstance(sp, dict):
+        return sp.get("append", "") or ""
+    return ""
+
+
 @pytest.fixture
 def mock_config(tmp_path):
     cfg = MagicMock(spec=Config)
