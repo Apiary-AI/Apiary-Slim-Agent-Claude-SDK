@@ -14,10 +14,15 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ENTRYPOINT = REPO_ROOT / "entrypoint.sh"
 
-# Minimum agent-core version that ships the `github_auth` module the
-# entrypoint now invokes. Bump this in lockstep with any new core API the
-# entrypoint starts depending on.
-MIN_CORE_VERSION = (0, 1, 2)
+# Minimum agent-core version the entrypoint depends on. Bump this in lockstep
+# with any new core API the entrypoint starts depending on.
+#
+# 0.1.2  — ships the `github_auth` module the entrypoint invokes.
+# 0.1.12 — module_setup honours `--skills-dir` (registry skills overlay) AND
+#          warms the last-good /registry/resolved cache on a successful fetch
+#          (resilient fetch with retry + cache). The entrypoint now passes
+#          `--skills-dir`, so the floor must guarantee both.
+MIN_CORE_VERSION = (0, 1, 12)
 
 
 def _parse_lower_bound(specifier: str) -> tuple[int, ...]:
@@ -105,6 +110,25 @@ class TestModuleSetupPaths:
     def test_bin_dir_uses_working_dir(self):
         block = self._module_setup_block()
         assert '"$WORKING_DIR/.claude/modules-bin"' in block
+
+    def test_skills_dir_passed(self):
+        """module_setup must receive --skills-dir so the registry SKILLS
+        overlay runs (and the last-good /registry/resolved cache is warmed).
+        Without it, module_setup overlays registry *modules* only and silently
+        skips the skills half, leaving agents on baked-in skills alone — the
+        latent bug this fixes and the Beat 4 prerequisite."""
+        block = self._module_setup_block()
+        assert "--skills-dir" in block, (
+            "module_setup must be invoked with --skills-dir so registry skills "
+            "are overlaid and the registry-resolved cache is warmed on boot"
+        )
+
+    def test_skills_dir_uses_working_dir(self):
+        block = self._module_setup_block()
+        assert '"$WORKING_DIR/.claude/skills"' in block, (
+            "module_setup --skills-dir must derive from $WORKING_DIR so it "
+            "agrees with the sync_sub_agents --skills-dir scan target"
+        )
 
     def test_no_hardcoded_workspace_in_module_setup_block(self):
         block = self._module_setup_block()
@@ -395,6 +419,23 @@ class TestPathContractAgreement:
         assert setup_match.group(1) == sync_match.group(1), (
             "module_setup --modules-dir and sync_sub_agents --modules-dir "
             "must agree so an overridden CLAUDE_WORKING_DIR keeps them aligned"
+        )
+
+    def test_skills_dir_matches_between_blocks(self):
+        text = _read_entrypoint()
+        setup_match = re.search(
+            r"module_setup\b.*?--skills-dir\s+(\S+)", text, re.DOTALL
+        )
+        sync_match = re.search(
+            r"sync_sub_agents\.py\b.*?--skills-dir\s+(\S+)", text, re.DOTALL
+        )
+        assert setup_match and sync_match, (
+            "both module_setup and sync_sub_agents must pass --skills-dir"
+        )
+        assert setup_match.group(1) == sync_match.group(1), (
+            "module_setup --skills-dir and sync_sub_agents --skills-dir must "
+            "agree so the registry overlay materialises skills into the same "
+            "dir the sub-agent sync scans"
         )
 
 

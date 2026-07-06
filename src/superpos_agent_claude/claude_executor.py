@@ -586,13 +586,18 @@ class ClaudeExecutor(Executor):
                     exc,
                 )
                 return
-            if not isinstance(server, dict) or not server.get("command"):
+            # Accept either a local stdio server (has "command", e.g. Tavily
+            # via npx) or a remote HTTP/SSE server (has "url", e.g. Z.ai's own
+            # web_search_prime MCP). Default "type" from whichever is present.
+            if not isinstance(server, dict) or not (
+                server.get("command") or server.get("url")
+            ):
                 log.error(
                     "WEB_SEARCH_MCP must be a JSON object with a 'command' "
-                    "key — web search unavailable"
+                    "(stdio) or 'url' (http/sse) key — web search unavailable"
                 )
                 return
-            server.setdefault("type", "stdio")
+            server.setdefault("type", "http" if server.get("url") else "stdio")
             self._mcp = {**self._mcp, "web_search": server}
             self._search_note = (
                 "## Web search\n"
@@ -602,9 +607,9 @@ class ClaudeExecutor(Executor):
             )
             log.info(
                 "Shim backend (base_url=%s) — added custom web-search MCP "
-                "(command=%s)",
+                "(transport=%s)",
                 config.anthropic_base_url,
-                server["command"],
+                server["type"],
             )
         elif config.minimax_api_key:
             self._mcp = {

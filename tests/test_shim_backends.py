@@ -1,4 +1,4 @@
-"""Backend-aware tooling: shims (MiniMax, Kimi, custom) vs native Anthropic."""
+"""Backend-aware tooling: shims (MiniMax, Kimi, GLM, custom) vs native Anthropic."""
 
 import pytest
 
@@ -17,6 +17,8 @@ from superpos_agent_claude.claude_executor import ClaudeExecutor
         ("https://api.minimax.io/anthropic", False),
         ("https://api.minimaxi.com/anthropic", False),
         ("https://api.kimi.com/coding/", False),
+        ("https://api.z.ai/api/anthropic", False),
+        ("https://open.bigmodel.cn/api/anthropic", False),
         ("https://my-gateway.internal/anthropic", False),
         # Substring-match traps: a non-Anthropic host that merely *contains*
         # the string "anthropic.com" in the path, query, or as a deceptive
@@ -132,6 +134,45 @@ def test_shim_with_custom_search_mcp(
     assert "web_search" in (opts.append_system_prompt or "")
 
 
+def test_shim_with_remote_http_search_mcp(
+    mock_config, mock_runtime, mock_superpos, mock_gateway,
+):
+    """A remote HTTP search MCP (e.g. GLM / Z.ai's web_search_prime) is
+    accepted: no 'command', a 'url' instead, and 'type' defaults to http."""
+    mock_config.is_native_anthropic = False
+    mock_config.anthropic_base_url = "https://api.z.ai/api/anthropic"
+    mock_config.web_search_mcp = (
+        '{"url": "https://api.z.ai/api/mcp/web_search_prime/mcp",'
+        ' "headers": {"Authorization": "Bearer zai-key"}}'
+    )
+
+    ex = ClaudeExecutor(mock_config, mock_runtime, mock_superpos, mock_gateway)
+    opts = ex._build_options()
+
+    assert opts.disallowed_tools == ["WebSearch", "WebFetch"]
+    ws = opts.mcp_servers["web_search"]
+    assert ws["type"] == "http"  # defaulted from the presence of "url"
+    assert ws["url"] == "https://api.z.ai/api/mcp/web_search_prime/mcp"
+    assert ws["headers"]["Authorization"] == "Bearer zai-key"
+    assert "web_search" in (opts.append_system_prompt or "")
+
+
+def test_remote_search_mcp_honors_explicit_type(
+    mock_config, mock_runtime, mock_superpos, mock_gateway,
+):
+    """An explicit 'type' (e.g. sse) is preserved rather than overridden."""
+    mock_config.is_native_anthropic = False
+    mock_config.anthropic_base_url = "https://api.z.ai/api/anthropic"
+    mock_config.web_search_mcp = (
+        '{"type": "sse", "url": "https://example.com/sse"}'
+    )
+
+    ex = ClaudeExecutor(mock_config, mock_runtime, mock_superpos, mock_gateway)
+    opts = ex._build_options()
+
+    assert opts.mcp_servers["web_search"]["type"] == "sse"
+
+
 def test_custom_search_mcp_wins_over_minimax(
     mock_config, mock_runtime, mock_superpos, mock_gateway,
 ):
@@ -153,7 +194,8 @@ def test_custom_search_mcp_wins_over_minimax(
     [
         "not json at all",
         '["command", "npx"]',  # a list, not an object
-        '{"args": ["-y", "tavily-mcp"]}',  # missing "command"
+        '{"args": ["-y", "tavily-mcp"]}',  # has neither "command" nor "url"
+        '{"headers": {"Authorization": "Bearer x"}}',  # url missing too
     ],
 )
 def test_invalid_web_search_mcp_adds_no_server(
