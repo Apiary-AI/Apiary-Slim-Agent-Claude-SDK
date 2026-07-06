@@ -3215,7 +3215,7 @@ async def test_crash_resume_progress_message_excludes_captured_stderr(
     """The crash-resume path streams a '⏳ CLI crashed ... resuming session'
     note after a mid-task crash.  That progress message must NOT contain the
     captured stderr firehose (it is logged + kept for the summary instead)."""
-    from claude_code_sdk.types import SystemMessage
+    from claude_agent_sdk.types import SystemMessage
 
     monkeypatch.delenv("ENABLE_CLAUDEAI_MCP_SERVERS", raising=False)
     mock_config.executor_worktree_isolation = False
