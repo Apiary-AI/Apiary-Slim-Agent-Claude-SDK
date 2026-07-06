@@ -5,6 +5,12 @@ REPO="${1:?Usage: clone-and-branch.sh <owner/repo> <branch-name> [base-branch]}"
 BRANCH="${2:?Usage: clone-and-branch.sh <owner/repo> <branch-name> [base-branch]}"
 BASE="${3:-main}"
 
+# Ensure the git credential helper is registered before we clone. entrypoint.sh
+# already runs this at boot, but re-running is idempotent (it replaces, not
+# stacks, the github.com helper) and non-fatal (|| true): for a PAT-only agent
+# with GITHUB_TOKEN already set, the clone still proceeds via the existing token.
+python3 -m superpos_agent_core.github_auth setup >/dev/null 2>&1 || true
+
 REPO_NAME=$(basename "$REPO")
 DEST="/workspace/repos/$REPO_NAME"
 
