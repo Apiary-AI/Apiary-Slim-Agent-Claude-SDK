@@ -700,12 +700,11 @@ class ClaudeExecutor(Executor):
         The new persona — including an edited MEMORY — takes effect on the
         next message because ``_build_options`` re-injects the live
         ``self._persona`` via ``--append-system-prompt`` every turn.
-        Resumed Telegram sessions are *not* torn down on a version bump:
-        the agent's own MEMORY writes bump the persona version constantly,
-        and dropping the conversation each time wiped the user's context
-        mid-chat (see ``_resolve_resume_target``).  ``version`` is tracked
-        only so newly created sessions record which version they started
-        under, for diagnostics.
+        When ``version`` is newer than the previously tracked version,
+        each Telegram chat's next message starts a fresh session instead
+        of resuming (the invalidation happens lazily in
+        ``_resolve_resume_target``), which keeps resumed contexts from
+        growing without bound.
 
         A ``None`` ``prompt`` is interpreted in two distinct ways,
         disambiguated by ``version``:
@@ -752,8 +751,15 @@ class ClaudeExecutor(Executor):
                 "poll cycle will retry the fetch."
             )
         self._persona = prompt
+        prev_version = self._persona_version
         if version is not None:
             self._persona_version = version
+            if prev_version is not None and version > prev_version:
+                log.info(
+                    "Persona version bumped %s -> %s; sessions started under "
+                    "older persona will be invalidated on next use",
+                    prev_version, version,
+                )
 
     def clear_session(self, chat_id: int | str) -> None:
         self._sessions.clear(chat_id)
@@ -971,15 +977,16 @@ class ClaudeExecutor(Executor):
         matches the original transcript at
         ``~/.claude/projects/<encoded-cwd>/<sid>.jsonl``.
 
-        We resume regardless of the persona version the session was
-        created under.  The live persona — including a freshly edited
-        MEMORY — is re-injected into every turn via
-        ``--append-system-prompt`` (see ``_build_options``), so a
-        persona-version bump never needs a fresh session.  The agent's
-        own MEMORY writes bump that version constantly, so invalidating
-        on every bump wiped the user's context mid-chat; this matches the
-        Codex/Gemini/Qwen agents, which re-read their persona file each
-        turn and never tear down the conversation.
+        Lazy persona invalidation: a session started under an older
+        persona version is dropped (and its store entry cleared) so the
+        next message starts a fresh conversation.  This deliberately
+        reverts the 2026-06-04 change (``954f192``): the agent's own
+        MEMORY writes bump the persona version constantly, so sessions
+        reset often and never accumulate the huge resumed context that
+        drove runaway per-turn token cost.  Trade-off: an in-flight
+        Telegram chat loses its context on the first message after any
+        version bump.  Only ``source == "telegram"`` requests consult the
+        SessionStore, so Superpos task execution is unaffected.
 
         Called by ``_run_one`` *before* slot resolution so the worktree
         lock key matches the cwd ``_execute_inner`` will actually use.
@@ -993,7 +1000,23 @@ class ClaudeExecutor(Executor):
         stored = self._sessions.get_with_version(req.chat_key)
         if stored is None:
             return None, req.branch
-        resume_id, _stored_version, stored_branch = stored
+        resume_id, stored_version, stored_branch = stored
+        # ``stored_version is None`` covers the startup race where Telegram
+        # polling writes a session before the Superpos version poller has
+        # populated ``_persona_version``; treat it as stale.
+        if self._persona_version is not None and (
+            stored_version is None
+            or stored_version < self._persona_version
+        ):
+            log.info(
+                "Dropping resume for chat %s: session persona v%s < "
+                "current v%s — starting fresh",
+                req.chat_key,
+                "?" if stored_version is None else stored_version,
+                self._persona_version,
+            )
+            self._sessions.clear(req.chat_key)
+            return None, req.branch
         effective_branch = req.branch
         if req.branch is None and stored_branch is not None:
             log.info(
