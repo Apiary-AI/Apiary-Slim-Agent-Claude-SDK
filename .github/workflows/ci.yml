@@ -49,3 +49,21 @@ jobs:
           else
             echo "No tests/ directory — skipping pytest"
           fi
+
+  pexels-mcp:
+    name: Pexels MCP (node --test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      # The vendored unit tests mock global fetch (no network); the live smoke
+      # test skips unless PEXELS_API_KEY is set — so `node --test` is fully
+      # self-contained in CI.
+      - name: Install deps
+        working-directory: mcp-servers/pexels
+        run: npm install --omit=dev
+      - name: Run node tests
+        working-directory: mcp-servers/pexels
+        run: npm test
