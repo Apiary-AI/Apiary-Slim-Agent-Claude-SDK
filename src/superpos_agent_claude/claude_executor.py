@@ -229,7 +229,65 @@ _ASK_MCP_TOOL_FQN = f"mcp__{_ASK_MCP_SERVER}__{_ASK_MCP_TOOL}"
 # When the CLI crashes before init with these present, the degrade safeguard in
 # ``_execute_inner`` strips them and retries without ask/search rather than
 # looping the identical failing config forever.
-_OPTIONAL_MCP_SERVERS = frozenset({_ASK_MCP_SERVER, "minimax", "web_search"})
+_OPTIONAL_MCP_SERVERS = frozenset({_ASK_MCP_SERVER, "minimax", "web_search", "pexels"})
+
+# A bare ``${NAME}`` placeholder — the whole value must be exactly one
+# placeholder (names only, matching MCP-3 credential-resolution semantics). We
+# deliberately do NOT support partial/interpolated values like ``prefix-${X}``.
+_MCP_ENV_PLACEHOLDER_RE = re.compile(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)\}$")
+
+
+def _resolve_mcp_env_placeholders(servers: dict) -> dict:
+    """Resolve bare ``${VAR}`` placeholders in each MCP server's ``env`` block.
+
+    ``collect_mcp_servers`` merges each module's inline ``mcp:`` block verbatim,
+    with no placeholder expansion. A module such as ``mcp-pexels`` declares
+    ``env: {PEXELS_API_KEY: "${PEXELS_API_KEY}"}`` so the secret is injected at
+    launch time from the container environment rather than baked into the YAML.
+
+    This pass walks every server's ``env`` dict and, for any value that is an
+    exact bare ``${NAME}`` placeholder, substitutes ``os.environ[NAME]``. Rules:
+
+    - Only exact bare-placeholder values are substituted; every other value
+      (real config carried by minimax/web_search, etc.) is left untouched.
+    - If a placeholder's env var is unset or empty, the *server* is dropped from
+      the returned mapping (rather than launched with a literal ``${...}``,
+      which would fail confusingly), and a warning is logged.
+
+    Returns a new dict; the input is not mutated. Generic over any server.
+    """
+    resolved: dict = {}
+    for name, cfg in servers.items():
+        env = cfg.get("env") if isinstance(cfg, dict) else None
+        if not isinstance(env, dict):
+            resolved[name] = cfg
+            continue
+
+        new_env: dict = {}
+        drop = False
+        for key, value in env.items():
+            match = _MCP_ENV_PLACEHOLDER_RE.match(value) if isinstance(value, str) else None
+            if match is None:
+                new_env[key] = value
+                continue
+            var_name = match.group(1)
+            resolved_value = os.environ.get(var_name)
+            if not resolved_value:
+                log.warning(
+                    "MCP server %r: env var %s (placeholder %s) is unset/empty; "
+                    "dropping the server so it is not launched with a literal placeholder.",
+                    name,
+                    var_name,
+                    value,
+                )
+                drop = True
+                break
+            new_env[key] = resolved_value
+
+        if drop:
+            continue
+        resolved[name] = {**cfg, "env": new_env}
+    return resolved
 
 _original_open_process = anyio.open_process
 
@@ -472,6 +530,10 @@ class ClaudeExecutor(Executor):
 
         modules = discover_modules(config.modules_dir)
         self._mcp = collect_mcp_servers(modules)
+        # collect_mcp_servers merges module `mcp:` blocks verbatim; resolve any
+        # bare ${VAR} env placeholders (e.g. mcp-pexels' ${PEXELS_API_KEY}) from
+        # the container environment, dropping servers whose secret is unset.
+        self._mcp = _resolve_mcp_env_placeholders(self._mcp)
         if self._mcp:
             log.info("Loaded %d MCP server(s) from %s", len(self._mcp), config.modules_dir)
 
