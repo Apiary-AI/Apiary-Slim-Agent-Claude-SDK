@@ -26,6 +26,10 @@ build/
 .DS_Store
 Thumbs.db
 
+# Node (vendored MCP servers — deps are installed at image-build time)
+node_modules/
+package-lock.json
+
 # Docker
 docker-compose.yml
 docker-compose.override.yml

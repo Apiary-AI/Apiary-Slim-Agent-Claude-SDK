@@ -38,6 +38,14 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir --break-system-packages -r requirements.txt
 
+# Bake the vendored Pexels stdio MCP server and install its runtime deps
+# (@modelcontextprotocol/sdk + zod). node/npm are provided by the base image.
+# The mcp-pexels module (workspace/.claude/modules/mcp-pexels) launches this
+# via `node /app/mcp-servers/pexels/src/index.js`. No package-lock.json is
+# vendored, so `npm ci` is not applicable — use `npm install --omit=dev`.
+COPY mcp-servers/pexels /app/mcp-servers/pexels
+RUN npm install --omit=dev --prefix /app/mcp-servers/pexels
+
 COPY src/ /app/src/
 COPY entrypoint.sh /app/entrypoint.sh
 COPY workspace/ /workspace/

@@ -1,0 +1,17 @@
+description: "Pexels stock photo + video search MCP server"
+env:
+  - PEXELS_API_KEY
+deps:
+  python: []
+  system: []
+# Inline MCP block: collect_mcp_servers merges this verbatim into the SDK
+# options. The ${PEXELS_API_KEY} placeholder is resolved from the container
+# environment at launch time by _resolve_mcp_env_placeholders in the executor;
+# if PEXELS_API_KEY is unset the server is simply not launched.
+mcp:
+  pexels:
+    type: stdio
+    command: node
+    args: ["/app/mcp-servers/pexels/src/index.js"]
+    env:
+      PEXELS_API_KEY: "${PEXELS_API_KEY}"
